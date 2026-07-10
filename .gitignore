@@ -13,4 +13,6 @@ htmlcov/
 artifacts/
 runs/
 .env
-
+.inverse-agent-state/
+*.sqlite-shm
+*.sqlite-wal

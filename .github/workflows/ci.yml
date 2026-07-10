@@ -7,18 +7,22 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: astral-sh/setup-uv@v7
         with:
-          python-version: "3.12"
-      - name: Install
-        run: |
-          python -m pip install --upgrade pip
-          python -m pip install -e ".[dev]"
+          version: "0.11.28"
+          enable-cache: true
+      - name: Install locked environment
+        run: uv sync --locked --extra dev --python 3.12
       - name: Ruff
-        run: python -m ruff check .
-      - name: Pytest
-        run: python -m pytest
-
+        run: uv run ruff check .
+      - name: Mypy
+        run: uv run mypy
+      - name: Pytest and coverage
+        run: uv run pytest --cov=inverse_agent --cov-report=term-missing

@@ -7,7 +7,7 @@ from dataclasses import asdict, is_dataclass
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from inverse_agent.models import EvalTrace
 
@@ -19,7 +19,7 @@ def json_default(value: Any) -> Any:
         return value.value
     if isinstance(value, datetime):
         return value.isoformat()
-    if is_dataclass(value):
+    if is_dataclass(value) and not isinstance(value, type):
         return asdict(value)
     if isinstance(value, set):
         return sorted(value)
@@ -32,4 +32,7 @@ def save_trace(trace: EvalTrace, path: Path) -> None:
 
 
 def load_trace(path: Path) -> dict[str, Any]:
-    return json.loads(path.read_text(encoding="utf-8"))
+    value = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(value, dict):
+        raise ValueError("trace JSON must contain an object")
+    return cast(dict[str, Any], value)

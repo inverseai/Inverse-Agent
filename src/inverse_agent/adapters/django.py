@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-import sys
 from pathlib import Path
 
 from inverse_agent.adapters.base import CommandAdapter, Tool, ToolResult
+from inverse_agent.environments import discover_python
 from inverse_agent.models import Domain, WorkspaceProfile
 from inverse_agent.runner import LocalRunner
 
@@ -17,7 +17,8 @@ class DjangoAdapter(CommandAdapter):
         return (root / "manage.py").exists()
 
     def profile(self, root: Path) -> WorkspaceProfile:
-        python = sys.executable
+        environment = discover_python(root)
+        python = str(environment.path)
         return WorkspaceProfile(
             root=root,
             domains={Domain.DJANGO},
@@ -34,19 +35,39 @@ class DjangoAdapter(CommandAdapter):
                 "migrate_plan": [python, "manage.py", "migrate", "--plan"],
             },
             test_targets=["manage.py test"],
-            toolchain={"python": python, "framework": "django"},
+            toolchain={
+                "python": python,
+                "python_source": environment.source,
+                "framework": "django",
+            },
         )
 
     def tools(self) -> list[Tool]:
         return [
-            Tool("django.check", "Run Django system checks", "safe-read", self.domain),
-            Tool("django.test", "Run Django tests", "safe-read", self.domain),
-            Tool("django.migration_plan", "Inspect pending migrations", "safe-read", self.domain),
+            Tool("django.check", "Run Django system checks", "approval-required", self.domain),
+            Tool("django.test", "Run Django tests", "approval-required", self.domain),
+            Tool(
+                "django.migration_plan",
+                "Inspect pending migrations",
+                "approval-required",
+                self.domain,
+            ),
         ]
 
-    def run_checks(self, runner: LocalRunner, root: Path) -> ToolResult:
+    def run_checks(
+        self,
+        runner: LocalRunner,
+        root: Path,
+        *,
+        approval_token: str | None = None,
+    ) -> ToolResult:
         profile = self.profile(root)
-        result = self.run_command(runner, root, profile.commands["check"])
+        result = self.run_command(
+            runner,
+            root,
+            profile.commands["check"],
+            approval_token=approval_token,
+        )
         return ToolResult(
             name="django.check",
             ok=result.status.value == "succeeded",
@@ -54,9 +75,20 @@ class DjangoAdapter(CommandAdapter):
             command=result,
         )
 
-    def run_tests(self, runner: LocalRunner, root: Path, *, approved: bool = False) -> ToolResult:
+    def run_tests(
+        self,
+        runner: LocalRunner,
+        root: Path,
+        *,
+        approval_token: str | None = None,
+    ) -> ToolResult:
         profile = self.profile(root)
-        result = self.run_command(runner, root, profile.commands["test"], approved=approved)
+        result = self.run_command(
+            runner,
+            root,
+            profile.commands["test"],
+            approval_token=approval_token,
+        )
         return ToolResult(
             name="django.test",
             ok=result.status.value == "succeeded",

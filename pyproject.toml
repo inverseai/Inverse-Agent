@@ -13,6 +13,7 @@ authors = [{ name = "Inverse.AI" }]
 dependencies = [
   "fastapi>=0.115,<1",
   "langgraph>=0.2,<2",
+  "langgraph-checkpoint-sqlite>=3.1,<4",
   "mcp>=1.27,<2",
   "pydantic>=2,<3",
   "rich>=13,<15",
@@ -22,7 +23,9 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
+  "mypy>=2.2,<3",
   "pytest>=8,<10",
+  "pytest-cov>=7.1,<8",
   "ruff>=0.8,<1",
 ]
 
@@ -44,3 +47,16 @@ target-version = "py312"
 select = ["E", "F", "I", "UP", "B", "SIM"]
 ignore = ["E501"]
 
+[tool.mypy]
+python_version = "3.12"
+strict = true
+files = ["src/inverse_agent"]
+
+[tool.coverage.run]
+branch = true
+source = ["inverse_agent"]
+
+[tool.coverage.report]
+fail_under = 80
+show_missing = true
+skip_covered = true

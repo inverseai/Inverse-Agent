@@ -1,3 +1,4 @@
+import platform
 from pathlib import Path
 
 from inverse_agent.adapters.android import AndroidAdapter, AndroidNdkAdapter
@@ -10,38 +11,44 @@ from inverse_agent.models import Domain
 FIXTURES = Path(__file__).parent / "fixtures"
 
 
-def test_django_adapter_detects_fixture() -> None:
+def test_django_adapter_detects_fixture_and_records_python_source() -> None:
     root = FIXTURES / "django_project"
-    adapter = DjangoAdapter()
-
-    assert adapter.detect(root)
-    assert Domain.DJANGO in adapter.profile(root).domains
+    profile = DjangoAdapter().profile(root)
+    assert DjangoAdapter().detect(root)
+    assert Domain.DJANGO in profile.domains
+    assert Path(profile.commands["check"][0]).is_absolute()
+    assert profile.toolchain["python_source"]
 
 
 def test_pytorch_adapter_detects_fixture() -> None:
     root = FIXTURES / "pytorch_project"
-    adapter = PyTorchAdapter()
+    profile = PyTorchAdapter().profile(root)
+    assert PyTorchAdapter().detect(root)
+    assert "smoke_train" in profile.commands
+    assert Path(profile.commands["smoke_train"][0]).is_absolute()
 
-    assert adapter.detect(root)
-    assert "smoke_train" in adapter.profile(root).commands
 
-
-def test_android_and_ndk_detection() -> None:
+def test_android_uses_absolute_offline_wrapper() -> None:
     root = FIXTURES / "android_project"
-
+    profile = AndroidAdapter().profile(root)
     assert AndroidAdapter().detect(root)
     assert AndroidNdkAdapter().detect(root)
+    command = profile.commands["tasks"]
+    assert Path(command[0]).is_absolute()
+    assert command[1:] == ["--offline", "tasks"]
 
 
-def test_ios_detection() -> None:
+def test_ios_detection_is_explicitly_unavailable_off_macos() -> None:
     root = FIXTURES / "ios_project"
-
+    profile = IosAdapter().profile(root)
     assert IosAdapter().detect(root)
+    if platform.system() != "Darwin":
+        assert not profile.commands
+        assert "xcodebuild" in profile.unavailable_tools
 
 
-def test_registry_merges_domains() -> None:
+def test_registry_merges_domains_with_deterministic_labels() -> None:
     profile = detect_workspace(FIXTURES / "android_project")
-
     assert Domain.ANDROID in profile.domains
     assert Domain.ANDROID_NDK in profile.domains
-
+    assert all(name.startswith(("android.", "android_ndk.")) for name in profile.commands)

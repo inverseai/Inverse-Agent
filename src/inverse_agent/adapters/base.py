@@ -49,14 +49,13 @@ class CommandAdapter:
         workspace: Path,
         argv: list[str],
         *,
-        approved: bool = False,
+        approval_token: str | None = None,
     ) -> CommandResult:
         return runner.run(
             CommandRequest(
                 argv=tuple(argv),
                 cwd=workspace,
                 domain=self.domain,
-                approved=approved,
+                approval_token=approval_token,
             )
         )
-

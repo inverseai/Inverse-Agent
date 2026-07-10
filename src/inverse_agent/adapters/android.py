@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from inverse_agent.adapters.base import CommandAdapter, Tool
+from inverse_agent.environments import discover_gradle_wrapper, discover_system_executable
 from inverse_agent.models import Domain, WorkspaceProfile
 
 
@@ -15,26 +16,39 @@ class AndroidAdapter(CommandAdapter):
         return (root / "gradlew").exists() or (root / "gradlew.bat").exists() or (root / "build.gradle").exists()
 
     def profile(self, root: Path) -> WorkspaceProfile:
-        gradle = "gradlew.bat" if (root / "gradlew.bat").exists() else "gradlew"
+        gradle = discover_gradle_wrapper(root)
+        commands: dict[str, list[str]] = {}
+        unavailable: dict[str, str] = {}
+        if gradle:
+            executable = str(gradle)
+            commands = {
+                "tasks": [executable, "--offline", "tasks"],
+                "test": [executable, "--offline", "test"],
+                "lint": [executable, "--offline", "lint"],
+                "assemble_debug": [executable, "--offline", "assembleDebug"],
+            }
+        else:
+            unavailable["gradle"] = "Gradle wrapper not found in workspace root"
         return WorkspaceProfile(
             root=root,
             domains={Domain.ANDROID},
-            commands={
-                "tasks": [gradle, "tasks"],
-                "test": [gradle, "test"],
-                "lint": [gradle, "lint"],
-                "assemble_debug": [gradle, "assembleDebug"],
-            },
+            commands=commands,
             test_targets=["gradle test", "gradle lint"],
-            toolchain={"build": "gradle", "gradle": gradle},
+            toolchain={"build": "gradle", "gradle": str(gradle) if gradle else "unavailable"},
+            unavailable_tools=unavailable,
         )
 
     def tools(self) -> list[Tool]:
         return [
-            Tool("android.tasks", "List Gradle tasks", "safe-read", self.domain),
-            Tool("android.test", "Run Android unit tests", "safe-read", self.domain),
-            Tool("android.lint", "Run Android lint", "safe-read", self.domain),
-            Tool("android.assemble_debug", "Build a debug APK", "safe-build", self.domain),
+            Tool("android.tasks", "List Gradle tasks", "approval-required", self.domain),
+            Tool("android.test", "Run Android unit tests", "approval-required", self.domain),
+            Tool("android.lint", "Run Android lint", "approval-required", self.domain),
+            Tool(
+                "android.assemble_debug",
+                "Build a debug APK",
+                "approval-required",
+                self.domain,
+            ),
         ]
 
 
@@ -48,17 +62,24 @@ class AndroidNdkAdapter(CommandAdapter):
         )
 
     def profile(self, root: Path) -> WorkspaceProfile:
+        cmake = discover_system_executable("cmake")
+        commands = {"cmake_build": [str(cmake), "--build", "build"]} if cmake else {}
         return WorkspaceProfile(
             root=root,
             domains={Domain.ANDROID_NDK},
-            commands={"cmake_build": ["cmake", "--build", "build"]},
+            commands=commands,
             test_targets=["cmake --build build"],
-            toolchain={"native": "ndk/cmake"},
+            toolchain={"native": "ndk/cmake", "cmake": str(cmake) if cmake else "unavailable"},
+            unavailable_tools={} if cmake else {"cmake": "cmake executable not found"},
         )
 
     def tools(self) -> list[Tool]:
         return [
-            Tool("android_ndk.cmake_build", "Run configured CMake build", "safe-build", self.domain),
+            Tool(
+                "android_ndk.cmake_build",
+                "Run configured CMake build",
+                "approval-required",
+                self.domain,
+            ),
             Tool("android_ndk.inspect_jni", "Inspect JNI/native layout", "safe-read", self.domain),
         ]
-

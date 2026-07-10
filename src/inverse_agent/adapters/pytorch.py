@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-import sys
 from pathlib import Path
 
 from inverse_agent.adapters.base import CommandAdapter, Tool
+from inverse_agent.environments import discover_python
 from inverse_agent.models import Domain, WorkspaceProfile
 
 
@@ -17,7 +17,8 @@ class PyTorchAdapter(CommandAdapter):
         return any((root / marker).exists() for marker in markers) and self._mentions_torch(root)
 
     def profile(self, root: Path) -> WorkspaceProfile:
-        python = sys.executable
+        environment = discover_python(root)
+        python = str(environment.path)
         commands: dict[str, list[str]] = {}
         if (root / "train.py").exists():
             commands["smoke_train"] = [python, "train.py", "--smoke"]
@@ -28,7 +29,11 @@ class PyTorchAdapter(CommandAdapter):
             domains={Domain.PYTORCH},
             commands=commands,
             test_targets=list(commands),
-            toolchain={"python": python, "framework": "pytorch"},
+            toolchain={
+                "python": python,
+                "python_source": environment.source,
+                "framework": "pytorch",
+            },
         )
 
     def tools(self) -> list[Tool]:
@@ -45,4 +50,3 @@ class PyTorchAdapter(CommandAdapter):
             if path.exists() and "torch" in path.read_text(encoding="utf-8", errors="ignore").lower():
                 return True
         return False
-

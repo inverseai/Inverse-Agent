@@ -1,15 +1,20 @@
-"""Local command runner with default-deny policy enforcement."""
+"""Local command runner with exact policy and approval-capability enforcement."""
 
 from __future__ import annotations
 
 import os
+import signal
 import subprocess
+import tempfile
 import time
+from collections.abc import Callable
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Protocol, cast
 
+from inverse_agent.approvals import ApprovalAuthority, ApprovalClaims, ApprovalError, action_digest
 from inverse_agent.models import CommandRule, Domain, RunnerPolicy, RunStatus
-from inverse_agent.policies import has_shell_metachar
 from inverse_agent.redaction import redact_text
 
 
@@ -18,7 +23,7 @@ class CommandRequest:
     argv: tuple[str, ...]
     cwd: Path
     domain: Domain
-    approved: bool = False
+    approval_token: str | None = None
     timeout_seconds: int | None = None
 
 
@@ -31,18 +36,42 @@ class CommandResult:
     stderr: str
     rule: str | None = None
     reason: str = ""
+    approval_id: str | None = None
+
+
+@dataclass(frozen=True)
+class ApprovalChallenge:
+    action_digest: str
+    rule: str
+    argv: tuple[str, ...]
+    workspace: str
+    domain: str
+    reason: str
+
+
+@dataclass(frozen=True)
+class _PreparedCommand:
+    rule: CommandRule
+    resolved_argv: tuple[str, ...]
+    approval: ApprovalClaims | None
+
+
+class _BinaryStream(Protocol):
+    def seek(self, offset: int, whence: int = 0) -> int:
+        ...
+
+    def read(self, size: int = -1) -> bytes:
+        ...
 
 
 def normalize_token(token: str) -> str:
     value = Path(token).name.lower()
-    if value.endswith(".exe"):
-        value = value[:-4]
-    if value.endswith(".cmd"):
-        value = value[:-4]
+    for suffix in (".exe", ".cmd", ".bat"):
+        if value.endswith(suffix):
+            value = value[: -len(suffix)]
+            break
     if value in {"python3", "py"}:
         return "python"
-    if value in {"gradlew.bat"}:
-        return "gradlew"
     return value
 
 
@@ -57,36 +86,37 @@ class PolicyViolation(ValueError):
 
 
 class LocalRunner:
-    def __init__(self, policy: RunnerPolicy):
+    def __init__(self, policy: RunnerPolicy, approval_authority: ApprovalAuthority | None = None):
         self.policy = policy
         self.workspace_root = policy.workspace_root.resolve()
+        self.approval_authority = approval_authority
 
     def validate(self, request: CommandRequest) -> CommandRule:
-        if not request.argv:
-            raise PolicyViolation("empty argv refused")
-        for arg in request.argv:
-            if has_shell_metachar(arg):
-                raise PolicyViolation(f"shell metacharacter refused in argument: {arg}")
-        cwd = request.cwd.resolve()
-        if not self._is_relative_to(cwd, self.workspace_root):
-            raise PolicyViolation(f"cwd outside workspace refused: {cwd}")
-        normalized = normalize_argv(request.argv)
-        for rule in self.policy.rules_for(request.domain):
-            if normalized[: len(rule.argv_prefix)] == rule.argv_prefix:
-                if (
-                    rule.network_required
-                    and self.policy.network_default == "deny"
-                    and not request.approved
-                ):
-                    raise PolicyViolation(f"network approval required for {rule.name}: {rule.reason}")
-                if rule.requires_approval and not request.approved:
-                    raise PolicyViolation(f"approval required for {rule.name}: {rule.reason}")
-                return rule
-        raise PolicyViolation(f"command is not allowlisted: {' '.join(request.argv)}")
+        """Validate without consuming an approval capability."""
+
+        return self._prepare(request, consume_approval=False).rule
+
+    def approval_challenge(self, request: CommandRequest) -> ApprovalChallenge:
+        prepared = self._prepare(request, require_approval=False, consume_approval=False)
+        if not prepared.rule.requires_approval and not prepared.rule.network_required:
+            raise PolicyViolation(f"command does not require approval: {prepared.rule.name}")
+        return ApprovalChallenge(
+            action_digest=action_digest(
+                workspace=self.workspace_root,
+                domain=request.domain,
+                rule=prepared.rule,
+                argv=prepared.resolved_argv,
+            ),
+            rule=prepared.rule.name,
+            argv=prepared.resolved_argv,
+            workspace=str(self.workspace_root),
+            domain=request.domain.value,
+            reason=prepared.rule.reason,
+        )
 
     def run(self, request: CommandRequest) -> CommandResult:
         try:
-            rule = self.validate(request)
+            prepared = self._prepare(request, consume_approval=True)
         except PolicyViolation as exc:
             return CommandResult(
                 status=RunStatus.REFUSED,
@@ -96,87 +126,185 @@ class LocalRunner:
                 stderr="",
                 reason=str(exc),
             )
+
         timeout = request.timeout_seconds or self.policy.compute_budget_seconds
+        if timeout <= 0:
+            return self._failed(request, prepared, "timeout must be positive")
+
         started = time.monotonic()
         try:
-            completed = subprocess.run(
-                list(request.argv),
-                cwd=request.cwd,
-                shell=False,
-                text=True,
-                capture_output=True,
-                timeout=timeout,
-                env=self._safe_env(),
-                check=False,
-            )
-        except subprocess.TimeoutExpired as exc:
-            stdout = redact_text(exc.stdout or "").text
-            stderr = redact_text(exc.stderr or "").text
-            return CommandResult(
-                status=RunStatus.FAILED,
-                argv=request.argv,
-                returncode=None,
-                stdout=stdout,
-                stderr=stderr,
-                rule=rule.name,
-                reason=f"command exceeded compute budget after {timeout} seconds",
-            )
+            with tempfile.TemporaryFile() as stdout_file, tempfile.TemporaryFile() as stderr_file:
+                process = subprocess.Popen(
+                    list(prepared.resolved_argv),
+                    cwd=self.workspace_root,
+                    shell=False,
+                    stdout=stdout_file,
+                    stderr=stderr_file,
+                    env=self._safe_env(),
+                    start_new_session=os.name != "nt",
+                    creationflags=(
+                        subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
+                    ),
+                )
+                timed_out = False
+                try:
+                    returncode = process.wait(timeout=timeout)
+                except subprocess.TimeoutExpired:
+                    timed_out = True
+                    self._terminate_process_tree(process)
+                    returncode = process.wait()
+                stdout, stdout_truncated = self._read_output(stdout_file)
+                stderr, stderr_truncated = self._read_output(stderr_file)
         except FileNotFoundError as exc:
-            return CommandResult(
-                status=RunStatus.FAILED,
-                argv=request.argv,
-                returncode=None,
-                stdout="",
-                stderr="",
-                rule=rule.name,
-                reason=f"executable not found: {exc.filename}",
-            )
+            return self._failed(request, prepared, f"executable not found: {exc.filename}")
         except PermissionError as exc:
-            return CommandResult(
-                status=RunStatus.FAILED,
-                argv=request.argv,
-                returncode=None,
-                stdout="",
-                stderr="",
-                rule=rule.name,
-                reason=f"permission denied while executing command: {exc}",
-            )
+            return self._failed(request, prepared, f"permission denied while executing command: {exc}")
         except OSError as exc:
+            return self._failed(request, prepared, f"os error while executing command: {exc}")
+
+        stdout_redaction = redact_text(stdout)
+        stderr_redaction = redact_text(stderr)
+        approval_id = prepared.approval.approval_id if prepared.approval else None
+        if timed_out:
             return CommandResult(
                 status=RunStatus.FAILED,
-                argv=request.argv,
-                returncode=None,
-                stdout="",
-                stderr="",
-                rule=rule.name,
-                reason=f"os error while executing command: {exc}",
+                argv=prepared.resolved_argv,
+                returncode=returncode,
+                stdout=stdout_redaction.text,
+                stderr=stderr_redaction.text,
+                rule=prepared.rule.name,
+                reason=f"command exceeded compute budget after {timeout} seconds",
+                approval_id=approval_id,
             )
-        stdout_redaction = redact_text(completed.stdout)
-        stderr_redaction = redact_text(completed.stderr)
-        status = RunStatus.SUCCEEDED if completed.returncode == 0 else RunStatus.FAILED
-        redacted_streams = []
+
+        status = RunStatus.SUCCEEDED if returncode == 0 else RunStatus.FAILED
+        notes: list[str] = []
         if stdout_redaction.blocked:
-            redacted_streams.append("stdout")
+            notes.append("redacted stdout")
         if stderr_redaction.blocked:
-            redacted_streams.append("stderr")
+            notes.append("redacted stderr")
+        if stdout_truncated:
+            notes.append("truncated stdout")
+        if stderr_truncated:
+            notes.append("truncated stderr")
         elapsed = time.monotonic() - started
-        reason = (
-            f"redacted secret-like content from {', '.join(redacted_streams)}"
-            if redacted_streams
-            else f"completed in {elapsed:.3f}s"
-        )
+        reason = ", ".join(notes) if notes else f"completed in {elapsed:.3f}s"
         return CommandResult(
             status=status,
-            argv=request.argv,
-            returncode=completed.returncode,
+            argv=prepared.resolved_argv,
+            returncode=returncode,
             stdout=stdout_redaction.text,
             stderr=stderr_redaction.text,
-            rule=rule.name,
+            rule=prepared.rule.name,
             reason=reason,
+            approval_id=approval_id,
         )
+
+    def _prepare(
+        self,
+        request: CommandRequest,
+        *,
+        require_approval: bool = True,
+        consume_approval: bool,
+    ) -> _PreparedCommand:
+        if not request.argv:
+            raise PolicyViolation("empty argv refused")
+        cwd = request.cwd.resolve()
+        if cwd != self.workspace_root:
+            raise PolicyViolation(f"command cwd must equal workspace root: {cwd}")
+
+        normalized = normalize_argv(request.argv)
+        rule = next(
+            (
+                candidate
+                for candidate in self.policy.rules_for(request.domain)
+                if normalized == candidate.argv_prefix
+            ),
+            None,
+        )
+        if rule is None:
+            raise PolicyViolation(f"command is not exactly allowlisted: {' '.join(request.argv)}")
+
+        for index in rule.workspace_path_args:
+            try:
+                raw_path = Path(request.argv[index])
+            except IndexError as exc:
+                raise PolicyViolation(f"rule {rule.name} has an invalid path-argument index") from exc
+            resolved_path = (
+                raw_path.resolve()
+                if raw_path.is_absolute()
+                else (self.workspace_root / raw_path).resolve()
+            )
+            if not resolved_path.is_relative_to(self.workspace_root):
+                raise PolicyViolation(f"path argument escapes workspace: {raw_path}")
+
+        resolved_argv = (str(self._resolve_executable(request.argv[0], rule)), *request.argv[1:])
+        approval: ApprovalClaims | None = None
+        approval_needed = rule.requires_approval or (
+            rule.network_required and self.policy.network_default == "deny"
+        )
+        if approval_needed and require_approval:
+            if not request.approval_token:
+                raise PolicyViolation(f"approval capability required for {rule.name}: {rule.reason}")
+            if self.approval_authority is None:
+                raise PolicyViolation("runner has no approval authority configured")
+            try:
+                approval = self.approval_authority.verify(
+                    request.approval_token,
+                    workspace=self.workspace_root,
+                    domain=request.domain,
+                    rule=rule,
+                    argv=resolved_argv,
+                    consume=consume_approval,
+                )
+            except ApprovalError as exc:
+                raise PolicyViolation(str(exc)) from exc
+        return _PreparedCommand(rule=rule, resolved_argv=resolved_argv, approval=approval)
+
+    def _resolve_executable(self, requested: str, rule: CommandRule) -> Path:
+        alias = normalize_token(requested)
+        trusted = tuple(path.resolve() for path in self.policy.trusted_executables.get(alias, ()))
+        workspace = tuple(
+            path.resolve()
+            for path in self.policy.allowed_workspace_executables
+            if normalize_token(str(path)) == alias
+        )
+        candidates = (*trusted, *workspace)
+        if not candidates:
+            raise PolicyViolation(f"no trusted executable registered for {alias}")
+
+        requested_path = Path(requested)
+        has_path = requested_path.is_absolute() or requested_path.parent != Path(".")
+        if has_path:
+            resolved = requested_path.resolve()
+            if resolved not in candidates:
+                raise PolicyViolation(f"untrusted executable path refused: {resolved}")
+        else:
+            resolved = candidates[0]
+        if not resolved.is_file():
+            raise PolicyViolation(f"registered executable is missing: {resolved}")
+        if resolved in workspace and not rule.requires_approval:
+            raise PolicyViolation("workspace executable requires an approval-gated rule")
+        return resolved
+
+    def _read_output(self, stream: _BinaryStream) -> tuple[str, bool]:
+        stream.seek(0)
+        raw = stream.read(self.policy.output_limit_bytes + 1)
+        truncated = len(raw) > self.policy.output_limit_bytes
+        raw = raw[: self.policy.output_limit_bytes]
+        text = raw.decode("utf-8", errors="replace")
+        if truncated:
+            text += "\n[OUTPUT_TRUNCATED]"
+        return text, truncated
 
     def _safe_env(self) -> dict[str, str]:
         env: dict[str, str] = {
+            "GCM_INTERACTIVE": "Never",
+            "GIT_CONFIG_GLOBAL": "NUL" if os.name == "nt" else "/dev/null",
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_TERMINAL_PROMPT": "0",
+            "NO_COLOR": "1",
+            "PIP_NO_INPUT": "1",
             "PYTHONIOENCODING": "utf-8",
             "PYTHONUNBUFFERED": "1",
         }
@@ -190,9 +318,34 @@ class LocalRunner:
         return env
 
     @staticmethod
-    def _is_relative_to(path: Path, parent: Path) -> bool:
-        try:
-            path.relative_to(parent)
-            return True
-        except ValueError:
-            return False
+    def _terminate_process_tree(process: subprocess.Popen[bytes]) -> None:
+        if os.name == "nt":
+            taskkill = Path(os.environ.get("SYSTEMROOT", r"C:\Windows")) / "System32" / "taskkill.exe"
+            subprocess.run(
+                [str(taskkill), "/PID", str(process.pid), "/T", "/F"],
+                capture_output=True,
+                check=False,
+            )
+            return
+        killpg = cast(Callable[[int, int], None] | None, getattr(os, "killpg", None))
+        sigkill = cast(int, getattr(signal, "SIGKILL", signal.SIGTERM))
+        if killpg:
+            with suppress(ProcessLookupError):
+                killpg(process.pid, sigkill)
+
+    @staticmethod
+    def _failed(
+        request: CommandRequest,
+        prepared: _PreparedCommand,
+        reason: str,
+    ) -> CommandResult:
+        return CommandResult(
+            status=RunStatus.FAILED,
+            argv=request.argv,
+            returncode=None,
+            stdout="",
+            stderr="",
+            rule=prepared.rule.name,
+            reason=reason,
+            approval_id=prepared.approval.approval_id if prepared.approval else None,
+        )

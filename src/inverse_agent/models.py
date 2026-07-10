@@ -47,6 +47,7 @@ class ArtifactKind(StrEnum):
 class RunStatus(StrEnum):
     PLANNED = "planned"
     WAITING_FOR_APPROVAL = "waiting_for_approval"
+    APPROVING = "approving"
     RUNNING = "running"
     SUCCEEDED = "succeeded"
     FAILED = "failed"
@@ -71,6 +72,7 @@ class WorkspaceProfile:
     commands: dict[str, list[str]] = field(default_factory=dict)
     test_targets: list[str] = field(default_factory=list)
     toolchain: dict[str, str] = field(default_factory=dict)
+    unavailable_tools: dict[str, str] = field(default_factory=dict)
     secrets_required: list[str] = field(default_factory=list)
     risk_rules: list[ApprovalRule] = field(default_factory=list)
     inference_mode: InferenceMode = InferenceMode.CLOUD_NO_RETENTION
@@ -107,8 +109,8 @@ class RunSpec:
 class CommandRule:
     """Structured argv allowlist rule.
 
-    A rule matches when command argv starts with argv_prefix after executable
-    normalization. Rules may require approval even when they match.
+    Rules match exact argv by default after executable normalization. A rule may
+    opt into trailing arguments only when a caller supplies a separate validator.
     """
 
     name: str
@@ -117,6 +119,7 @@ class CommandRule:
     requires_approval: bool = False
     network_required: bool = False
     reason: str = ""
+    workspace_path_args: tuple[int, ...] = ()
 
 
 @dataclass
@@ -127,13 +130,24 @@ class RunnerPolicy:
     secrets_default: str = "deny"
     compute_budget_seconds: int = 300
     artifact_upload_default: str = "metadata_only"
+    trusted_executables: dict[str, tuple[Path, ...]] = field(default_factory=dict)
+    allowed_workspace_executables: tuple[Path, ...] = ()
+    output_limit_bytes: int = 2_000_000
     allowed_env_names: tuple[str, ...] = (
+        "ANDROID_HOME",
+        "ANDROID_SDK_ROOT",
         "COMSPEC",
+        "CUDA_VISIBLE_DEVICES",
+        "GRADLE_USER_HOME",
+        "HOME",
+        "JAVA_HOME",
         "PATH",
         "PATHEXT",
         "SYSTEMROOT",
         "TEMP",
         "TMP",
+        "USERPROFILE",
+        "VIRTUAL_ENV",
         "WINDIR",
     )
 

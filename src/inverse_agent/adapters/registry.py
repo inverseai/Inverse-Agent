@@ -28,13 +28,17 @@ def detect_workspace(root: Path) -> WorkspaceProfile:
     commands: dict[str, list[str]] = {}
     tests: list[str] = []
     toolchain: dict[str, str] = {}
+    unavailable: dict[str, str] = {}
     for adapter in default_adapters():
         if adapter.detect(root):
             profile = adapter.profile(root)
             domains.update(profile.domains)
-            commands.update({f"{next(iter(profile.domains)).value}.{k}": v for k, v in profile.commands.items()})
+            commands.update({f"{adapter.domain.value}.{k}": v for k, v in profile.commands.items()})
             tests.extend(profile.test_targets)
             toolchain.update(profile.toolchain)
+            unavailable.update(
+                {f"{adapter.domain.value}.{key}": value for key, value in profile.unavailable_tools.items()}
+            )
     if not domains:
         domains.add(Domain.GENERIC)
     return WorkspaceProfile(
@@ -43,5 +47,5 @@ def detect_workspace(root: Path) -> WorkspaceProfile:
         commands=commands,
         test_targets=tests,
         toolchain=toolchain,
+        unavailable_tools=unavailable,
     )
-

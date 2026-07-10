@@ -1,124 +1,192 @@
-"""Policy factories and validation."""
+"""Policy factories for exact, trusted command execution."""
 
 from __future__ import annotations
 
 from pathlib import Path
 
+from inverse_agent.environments import (
+    discover_gradle_wrapper,
+    discover_python,
+    discover_system_executable,
+)
 from inverse_agent.models import CommandRule, Domain, RunnerPolicy
-
-SHELL_METACHARS = {
-    "!",
-    "$(",
-    "%",
-    "&",
-    "&&",
-    ";",
-    "<",
-    ">",
-    ">>",
-    "^",
-    "`",
-    "|",
-    "||",
-}
-
-
-def has_shell_metachar(value: str) -> bool:
-    return any(token in value for token in SHELL_METACHARS)
 
 
 def default_policy(workspace_root: Path) -> RunnerPolicy:
-    """Create the default-deny command policy with narrow allowlists."""
+    """Create a default-deny policy with exact argv and trusted executable paths."""
 
-    return RunnerPolicy(
-        workspace_root=workspace_root,
-        allowed_commands=[
-            CommandRule("git-status", ("git", "status"), Domain.GENERIC),
-            CommandRule("git-diff", ("git", "diff"), Domain.GENERIC),
-            CommandRule("git-log", ("git", "log"), Domain.GENERIC),
-            CommandRule("git-show", ("git", "show"), Domain.GENERIC),
-            CommandRule("git-ls-files", ("git", "ls-files"), Domain.GENERIC),
-            CommandRule("django-check", ("python", "manage.py", "check"), Domain.DJANGO),
-            CommandRule(
-                "django-test",
-                ("python", "manage.py", "test"),
-                Domain.DJANGO,
-                requires_approval=True,
-                reason="Django tests import and execute workspace code",
-            ),
-            CommandRule(
-                "django-makemigrations-dry-run",
-                ("python", "manage.py", "makemigrations", "--check", "--dry-run"),
-                Domain.DJANGO,
-            ),
-            CommandRule("django-migrate-plan", ("python", "manage.py", "migrate", "--plan"), Domain.DJANGO),
-            CommandRule(
-                "pytest",
-                ("pytest",),
-                Domain.GENERIC,
-                requires_approval=True,
-                reason="pytest imports and executes workspace code",
-            ),
-            CommandRule("ruff-check", ("ruff", "check"), Domain.GENERIC),
-            CommandRule(
-                "pytorch-smoke",
-                ("python", "train.py", "--smoke"),
-                Domain.PYTORCH,
-                requires_approval=True,
-                reason="PyTorch smoke jobs execute workspace code",
-            ),
-            CommandRule(
-                "pytorch-eval",
-                ("python", "eval.py"),
-                Domain.PYTORCH,
-                requires_approval=True,
-                reason="Evaluation jobs execute workspace code",
-            ),
-            CommandRule("gradle-tasks", ("gradlew", "tasks"), Domain.ANDROID),
-            CommandRule(
-                "gradle-test",
-                ("gradlew", "test"),
-                Domain.ANDROID,
-                requires_approval=True,
-                reason="Gradle tests execute workspace code",
-            ),
-            CommandRule(
-                "gradle-lint",
-                ("gradlew", "lint"),
-                Domain.ANDROID,
-                requires_approval=True,
-                network_required=True,
-                reason="Gradle may resolve dependencies or plugins",
-            ),
-            CommandRule(
-                "gradle-assemble-debug",
-                ("gradlew", "assembleDebug"),
-                Domain.ANDROID,
-                requires_approval=True,
-                network_required=True,
-                reason="Android builds may resolve dependencies and execute build scripts",
-            ),
-            CommandRule(
-                "cmake-build",
-                ("cmake", "--build"),
-                Domain.ANDROID_NDK,
-                requires_approval=True,
-                reason="Native builds execute project build scripts",
-            ),
-            CommandRule("xcode-list", ("xcodebuild", "-list"), Domain.IOS),
-            CommandRule(
-                "xcode-build",
-                ("xcodebuild", "build"),
-                Domain.IOS,
-                requires_approval=True,
-                reason="Xcode builds execute project build phases",
-            ),
-            CommandRule(
-                "xcode-test",
-                ("xcodebuild", "test"),
-                Domain.IOS,
-                requires_approval=True,
-                reason="Xcode tests execute workspace code",
-            ),
-        ],
+    root = workspace_root.resolve()
+    python = discover_python(root).path
+    gradle = discover_gradle_wrapper(root)
+    trusted: dict[str, tuple[Path, ...]] = {}
+    workspace_executables: list[Path] = []
+
+    _register_executable(trusted, workspace_executables, root, "python", python)
+    if gradle:
+        _register_executable(trusted, workspace_executables, root, "gradlew", gradle)
+    for name in ("cmake", "git", "pytest", "ruff", "xcodebuild"):
+        _register_executable(
+            trusted,
+            workspace_executables,
+            root,
+            name,
+            discover_system_executable(name),
+        )
+
+    git_safe = (
+        "git",
+        "-c",
+        "core.fsmonitor=",
+        "-c",
+        "core.pager=cat",
+        "-c",
+        "pager.status=false",
     )
+    rules = [
+        CommandRule(
+            "git-status",
+            (*git_safe, "status", "--short", "--branch", "--untracked-files=no"),
+            Domain.GENERIC,
+        ),
+        CommandRule("git-ls-files", (*git_safe, "ls-files"), Domain.GENERIC),
+        CommandRule(
+            "django-check",
+            ("python", "manage.py", "check"),
+            Domain.DJANGO,
+            requires_approval=True,
+            reason="Django checks import and execute workspace code",
+            workspace_path_args=(1,),
+        ),
+        CommandRule(
+            "django-test",
+            ("python", "manage.py", "test"),
+            Domain.DJANGO,
+            requires_approval=True,
+            reason="Django tests import and execute workspace code",
+            workspace_path_args=(1,),
+        ),
+        CommandRule(
+            "django-makemigrations-dry-run",
+            ("python", "manage.py", "makemigrations", "--check", "--dry-run"),
+            Domain.DJANGO,
+            requires_approval=True,
+            reason="Django management commands import workspace code",
+            workspace_path_args=(1,),
+        ),
+        CommandRule(
+            "django-migrate-plan",
+            ("python", "manage.py", "migrate", "--plan"),
+            Domain.DJANGO,
+            requires_approval=True,
+            reason="Django management commands import workspace code",
+            workspace_path_args=(1,),
+        ),
+        CommandRule(
+            "pytest",
+            ("pytest",),
+            Domain.GENERIC,
+            requires_approval=True,
+            reason="pytest imports and executes workspace code",
+        ),
+        CommandRule(
+            "ruff-check",
+            ("ruff", "check", "."),
+            Domain.GENERIC,
+            workspace_path_args=(2,),
+        ),
+        CommandRule(
+            "pytorch-smoke",
+            ("python", "train.py", "--smoke"),
+            Domain.PYTORCH,
+            requires_approval=True,
+            reason="PyTorch smoke jobs execute workspace code",
+            workspace_path_args=(1,),
+        ),
+        CommandRule(
+            "pytorch-eval",
+            ("python", "eval.py"),
+            Domain.PYTORCH,
+            requires_approval=True,
+            reason="Evaluation jobs execute workspace code",
+            workspace_path_args=(1,),
+        ),
+        CommandRule(
+            "gradle-tasks",
+            ("gradlew", "--offline", "tasks"),
+            Domain.ANDROID,
+            requires_approval=True,
+            reason="Gradle configuration executes workspace build scripts",
+        ),
+        CommandRule(
+            "gradle-test",
+            ("gradlew", "--offline", "test"),
+            Domain.ANDROID,
+            requires_approval=True,
+            reason="Gradle tests execute workspace code",
+        ),
+        CommandRule(
+            "gradle-lint",
+            ("gradlew", "--offline", "lint"),
+            Domain.ANDROID,
+            requires_approval=True,
+            reason="Android lint executes workspace build scripts",
+        ),
+        CommandRule(
+            "gradle-assemble-debug",
+            ("gradlew", "--offline", "assembleDebug"),
+            Domain.ANDROID,
+            requires_approval=True,
+            reason="Android builds execute workspace build scripts",
+        ),
+        CommandRule(
+            "cmake-build",
+            ("cmake", "--build", "build"),
+            Domain.ANDROID_NDK,
+            requires_approval=True,
+            reason="Native builds execute project build scripts",
+            workspace_path_args=(2,),
+        ),
+        CommandRule(
+            "xcode-list",
+            ("xcodebuild", "-list"),
+            Domain.IOS,
+            requires_approval=True,
+            reason="Xcode project loading may resolve packages and execute project configuration",
+        ),
+        CommandRule(
+            "xcode-build",
+            ("xcodebuild", "build"),
+            Domain.IOS,
+            requires_approval=True,
+            reason="Xcode builds execute project build phases",
+        ),
+        CommandRule(
+            "xcode-test",
+            ("xcodebuild", "test"),
+            Domain.IOS,
+            requires_approval=True,
+            reason="Xcode tests execute workspace code",
+        ),
+    ]
+    return RunnerPolicy(
+        workspace_root=root,
+        allowed_commands=rules,
+        trusted_executables=trusted,
+        allowed_workspace_executables=tuple(workspace_executables),
+    )
+
+
+def _register_executable(
+    trusted: dict[str, tuple[Path, ...]],
+    workspace_executables: list[Path],
+    root: Path,
+    alias: str,
+    executable: Path | None,
+) -> None:
+    if executable is None:
+        return
+    resolved = executable.resolve()
+    if resolved.is_relative_to(root):
+        workspace_executables.append(resolved)
+        return
+    trusted[alias] = (*trusted.get(alias, ()), resolved)
