@@ -143,7 +143,9 @@ class LocalRunner:
                     env=self._safe_env(),
                     start_new_session=os.name != "nt",
                     creationflags=(
-                        subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
+                        int(getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
+                        if os.name == "nt"
+                        else 0
                     ),
                 )
                 timed_out = False
