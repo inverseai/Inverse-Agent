@@ -7,9 +7,18 @@ import pytest
 from inverse_agent.approvals import ApprovalAuthority, ApprovalError, SqliteApprovalReplayStore
 from inverse_agent.models import CommandRule, Domain, RunnerPolicy, RunStatus
 from inverse_agent.policies import default_policy
-from inverse_agent.runner import CommandRequest, LocalRunner
+from inverse_agent.runner import CommandRequest, LocalRunner, normalize_token
 
 SECRET = b"test-approval-secret-that-is-at-least-32-bytes"
+
+
+@pytest.mark.parametrize("token", ["python", "python3", "python3.12", "/usr/bin/python3.12"])
+def test_normalize_token_accepts_versioned_python_executables(token: str) -> None:
+    assert normalize_token(token) == "python"
+
+
+def test_normalize_token_does_not_overmatch_python_tools() -> None:
+    assert normalize_token("python-config") == "python-config"
 
 
 def _python_runner(

@@ -70,8 +70,12 @@ def normalize_token(token: str) -> str:
         if value.endswith(suffix):
             value = value[: -len(suffix)]
             break
-    if value in {"python3", "py"}:
+    if value in {"python", "py"}:
         return "python"
+    if value.startswith("python"):
+        version = value.removeprefix("python")
+        if version and all(part.isdigit() for part in version.split(".")):
+            return "python"
     return value
 
 
