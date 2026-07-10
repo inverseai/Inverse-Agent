@@ -1,24 +1,33 @@
+import argparse
 import json
 import platform
 import shutil
+import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
 
-from inverse_agent.cli import main
+from inverse_agent.cli import approve_command, main
 from inverse_agent.models import AutonomyLevel, Domain, RunStatus
-from inverse_agent.service import AgentService
+from inverse_agent.planner import Planner
+from inverse_agent.service import AgentService, RunRecord, RunStore
 
 FIXTURES = Path(__file__).parent / "fixtures"
 SECRET = b"test-workflow-secret-that-is-at-least-32-bytes"
 
 
-def _service(state_dir: Path) -> AgentService:
+def _service(
+    state_dir: Path,
+    planner_fingerprint: str = "deterministic",
+    planner: Planner | None = None,
+) -> AgentService:
     return AgentService(
         workspace_root=FIXTURES,
         state_dir=state_dir,
         approval_secret=SECRET,
+        planner=planner,
+        planner_fingerprint=planner_fingerprint,
     )
 
 
@@ -28,6 +37,44 @@ def _approve(service: AgentService, record, approved_by: str):
         approved_by=approved_by,
         expected_action_digest=record.pending_approval["action_digest"],
     )
+
+
+def test_approve_command_returns_failure_for_failed_run(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    record = RunRecord(
+        run_id="failed-run",
+        goal="Inspect",
+        workspace=str(FIXTURES),
+        domain=Domain.GENERIC.value,
+        autonomy_level=AutonomyLevel.ASSISTED.value,
+        status=RunStatus.FAILED.value,
+        pending_approval=None,
+        trace_path=None,
+        error="command failed",
+        created_at=1.0,
+        updated_at=2.0,
+        planner_fingerprint="deterministic",
+    )
+
+    class FailedService:
+        def approve_and_resume(self, *_args: object, **_kwargs: object) -> RunRecord:
+            return record
+
+        def close(self) -> None:
+            return
+
+    monkeypatch.setattr("inverse_agent.cli._service", lambda *_args, **_kwargs: FailedService())
+    args = argparse.Namespace(
+        workspace_root=str(FIXTURES),
+        run_id=record.run_id,
+        approved_by="tester",
+        action_digest="digest",
+    )
+
+    assert approve_command(args) == 1
+    assert json.loads(capsys.readouterr().out)["status"] == RunStatus.FAILED.value
 
 
 def test_django_workflow_pauses_for_each_action_then_succeeds(tmp_path: Path) -> None:
@@ -54,6 +101,94 @@ def test_django_workflow_pauses_for_each_action_then_succeeds(tmp_path: Path) ->
     payload = json.loads(Path(final.trace_path).read_text(encoding="utf-8"))
     assert payload["status"] == "succeeded"
     assert len(payload["approvals"]) == 2
+    assert payload["planner_fingerprint"] == "deterministic"
+
+
+def test_goal_is_redacted_before_persistence_and_trace_output(tmp_path: Path) -> None:
+    service = _service(tmp_path / "state")
+    try:
+        created = service.create_run(
+            goal="Inspect token=super-secret-goal-value",
+            workspace=FIXTURES / "django_project",
+            domain=Domain.DJANGO,
+            autonomy_level=AutonomyLevel.ADVISORY,
+        )
+        completed = service.start(created.run_id)
+    finally:
+        service.close()
+
+    assert "super-secret-goal-value" not in created.goal
+    assert "[REDACTED_SECRET]" in created.goal
+    assert completed.trace_path
+    trace = Path(completed.trace_path).read_text(encoding="utf-8")
+    assert "super-secret-goal-value" not in trace
+    assert "[REDACTED_SECRET]" in trace
+
+
+def test_run_refuses_planner_change_before_start(tmp_path: Path) -> None:
+    state_dir = tmp_path / "state"
+    first = _service(state_dir, "openai-compatible|model-a|http://127.0.0.1:1234/v1|8")
+    created = first.create_run(
+        goal="Verify planner provenance",
+        workspace=FIXTURES / "django_project",
+        domain=Domain.DJANGO,
+    )
+    first.close()
+
+    second = _service(state_dir, "openai-compatible|model-b|http://127.0.0.1:1234/v1|8")
+    try:
+        with pytest.raises(ValueError, match="planner configuration changed"):
+            second.start(created.run_id)
+    finally:
+        second.close()
+
+
+def test_waiting_run_resumes_without_replanning_after_config_change(tmp_path: Path) -> None:
+    state_dir = tmp_path / "state"
+    first = _service(state_dir, "openai-compatible|model-a|http://127.0.0.1:1234/v1|8")
+    first.trust_workspace(FIXTURES / "django_project", trusted_by="tester")
+    created = first.create_run(
+        goal="Verify durable model plan",
+        workspace=FIXTURES / "django_project",
+        domain=Domain.DJANGO,
+    )
+    waiting = first.start(created.run_id)
+    first.close()
+
+    class ReplanningFailsTest:
+        def plan(self, **_kwargs):
+            pytest.fail("resume invoked the planner")
+
+    second = _service(
+        state_dir,
+        "openai-compatible|model-b|http://127.0.0.1:1234/v1|8",
+        planner=ReplanningFailsTest(),
+    )
+    try:
+        resumed = _approve(second, waiting, "tester")
+    finally:
+        second.close()
+    assert resumed.status == RunStatus.WAITING_FOR_APPROVAL.value
+    assert resumed.pending_approval and resumed.pending_approval["rule"] == "django-test"
+
+
+def test_run_store_migrates_planner_fingerprint_column(tmp_path: Path) -> None:
+    path = tmp_path / "runs.sqlite"
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE runs (
+                run_id TEXT PRIMARY KEY, goal TEXT NOT NULL, workspace TEXT NOT NULL,
+                domain TEXT NOT NULL, autonomy_level INTEGER NOT NULL, status TEXT NOT NULL,
+                pending_approval TEXT, trace_path TEXT, error TEXT,
+                created_at REAL NOT NULL, updated_at REAL NOT NULL
+            )
+            """
+        )
+    RunStore(path)
+    with sqlite3.connect(path) as connection:
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(runs)")}
+    assert "planner_fingerprint" in columns
 
 
 def test_workflow_resumes_after_service_restart(tmp_path: Path) -> None:
@@ -309,9 +444,7 @@ def test_cli_profile_outputs_json(capsys) -> None:
     assert "django" in payload["domains"]
 
 
-def test_cli_start_returns_waiting_status(
-    tmp_path: Path, monkeypatch, capsys
-) -> None:
+def test_cli_start_returns_waiting_status(tmp_path: Path, monkeypatch, capsys) -> None:
     monkeypatch.setenv("INVERSE_AGENT_APPROVAL_SECRET", SECRET.decode())
     state_dir = tmp_path / "state"
     assert (

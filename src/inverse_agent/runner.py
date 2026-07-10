@@ -60,11 +60,9 @@ class _PreparedCommand:
 
 
 class _BinaryStream(Protocol):
-    def seek(self, offset: int, whence: int = 0) -> int:
-        ...
+    def seek(self, offset: int, whence: int = 0) -> int: ...
 
-    def read(self, size: int = -1) -> bytes:
-        ...
+    def read(self, size: int = -1) -> bytes: ...
 
 
 def normalize_token(token: str) -> str:
@@ -182,7 +180,9 @@ class LocalRunner:
         except FileNotFoundError as exc:
             return self._failed(request, prepared, f"executable not found: {exc.filename}")
         except PermissionError as exc:
-            return self._failed(request, prepared, f"permission denied while executing command: {exc}")
+            return self._failed(
+                request, prepared, f"permission denied while executing command: {exc}"
+            )
         except OSError as exc:
             return self._failed(request, prepared, f"os error while executing command: {exc}")
 
@@ -258,7 +258,9 @@ class LocalRunner:
             try:
                 raw_path = Path(request.argv[index])
             except IndexError as exc:
-                raise PolicyViolation(f"rule {rule.name} has an invalid path-argument index") from exc
+                raise PolicyViolation(
+                    f"rule {rule.name} has an invalid path-argument index"
+                ) from exc
             resolved_path = (
                 raw_path.resolve()
                 if raw_path.is_absolute()
@@ -274,7 +276,9 @@ class LocalRunner:
         )
         if approval_needed and require_approval:
             if not request.approval_token:
-                raise PolicyViolation(f"approval capability required for {rule.name}: {rule.reason}")
+                raise PolicyViolation(
+                    f"approval capability required for {rule.name}: {rule.reason}"
+                )
             if self.approval_authority is None:
                 raise PolicyViolation("runner has no approval authority configured")
             try:
@@ -351,7 +355,9 @@ class LocalRunner:
     @staticmethod
     def _terminate_process_tree(process: subprocess.Popen[bytes]) -> None:
         if os.name == "nt":
-            taskkill = Path(os.environ.get("SYSTEMROOT", r"C:\Windows")) / "System32" / "taskkill.exe"
+            taskkill = (
+                Path(os.environ.get("SYSTEMROOT", r"C:\Windows")) / "System32" / "taskkill.exe"
+            )
             with suppress(OSError, subprocess.TimeoutExpired):
                 subprocess.run(
                     [str(taskkill), "/PID", str(process.pid), "/T", "/F"],

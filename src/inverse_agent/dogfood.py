@@ -10,6 +10,9 @@ from inverse_agent.adapters.registry import detect_workspace
 from inverse_agent.eval import json_default
 from inverse_agent.models import Domain
 from inverse_agent.planner import DeterministicPlanner, Planner
+from inverse_agent.redaction import redact_text
+
+MAX_EVALUATION_ERROR_CHARS = 4096
 
 
 @dataclass(frozen=True)
@@ -56,7 +59,8 @@ def evaluate_workspace(root: Path, planner: Planner | None = None) -> WorkspaceE
             planned = tuple(action.tool_name for action in plan.actions)
             results.append(DomainEvaluation(domain, True, planned, unavailable))
         except (TypeError, ValueError) as exc:
-            results.append(DomainEvaluation(domain, False, (), unavailable, str(exc)))
+            error = redact_text(str(exc)).text[:MAX_EVALUATION_ERROR_CHARS]
+            results.append(DomainEvaluation(domain, False, (), unavailable, error))
     return WorkspaceEvaluation(root.resolve(), tuple(results))
 
 

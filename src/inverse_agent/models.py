@@ -102,6 +102,7 @@ class RunSpec:
     budget: dict[str, int | float] = field(default_factory=dict)
     expected_artifacts: set[ArtifactKind] = field(default_factory=set)
     stop_conditions: list[str] = field(default_factory=list)
+    planner_fingerprint: str = "deterministic"
     run_id: str = field(default_factory=lambda: str(uuid4()))
 
 
@@ -177,10 +178,13 @@ class EvalTrace:
     duration_seconds: float = 0.0
     status: RunStatus = RunStatus.PLANNED
     human_edits_after_output: int = 0
+    planner_fingerprint: str = "deterministic"
     created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
 
     def record_action(self, name: str, **metadata: Any) -> None:
-        self.actions.append({"name": name, "metadata": metadata, "at": datetime.now(UTC).isoformat()})
+        self.actions.append(
+            {"name": name, "metadata": metadata, "at": datetime.now(UTC).isoformat()}
+        )
 
     def record_artifact(self, artifact: Artifact) -> None:
         self.artifacts.append(artifact)

@@ -27,6 +27,7 @@ from inverse_agent.models import (
 )
 from inverse_agent.planner import DeterministicPlanner, Planner
 from inverse_agent.policies import default_policy
+from inverse_agent.redaction import redact_text
 from inverse_agent.runner import ApprovalNotRequired, CommandRequest, LocalRunner, PolicyViolation
 
 
@@ -45,6 +46,7 @@ class AgentState(TypedDict, total=False):
     status: str
     error: str
     started_at: float
+    planner_fingerprint: str
     duration_seconds: float
     trace_path: str
 
@@ -91,6 +93,7 @@ class DurableAgentWorkflow:
             "actions": [],
             "status": RunStatus.PLANNED.value,
             "started_at": time.time(),
+            "planner_fingerprint": spec.planner_fingerprint,
         }
         state = cast(AgentState, self.graph.invoke(initial, self._config(spec.run_id)))
         return self._result_from_state(state)
@@ -178,7 +181,8 @@ class DurableAgentWorkflow:
                 available_tools=tuple(state["available_tools"]),
             )
         except (TypeError, ValueError) as exc:
-            return {"status": RunStatus.FAILED.value, "error": f"planning failed: {exc}"}
+            error = redact_text(str(exc)).text
+            return {"status": RunStatus.FAILED.value, "error": f"planning failed: {error}"}
         return {
             "plan": [action.tool_name for action in plan.actions],
             "plan_rationale": plan.rationale,
@@ -239,9 +243,13 @@ class DurableAgentWorkflow:
         if status == RunStatus.RUNNING:
             status = RunStatus.SUCCEEDED
         duration = max(0.0, time.time() - state["started_at"])
-        trace = self._trace_from_state({**state, "status": status.value, "duration_seconds": duration})
+        trace = self._trace_from_state(
+            {**state, "status": status.value, "duration_seconds": duration}
+        )
         trace_path = self.trace_dir / f"{state['run_id']}.trace.json"
-        trace.record_artifact(Artifact(kind=ArtifactKind.TRACE, path=trace_path, summary="Eval trace JSON"))
+        trace.record_artifact(
+            Artifact(kind=ArtifactKind.TRACE, path=trace_path, summary="Eval trace JSON")
+        )
         save_trace(trace, trace_path)
         return {
             "status": status.value,
@@ -270,6 +278,7 @@ class DurableAgentWorkflow:
             run_id=state["run_id"],
             status=status,
             duration_seconds=float(state.get("duration_seconds", 0.0)),
+            planner_fingerprint=str(state.get("planner_fingerprint", "deterministic")),
         )
         for action in state.get("actions", []):
             trace.record_action(action["tool"], **action)

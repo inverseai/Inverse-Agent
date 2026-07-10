@@ -14,5 +14,6 @@ artifacts/
 runs/
 .env
 .inverse-agent-state/
+.tmp/
 *.sqlite-shm
 *.sqlite-wal

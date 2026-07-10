@@ -5,6 +5,8 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
+import time
 from dataclasses import asdict
 from pathlib import Path
 
@@ -13,7 +15,9 @@ from inverse_agent.control_plane import create_app
 from inverse_agent.dogfood import evaluate_workspace, save_evaluation
 from inverse_agent.eval import json_default
 from inverse_agent.mcp_server import create_mcp_server
-from inverse_agent.models import AutonomyLevel, Domain, RunStatus
+from inverse_agent.model_config import PlannerResolution, resolve_planner
+from inverse_agent.models import AutonomyLevel, Domain, RunStatus, WorkspaceProfile
+from inverse_agent.redaction import redact_text
 from inverse_agent.service import AgentService
 
 
@@ -32,7 +36,8 @@ def profile_command(args: argparse.Namespace) -> int:
 
 
 def evaluate_command(args: argparse.Namespace) -> int:
-    result = evaluate_workspace(Path(args.workspace))
+    planner = resolve_planner(args=args, require_model=True).planner if args.use_model else None
+    result = evaluate_workspace(Path(args.workspace), planner=planner)
     if args.output:
         save_evaluation(result, Path(args.output).resolve())
     print(json.dumps({**asdict(result), "passed": result.passed}, default=json_default, indent=2))
@@ -51,7 +56,9 @@ def start_command(args: argparse.Namespace) -> int:
         )
         record = service.start(created.run_id)
         print(json.dumps(asdict(record), default=json_default, indent=2))
-        return 2 if record.status == RunStatus.WAITING_FOR_APPROVAL.value else 0
+        if record.status == RunStatus.WAITING_FOR_APPROVAL.value:
+            return 2
+        return 0 if record.status == RunStatus.SUCCEEDED.value else 1
     finally:
         service.close()
 
@@ -65,7 +72,9 @@ def approve_command(args: argparse.Namespace) -> int:
             expected_action_digest=args.action_digest,
         )
         print(json.dumps(asdict(record), default=json_default, indent=2))
-        return 2 if record.status == RunStatus.WAITING_FOR_APPROVAL.value else 0
+        if record.status == RunStatus.WAITING_FOR_APPROVAL.value:
+            return 2
+        return 0 if record.status == RunStatus.SUCCEEDED.value else 1
     finally:
         service.close()
 
@@ -93,7 +102,9 @@ def serve_command(args: argparse.Namespace) -> int:
     approver_id = os.environ.get("INVERSE_AGENT_APPROVER_ID", "")
     if not approver_token or not approver_id:
         raise ValueError("INVERSE_AGENT_APPROVER_TOKEN and INVERSE_AGENT_APPROVER_ID are required")
-    service = _service(args, Path(args.workspace_root).resolve())
+    resolution = resolve_planner(args=args)
+    _report_planner(resolution)
+    service = _service(args, Path(args.workspace_root).resolve(), resolution=resolution)
     app = create_app(
         service=service,
         api_token=api_token,
@@ -104,7 +115,9 @@ def serve_command(args: argparse.Namespace) -> int:
 
 
 def mcp_command(args: argparse.Namespace) -> int:
-    service = _service(args, Path(args.workspace_root).resolve())
+    resolution = resolve_planner(args=args)
+    _report_planner(resolution)
+    service = _service(args, Path(args.workspace_root).resolve(), resolution=resolution)
     try:
         create_mcp_server(service).run("stdio")
         return 0
@@ -112,15 +125,68 @@ def mcp_command(args: argparse.Namespace) -> int:
         service.close()
 
 
-def _service(args: argparse.Namespace, workspace_root: Path) -> AgentService:
+def model_check_command(args: argparse.Namespace) -> int:
+    started = time.monotonic()
+    try:
+        resolution = resolve_planner(args=args, require_model=True)
+        profile = WorkspaceProfile(
+            root=Path.cwd(),
+            domains={Domain.GENERIC},
+            commands={"generic.inspect": ["unused"]},
+        )
+        plan = resolution.planner.plan(
+            goal="Select the supplied diagnostic tool",
+            domain=Domain.GENERIC,
+            profile=profile,
+            available_tools=("generic.inspect",),
+        )
+        payload = {
+            "ok": True,
+            "planner": resolution.config.safe_summary(),
+            "latency_seconds": round(time.monotonic() - started, 3),
+            "actions": [action.tool_name for action in plan.actions],
+            "rationale": plan.rationale,
+        }
+        print(json.dumps(payload, indent=2))
+        return 0
+    except Exception as exc:
+        error = redact_text(str(exc)).text
+        print(json.dumps({"ok": False, "error": error}, indent=2), file=sys.stderr)
+        return 1
+
+
+def _service(
+    args: argparse.Namespace,
+    workspace_root: Path,
+    *,
+    resolution: PlannerResolution | None = None,
+) -> AgentService:
     secret = os.environ.get("INVERSE_AGENT_APPROVAL_SECRET", "").encode()
     if len(secret) < 32:
         raise ValueError("INVERSE_AGENT_APPROVAL_SECRET must contain at least 32 bytes")
+    selected = resolution or resolve_planner(args=args)
     return AgentService(
         workspace_root=workspace_root,
         state_dir=Path(args.state_dir).resolve(),
         approval_secret=secret,
+        planner=selected.planner,
+        planner_fingerprint=selected.config.fingerprint,
     )
+
+
+def _report_planner(resolution: PlannerResolution) -> None:
+    print(
+        "Inverse-Agent planner: " + json.dumps(resolution.config.safe_summary(), sort_keys=True),
+        file=sys.stderr,
+    )
+
+
+def _add_model_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--model")
+    parser.add_argument("--model-base-url")
+    parser.add_argument("--model-timeout-seconds", type=int)
+    parser.add_argument("--model-max-actions", type=int)
+    parser.add_argument("--model-allow-remote", action="store_true")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -134,6 +200,8 @@ def build_parser() -> argparse.ArgumentParser:
     evaluate = sub.add_parser("evaluate", help="Run the reproducible advisory dogfood evaluation")
     evaluate.add_argument("workspace")
     evaluate.add_argument("--output")
+    evaluate.add_argument("--use-model", action="store_true")
+    _add_model_arguments(evaluate)
     evaluate.set_defaults(func=evaluate_command)
 
     start = sub.add_parser("start", help="Create and start a durable workflow")
@@ -147,6 +215,7 @@ def build_parser() -> argparse.ArgumentParser:
         choices=[item.value for item in AutonomyLevel],
     )
     start.add_argument("--state-dir", default=default_state_dir())
+    _add_model_arguments(start)
     start.set_defaults(func=start_command)
 
     approve = sub.add_parser("approve", help="Approve the current pending action and resume")
@@ -155,6 +224,7 @@ def build_parser() -> argparse.ArgumentParser:
     approve.add_argument("--action-digest", required=True)
     approve.add_argument("--workspace-root", required=True)
     approve.add_argument("--state-dir", default=default_state_dir())
+    _add_model_arguments(approve)
     approve.set_defaults(func=approve_command)
 
     trust = sub.add_parser("trust-workspace", help="Attest a workspace before executing its code")
@@ -162,18 +232,25 @@ def build_parser() -> argparse.ArgumentParser:
     trust.add_argument("--trusted-by", required=True)
     trust.add_argument("--workspace-root", required=True)
     trust.add_argument("--state-dir", default=default_state_dir())
+    _add_model_arguments(trust)
     trust.set_defaults(func=trust_command)
 
     serve = sub.add_parser("serve", help="Serve the authenticated local control plane")
     serve.add_argument("--workspace-root", required=True)
     serve.add_argument("--state-dir", default=default_state_dir())
     serve.add_argument("--port", type=int, default=8765)
+    _add_model_arguments(serve)
     serve.set_defaults(func=serve_command)
 
     mcp = sub.add_parser("mcp", help="Serve policy-enforced tools over MCP stdio")
     mcp.add_argument("--workspace-root", required=True)
     mcp.add_argument("--state-dir", default=default_state_dir())
+    _add_model_arguments(mcp)
     mcp.set_defaults(func=mcp_command)
+
+    model_check = sub.add_parser("model-check", help="Verify model-backed structured planning")
+    _add_model_arguments(model_check)
+    model_check.set_defaults(func=model_check_command)
     return parser
 
 

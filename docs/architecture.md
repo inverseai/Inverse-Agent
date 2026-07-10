@@ -5,6 +5,7 @@ Inverse-Agent separates decisions, execution, and product state so no model-cont
 ## Components
 
 - `planner.py`: provider-neutral planning. Models select registered tool IDs under a strict action budget; raw commands are rejected.
+- `model_config.py`: validated model configuration, endpoint policy, planner construction, and non-secret provenance.
 - `adapters/`: domain detection and command generation for Django, PyTorch, Android/NDK, and iOS.
 - `policies.py`: exact command rules and the concrete trusted executable map.
 - `approvals.py`: signed action capabilities plus durable replay prevention.
@@ -22,6 +23,8 @@ The model sees goals, domain metadata, and registered tool names. It can create 
 ## Persistence
 
 SQLite stores LangGraph checkpoints, run records, workspace trust attestations, approval replay state, and trace handles. A process can close after an interrupt and reconstruct the service against the same state directory before approval arrives. Startup reconciliation treats the LangGraph checkpoint as authoritative when a crash leaves the run projection in an intermediate state.
+
+Run records and traces include the planner fingerprint that created the plan. Configuration changes before a planned run starts are refused. Once a plan reaches an approval interrupt, resume uses the checkpointed plan and does not call the model again.
 
 ## Domain Behavior
 

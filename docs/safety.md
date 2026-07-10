@@ -2,7 +2,7 @@
 
 ## Threat Model
 
-The planner and workspace content are untrusted. The approval signer, runner policy, authenticated control plane, and local state directory are trusted. Model output may select only registered tools; it cannot supply an executable, argv, approval bit, or approval token.
+The planner, model endpoint, and workspace content are untrusted. The approval signer, runner policy, authenticated control plane, and local state directory are trusted. Model output may select only registered tools; it cannot supply an executable, argv, approval bit, or approval token.
 
 ## Enforced Controls
 
@@ -15,6 +15,8 @@ The planner and workspace content are untrusted. The approval signer, runner pol
 - The child environment is allowlisted and does not inherit Inverse-Agent credentials.
 - Output capture is bounded, decoded defensively, and redacted before it enters traces.
 - Timeout cleanup targets process groups on POSIX and process trees on Windows.
+- Model endpoints are loopback-only by default. Remote inference requires dual operator opt-in and HTTPS. Redirects and environment proxies are disabled, responses are size-capped, and endpoint failures never trigger a deterministic fallback.
+- Model API keys are environment-only configuration and remain excluded from workspace subprocess environments, traces, fingerprints, and startup summaries.
 
 ## Tool Hardening
 
@@ -27,3 +29,7 @@ Inverse-Agent does not yet provide an OS-level network namespace, filesystem vir
 Approval binds the action, not every transitive file imported by a build system. Operators should avoid modifying a workspace while an approval is pending. The service refuses state directories under the workspace root; production deployments should additionally protect state with OS ACLs.
 
 Redaction is defense in depth, not a proof that arbitrary secrets can be detected. Raw logs and source remain local by default; external inference or artifact upload should use explicit egress policies.
+
+A loopback model server is still an untrusted network peer. A compromised local process can impersonate it, return malicious plans, or observe planning prompts. Exact tool validation and human approval remain mandatory at every autonomy level, including bounded and workflow automation.
+
+The model transport reapplies a shrinking monotonic deadline before response headers and every body chunk. Python's standard HTTP header parser may perform multiple socket reads under the remaining header timeout, so a deliberately slow opted-in remote endpoint can still extend one planning call. Keep inference loopback-local where possible and supervise long-running service processes externally.

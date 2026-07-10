@@ -79,6 +79,27 @@ uv run inverse-agent mcp --workspace-root D:\work
 
 `DeterministicPlanner` is the offline baseline used by CI and reproducible evaluations.
 
+### Local GPT-OSS-20B
+
+On a 24 GB NVIDIA GPU, load GPT-OSS-20B in LM Studio with a conservative 16K context and a stable API identifier:
+
+```powershell
+.\scripts\start-local-model.ps1
+```
+
+Configure Inverse-Agent in the same shell and verify structured planning before starting a run:
+
+```powershell
+$env:INVERSE_AGENT_MODEL_NAME = "inverse-gpt-oss-20b"
+$env:INVERSE_AGENT_MODEL_BASE_URL = "http://127.0.0.1:1234/v1"
+uv run inverse-agent model-check
+uv run inverse-agent start D:\work\django-app --domain django
+```
+
+When neither model variable is present, Inverse-Agent remains deterministic. Model name and base URL must be configured together; model failures stop planning and never silently fall back. `evaluate` remains deterministic unless `--use-model` is supplied explicitly.
+
+Remote model endpoints are denied by default. They require HTTPS, `INVERSE_AGENT_MODEL_ALLOW_REMOTE=1`, and the `--model-allow-remote` flag together. API keys are accepted only through `INVERSE_AGENT_MODEL_API_KEY`, never through a command-line flag.
+
 ## Safety Boundary
 
 - Exact argv matching; unknown flags and trailing arguments are refused.

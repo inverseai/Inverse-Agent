@@ -17,6 +17,7 @@ from inverse_agent.approvals import (
 from inverse_agent.models import AutonomyLevel, Domain, RunSpec, RunStatus
 from inverse_agent.planner import Planner
 from inverse_agent.policies import default_policy
+from inverse_agent.redaction import redact_text
 from inverse_agent.workflow import DurableAgentWorkflow, WorkflowResult
 
 
@@ -33,6 +34,7 @@ class RunRecord:
     error: str | None
     created_at: float
     updated_at: float
+    planner_fingerprint: str
 
 
 class RunStore:
@@ -53,10 +55,17 @@ class RunStore:
                     trace_path TEXT,
                     error TEXT,
                     created_at REAL NOT NULL,
-                    updated_at REAL NOT NULL
+                    updated_at REAL NOT NULL,
+                    planner_fingerprint TEXT NOT NULL DEFAULT 'deterministic'
                 )
                 """
             )
+            columns = {row[1] for row in connection.execute("PRAGMA table_info(runs)").fetchall()}
+            if "planner_fingerprint" not in columns:
+                connection.execute(
+                    "ALTER TABLE runs ADD COLUMN planner_fingerprint "
+                    "TEXT NOT NULL DEFAULT 'deterministic'"
+                )
 
     def create(self, spec: RunSpec) -> RunRecord:
         now = time.time()
@@ -72,10 +81,11 @@ class RunStore:
             error=None,
             created_at=now,
             updated_at=now,
+            planner_fingerprint=spec.planner_fingerprint,
         )
         with sqlite3.connect(self.path) as connection:
             connection.execute(
-                "INSERT INTO runs VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO runs VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 self._to_row(record),
             )
         return record
@@ -189,6 +199,7 @@ class RunStore:
             record.error,
             record.created_at,
             record.updated_at,
+            record.planner_fingerprint,
         )
 
     @staticmethod
@@ -205,6 +216,7 @@ class RunStore:
             error=row[8],
             created_at=row[9],
             updated_at=row[10],
+            planner_fingerprint=row[11],
         )
 
 
@@ -257,9 +269,11 @@ class AgentService:
         state_dir: Path,
         approval_secret: bytes,
         planner: Planner | None = None,
+        planner_fingerprint: str = "deterministic",
     ) -> None:
         self.workspace_root = workspace_root.resolve()
         self.state_dir = state_dir.resolve()
+        self.planner_fingerprint = planner_fingerprint
         if self.state_dir.is_relative_to(self.workspace_root):
             raise ValueError("state directory must be outside the workspace root")
         self.state_dir.mkdir(parents=True, exist_ok=True)
@@ -292,10 +306,11 @@ class AgentService:
         if not resolved.is_dir():
             raise ValueError("workspace directory does not exist")
         spec = RunSpec(
-            goal=goal,
+            goal=redact_text(goal).text,
             workspace=resolved,
             domain=domain,
             autonomy_level=autonomy_level,
+            planner_fingerprint=self.planner_fingerprint,
         )
         return self.runs.create(spec)
 
@@ -303,9 +318,10 @@ class AgentService:
         record = self.runs.require(run_id)
         if record.status != RunStatus.PLANNED.value:
             raise ValueError(f"run cannot start from status {record.status}")
-        if (
-            record.autonomy_level != AutonomyLevel.ADVISORY.value
-            and not self.trust.is_trusted(Path(record.workspace))
+        if record.planner_fingerprint != self.planner_fingerprint:
+            raise ValueError("planner configuration changed after run creation")
+        if record.autonomy_level != AutonomyLevel.ADVISORY.value and not self.trust.is_trusted(
+            Path(record.workspace)
         ):
             raise ValueError("workspace is not trusted for code execution")
         spec = self._spec(record)
@@ -386,5 +402,6 @@ class AgentService:
             workspace=Path(record.workspace),
             domain=Domain(record.domain),
             autonomy_level=AutonomyLevel(record.autonomy_level),
+            planner_fingerprint=record.planner_fingerprint,
             run_id=record.run_id,
         )

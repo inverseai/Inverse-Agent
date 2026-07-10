@@ -51,3 +51,13 @@ The review reported bounded P3 hardening opportunities. The subsequent batch add
 Initial verdict: BLOCK on three incomplete P3 remediations: unbounded `taskkill`, character-counted PyTorch sniffing, and incomplete containment of malformed checkpoints. All three were fixed and covered by targeted regressions.
 
 Final verdict: PASS with no P0, P1, P2, or P3 findings. Verification after fixes: 66 passed, 1 platform skip, 86.45% coverage, Ruff clean, strict Mypy clean for Windows/Linux/macOS, universal lock check clean, and `git diff --check` clean.
+
+## 2026-07-10 - Local Model Integration Gates
+
+Claude CLI JSON smoke testing confirmed exact `claude-fable-5` model usage at max effort. The first implementation review returned BLOCK on an unredacted model-backed evaluation error path. The independent Codex reviewer found the same gap plus planner provenance, CLI exit-status, persisted-goal redaction, and URL control-character issues. All findings were fixed with regressions.
+
+The final independent Codex review returned PASS with no P0, P1, P2, or P3 findings. The final Claude Fable 5 max-effort review returned PASS with no blocking findings. Its concrete P4 `Content-Length` diagnostic issue was also fixed and covered; the remaining slow-header availability note is documented in `docs/safety.md`.
+
+Final verification: Ruff clean, strict Mypy clean for Windows/Linux/macOS, 103 tests passed, 1 platform skip, 88.54% coverage, and `git diff --check` clean.
+
+LM Studio 0.4.19 loaded OpenAI GPT-OSS-20B MXFP4 with full GPU offload and a 16K context on an RTX 3090 Ti. Inverse-Agent's real `model-check` selected only `generic.inspect`, completed model inference in 0.797 seconds, and confirmed the loopback endpoint with no API key or fallback. The loaded setup used approximately 15.1 GiB of 24 GiB GPU memory.

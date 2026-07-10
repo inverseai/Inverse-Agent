@@ -244,12 +244,12 @@ def test_expired_approval_is_refused(tmp_path: Path, monkeypatch: pytest.MonkeyP
 
 def test_runner_returns_failed_for_timeout_with_partial_output(tmp_path: Path) -> None:
     script = tmp_path / "sleep_probe.py"
-    script.write_text("import time\nprint('partial', flush=True)\ntime.sleep(3)\n", encoding="utf-8")
+    script.write_text(
+        "import time\nprint('partial', flush=True)\ntime.sleep(3)\n", encoding="utf-8"
+    )
     argv = (sys.executable, "sleep_probe.py")
     runner, _rule, _authority = _python_runner(tmp_path, argv)
-    result = runner.run(
-        CommandRequest(argv, tmp_path, Domain.GENERIC, timeout_seconds=1)
-    )
+    result = runner.run(CommandRequest(argv, tmp_path, Domain.GENERIC, timeout_seconds=1))
     assert result.status == RunStatus.FAILED
     assert "compute budget" in result.reason
     assert "partial" in result.stdout
@@ -308,16 +308,19 @@ def test_runner_does_not_inherit_secret_environment(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("INVERSE_AGENT_API_TOKEN", "token_should_not_be_visible")
+    monkeypatch.setenv("INVERSE_AGENT_MODEL_API_KEY", "model_key_should_not_be_visible")
     script = tmp_path / "env_probe.py"
     script.write_text(
-        "import os\nprint(os.environ.get('INVERSE_AGENT_API_TOKEN', 'missing'))\n",
+        "import os\n"
+        "print(os.environ.get('INVERSE_AGENT_API_TOKEN', 'missing'))\n"
+        "print(os.environ.get('INVERSE_AGENT_MODEL_API_KEY', 'missing'))\n",
         encoding="utf-8",
     )
     argv = (sys.executable, "env_probe.py")
     runner, _rule, _authority = _python_runner(tmp_path, argv)
     result = runner.run(CommandRequest(argv, tmp_path, Domain.GENERIC))
     assert result.status == RunStatus.SUCCEEDED
-    assert result.stdout.strip() == "missing"
+    assert result.stdout.splitlines() == ["missing", "missing"]
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows path-spoof regression")
