@@ -63,6 +63,35 @@ def test_every_endpoint_except_health_requires_auth(tmp_path: Path) -> None:
         assert client.get("/runs/unknown").status_code == 401
         assert client.post("/runs/unknown/start").status_code == 401
         assert client.post("/runs/unknown/approvals", json={}).status_code == 401
+        assert (
+            client.get(
+                "/runs",
+                headers=[(b"x-inverse-agent-token", b"non-ascii-\xff")],
+            ).status_code
+            == 401
+        )
+    finally:
+        service.close()
+
+
+def test_operator_token_cannot_use_approver_endpoints(tmp_path: Path) -> None:
+    service = _service(tmp_path)
+    try:
+        client = TestClient(
+            create_app(service=service, api_token="api-secret", approver_tokens=APPROVERS)
+        )
+        trust = client.post(
+            "/workspaces/trust",
+            headers=HEADERS,
+            json={"workspace": str(FIXTURES / "django_project")},
+        )
+        approval = client.post(
+            "/runs/unknown/approvals",
+            headers=HEADERS,
+            json={"action_digest": "0" * 64},
+        )
+        assert trust.status_code == 401
+        assert approval.status_code == 401
     finally:
         service.close()
 
@@ -96,6 +125,12 @@ def test_control_plane_end_to_end_approval_flow(tmp_path: Path) -> None:
         assert trusted.json()["trusted_by"] == "human@example.test"
         waiting = client.post(f"/runs/{run_id}/start", headers=HEADERS)
         assert waiting.json()["status"] == RunStatus.WAITING_FOR_APPROVAL.value
+        stale = client.post(
+            f"/runs/{run_id}/approvals",
+            headers=APPROVER_HEADERS,
+            json={"action_digest": "0" * 64},
+        )
+        assert stale.status_code == 409
         waiting_again = client.post(
             f"/runs/{run_id}/approvals",
             headers=APPROVER_HEADERS,

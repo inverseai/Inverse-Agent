@@ -14,6 +14,10 @@ SECRET_PATTERNS = (
         ),
     ),
     (
+        "private-key-prefix",
+        re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*$", re.DOTALL),
+    ),
+    (
         "key-value-secret",
         re.compile(r"(?i)(api[_-]?key|secret|token|password)\s*[:=]\s*['\"]?([A-Za-z0-9_\-./+=]{8,})"),
     ),

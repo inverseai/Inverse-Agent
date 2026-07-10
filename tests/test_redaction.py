@@ -34,6 +34,13 @@ def test_redact_text_removes_complete_private_key_block() -> None:
     assert "END PRIVATE KEY" not in result.text
 
 
+def test_redact_text_removes_truncated_private_key_block() -> None:
+    value = "-----BEGIN PRIVATE KEY-----\nSENSITIVE_PARTIAL_BODY"
+    result = redact_text(value)
+    assert result.blocked
+    assert "SENSITIVE_PARTIAL_BODY" not in result.text
+
+
 def test_redact_text_allows_non_secret_text() -> None:
     result = redact_text("ordinary build output")
     assert not result.blocked

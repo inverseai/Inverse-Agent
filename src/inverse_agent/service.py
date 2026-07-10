@@ -374,7 +374,8 @@ class AgentService:
                 continue
             try:
                 result = self.workflow.current(record.run_id)
-            except (KeyError, sqlite3.Error, ValueError):
+            except Exception as exc:
+                self.runs.mark_failed(record.run_id, f"workflow recovery failed: {exc}")
                 continue
             self.runs.update_from_result(record.run_id, result)
 

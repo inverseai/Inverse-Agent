@@ -56,7 +56,7 @@ def create_app(
     )
 
     def require_auth(x_inverse_agent_token: str | None = Header(default=None)) -> None:
-        if not compare_digest(x_inverse_agent_token or "", api_token):
+        if not _tokens_match(x_inverse_agent_token or "", api_token):
             raise HTTPException(status_code=401, detail="invalid or missing token")
 
     def require_approver(
@@ -64,7 +64,7 @@ def create_app(
     ) -> str:
         supplied = x_inverse_agent_approval_token or ""
         for token, identity in approver_tokens.items():
-            if compare_digest(supplied, token):
+            if _tokens_match(supplied, token):
                 return identity
         raise HTTPException(status_code=401, detail="invalid or missing approver token")
 
@@ -138,6 +138,10 @@ def create_app(
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     return app
+
+
+def _tokens_match(supplied: str, expected: str) -> bool:
+    return compare_digest(supplied.encode("utf-8"), expected.encode("utf-8"))
 
 
 def _resolve_workspace(path: Path, allowed_root: Path) -> Path:

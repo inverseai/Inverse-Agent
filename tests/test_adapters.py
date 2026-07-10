@@ -28,6 +28,13 @@ def test_pytorch_adapter_detects_fixture() -> None:
     assert Path(profile.commands["smoke_train"][0]).is_absolute()
 
 
+def test_pytorch_detection_reads_only_bounded_prefix(tmp_path: Path) -> None:
+    (tmp_path / "requirements.txt").write_bytes(
+        b"\xff" * (1024 * 1024) + b"\ntorch\n",
+    )
+    assert not PyTorchAdapter().detect(tmp_path)
+
+
 def test_android_uses_absolute_offline_wrapper() -> None:
     root = FIXTURES / "android_project"
     profile = AndroidAdapter().profile(root)

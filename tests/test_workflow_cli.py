@@ -1,5 +1,6 @@
 import json
 import platform
+import shutil
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -81,6 +82,59 @@ def test_workflow_resumes_after_service_restart(tmp_path: Path) -> None:
         resumed_service.close()
     assert resumed.status == RunStatus.WAITING_FOR_APPROVAL.value
     assert resumed.pending_approval["rule"] == "django-test"
+
+
+def test_missing_checkpoint_marks_incomplete_run_failed(tmp_path: Path) -> None:
+    state_dir = tmp_path / "state"
+    first_service = _service(state_dir)
+    first_service.trust_workspace(FIXTURES / "django_project", trusted_by="tester")
+    created = first_service.create_run(
+        goal="Verify recovery failure",
+        workspace=FIXTURES / "django_project",
+        domain=Domain.DJANGO,
+    )
+    waiting = first_service.start(created.run_id)
+    first_service.close()
+    assert waiting.status == RunStatus.WAITING_FOR_APPROVAL.value
+    (state_dir / "checkpoints.sqlite").unlink()
+
+    restarted = _service(state_dir)
+    try:
+        recovered = restarted.get(created.run_id)
+    finally:
+        restarted.close()
+    assert recovered.status == RunStatus.FAILED.value
+    assert recovered.error and "workflow recovery failed" in recovered.error
+
+
+def test_malformed_checkpoint_marks_only_affected_run_failed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state_dir = tmp_path / "state"
+    first_service = _service(state_dir)
+    first_service.trust_workspace(FIXTURES / "django_project", trusted_by="tester")
+    created = first_service.create_run(
+        goal="Verify malformed recovery",
+        workspace=FIXTURES / "django_project",
+        domain=Domain.DJANGO,
+    )
+    first_service.start(created.run_id)
+    first_service.close()
+
+    def malformed_checkpoint(*_args, **_kwargs):
+        raise TypeError("malformed checkpoint value")
+
+    monkeypatch.setattr(
+        "inverse_agent.workflow.DurableAgentWorkflow.current",
+        malformed_checkpoint,
+    )
+    restarted = _service(state_dir)
+    try:
+        recovered = restarted.get(created.run_id)
+    finally:
+        restarted.close()
+    assert recovered.status == RunStatus.FAILED.value
+    assert recovered.error and "malformed checkpoint value" in recovered.error
 
 
 def test_pytorch_workflow_is_executable_and_checkpointed(tmp_path: Path) -> None:
@@ -250,6 +304,44 @@ def test_cli_start_returns_waiting_status(
         [
             "start",
             str(FIXTURES / "django_project"),
+            "--domain",
+            "django",
+            "--state-dir",
+            str(state_dir),
+        ]
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert code == 2
+    assert payload["status"] == RunStatus.WAITING_FOR_APPROVAL.value
+
+
+def test_cli_start_allows_state_directory_beside_workspace(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    monkeypatch.setenv("INVERSE_AGENT_APPROVAL_SECRET", SECRET.decode())
+    workspace = tmp_path / "django_project"
+    state_dir = tmp_path / "state"
+    shutil.copytree(FIXTURES / "django_project", workspace)
+    assert (
+        main(
+            [
+                "trust-workspace",
+                str(workspace),
+                "--trusted-by",
+                "tester",
+                "--workspace-root",
+                str(workspace),
+                "--state-dir",
+                str(state_dir),
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+    code = main(
+        [
+            "start",
+            str(workspace),
             "--domain",
             "django",
             "--state-dir",

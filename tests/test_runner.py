@@ -1,4 +1,5 @@
 import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -7,7 +8,7 @@ import pytest
 from inverse_agent.approvals import ApprovalAuthority, ApprovalError, SqliteApprovalReplayStore
 from inverse_agent.models import CommandRule, Domain, RunnerPolicy, RunStatus
 from inverse_agent.policies import default_policy
-from inverse_agent.runner import CommandRequest, LocalRunner, normalize_token
+from inverse_agent.runner import ApprovalNotRequired, CommandRequest, LocalRunner, normalize_token
 
 SECRET = b"test-approval-secret-that-is-at-least-32-bytes"
 
@@ -79,6 +80,13 @@ def test_runner_refuses_unallowlisted_command(tmp_path: Path) -> None:
     )
     assert result.status == RunStatus.REFUSED
     assert "not exactly allowlisted" in result.reason
+
+
+def test_runner_uses_typed_signal_when_approval_is_not_required(tmp_path: Path) -> None:
+    argv = (sys.executable, "-c", "print('ok')")
+    runner, _rule, _authority = _python_runner(tmp_path, argv)
+    with pytest.raises(ApprovalNotRequired):
+        runner.approval_challenge(CommandRequest(argv, tmp_path, Domain.GENERIC))
 
 
 @pytest.mark.parametrize(
@@ -247,6 +255,31 @@ def test_runner_returns_failed_for_timeout_with_partial_output(tmp_path: Path) -
     assert "partial" in result.stdout
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows taskkill timeout regression")
+def test_windows_taskkill_is_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
+    observed: dict[str, float] = {}
+
+    def stalled_taskkill(*_args, **kwargs) -> None:
+        observed["timeout"] = kwargs["timeout"]
+        raise subprocess.TimeoutExpired("taskkill", kwargs["timeout"])
+
+    class ProcessProbe:
+        pid = 42
+        killed = False
+
+        def poll(self) -> None:
+            return None
+
+        def kill(self) -> None:
+            self.killed = True
+
+    process = ProcessProbe()
+    monkeypatch.setattr(subprocess, "run", stalled_taskkill)
+    LocalRunner._terminate_process_tree(process)  # type: ignore[arg-type]
+    assert observed["timeout"] > 0
+    assert process.killed
+
+
 def test_runner_caps_output(tmp_path: Path) -> None:
     script = tmp_path / "output_probe.py"
     script.write_text("print('x' * 1000)\n", encoding="utf-8")
@@ -256,6 +289,19 @@ def test_runner_caps_output(tmp_path: Path) -> None:
     assert result.status == RunStatus.SUCCEEDED
     assert "[OUTPUT_TRUNCATED]" in result.stdout
     assert "truncated stdout" in result.reason
+
+
+def test_runner_redacts_secret_that_crosses_output_limit(tmp_path: Path) -> None:
+    secret = "_".join(("ghp", "abcdefghijklmnopqrstuvwxyz123456"))
+    script = tmp_path / "boundary_secret.py"
+    script.write_text(f"print({'x' * 74 + ' ' + secret!r})\n", encoding="utf-8")
+    argv = (sys.executable, "boundary_secret.py")
+    runner, _rule, _authority = _python_runner(tmp_path, argv, output_limit=100)
+    result = runner.run(CommandRequest(argv, tmp_path, Domain.GENERIC))
+    assert result.status == RunStatus.SUCCEEDED
+    assert secret[:20] not in result.stdout
+    assert "[REDACTED_SECRET]" in result.stdout
+    assert "[OUTPUT_TRUNCATED]" in result.stdout
 
 
 def test_runner_does_not_inherit_secret_environment(

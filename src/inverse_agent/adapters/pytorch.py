@@ -8,6 +8,8 @@ from inverse_agent.adapters.base import CommandAdapter, Tool
 from inverse_agent.environments import discover_python
 from inverse_agent.models import Domain, WorkspaceProfile
 
+PROFILE_SNIFF_BYTES = 1024 * 1024
+
 
 class PyTorchAdapter(CommandAdapter):
     domain = Domain.PYTORCH
@@ -47,6 +49,8 @@ class PyTorchAdapter(CommandAdapter):
     def _mentions_torch(root: Path) -> bool:
         for name in ("requirements.txt", "pyproject.toml", "train.py", "eval.py"):
             path = root / name
-            if path.exists() and "torch" in path.read_text(encoding="utf-8", errors="ignore").lower():
-                return True
+            if path.is_file():
+                with path.open("rb") as stream:
+                    if b"torch" in stream.read(PROFILE_SNIFF_BYTES).lower():
+                        return True
         return False

@@ -39,3 +39,15 @@ Verification after fixes: 52 passed, 1 platform skip, 85% coverage, strict Mypy 
 ## 2026-07-10 - Independent Codex Final Staged Gate
 
 Verdict: PASS. No P0, P1, P2, or P3 findings. The reviewer independently reran 52 tests, coverage, Ruff, Mypy, and `git diff --cached --check`, including the final removal of unauthenticated FastAPI documentation routes.
+
+## 2026-07-10 - Claude Fable 5 Post-Implementation Gate
+
+Review target: public commit `705d75d`. Runtime `modelUsage` confirmed exact model `claude-fable-5` at max effort. Verdict: PASS with no P0, P1, or P2 findings.
+
+The review reported bounded P3 hardening opportunities. The subsequent batch added bounded timeout cleanup, redaction across output truncation, byte-safe token comparison, immutable CI action pins, explicit checkpoint recovery failures, typed approval control flow, bounded PyTorch profiling, CLI state-layout coverage, and missing control-plane authorization tests.
+
+## 2026-07-10 - Independent Codex Hardening Gate
+
+Initial verdict: BLOCK on three incomplete P3 remediations: unbounded `taskkill`, character-counted PyTorch sniffing, and incomplete containment of malformed checkpoints. All three were fixed and covered by targeted regressions.
+
+Final verdict: PASS with no P0, P1, P2, or P3 findings. Verification after fixes: 66 passed, 1 platform skip, 86.45% coverage, Ruff clean, strict Mypy clean for Windows/Linux/macOS, universal lock check clean, and `git diff --check` clean.

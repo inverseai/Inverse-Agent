@@ -41,7 +41,7 @@ def evaluate_command(args: argparse.Namespace) -> int:
 
 def start_command(args: argparse.Namespace) -> int:
     workspace = Path(args.workspace).resolve()
-    service = _service(args, workspace.parent)
+    service = _service(args, workspace)
     try:
         created = service.create_run(
             goal=args.goal,

@@ -17,6 +17,9 @@ from inverse_agent.approvals import ApprovalAuthority, ApprovalClaims, ApprovalE
 from inverse_agent.models import CommandRule, Domain, RunnerPolicy, RunStatus
 from inverse_agent.redaction import redact_text
 
+OUTPUT_REDACTION_OVERLAP_BYTES = 64 * 1024
+PROCESS_TERMINATION_GRACE_SECONDS = 5.0
+
 
 @dataclass(frozen=True)
 class CommandRequest:
@@ -89,6 +92,10 @@ class PolicyViolation(ValueError):
     """Raised when a command violates runner policy."""
 
 
+class ApprovalNotRequired(PolicyViolation):
+    """Raised when a valid command can run without an approval interrupt."""
+
+
 class LocalRunner:
     def __init__(self, policy: RunnerPolicy, approval_authority: ApprovalAuthority | None = None):
         self.policy = policy
@@ -103,7 +110,7 @@ class LocalRunner:
     def approval_challenge(self, request: CommandRequest) -> ApprovalChallenge:
         prepared = self._prepare(request, require_approval=False, consume_approval=False)
         if not prepared.rule.requires_approval and not prepared.rule.network_required:
-            raise PolicyViolation(f"command does not require approval: {prepared.rule.name}")
+            raise ApprovalNotRequired(f"command does not require approval: {prepared.rule.name}")
         return ApprovalChallenge(
             action_digest=action_digest(
                 workspace=self.workspace_root,
@@ -153,12 +160,23 @@ class LocalRunner:
                     ),
                 )
                 timed_out = False
+                termination_failed = False
+                returncode: int | None
                 try:
                     returncode = process.wait(timeout=timeout)
                 except subprocess.TimeoutExpired:
                     timed_out = True
                     self._terminate_process_tree(process)
-                    returncode = process.wait()
+                    try:
+                        returncode = process.wait(timeout=PROCESS_TERMINATION_GRACE_SECONDS)
+                    except subprocess.TimeoutExpired:
+                        with suppress(OSError):
+                            process.kill()
+                        try:
+                            returncode = process.wait(timeout=PROCESS_TERMINATION_GRACE_SECONDS)
+                        except subprocess.TimeoutExpired:
+                            termination_failed = True
+                            returncode = process.poll()
                 stdout, stdout_truncated = self._read_output(stdout_file)
                 stderr, stderr_truncated = self._read_output(stderr_file)
         except FileNotFoundError as exc:
@@ -170,16 +188,21 @@ class LocalRunner:
 
         stdout_redaction = redact_text(stdout)
         stderr_redaction = redact_text(stderr)
+        stdout_text = self._limit_output(stdout_redaction.text, stdout_truncated)
+        stderr_text = self._limit_output(stderr_redaction.text, stderr_truncated)
         approval_id = prepared.approval.approval_id if prepared.approval else None
         if timed_out:
+            reason = f"command exceeded compute budget after {timeout} seconds"
+            if termination_failed:
+                reason += "; process survived forced termination"
             return CommandResult(
                 status=RunStatus.FAILED,
                 argv=prepared.resolved_argv,
                 returncode=returncode,
-                stdout=stdout_redaction.text,
-                stderr=stderr_redaction.text,
+                stdout=stdout_text,
+                stderr=stderr_text,
                 rule=prepared.rule.name,
-                reason=f"command exceeded compute budget after {timeout} seconds",
+                reason=reason,
                 approval_id=approval_id,
             )
 
@@ -199,8 +222,8 @@ class LocalRunner:
             status=status,
             argv=prepared.resolved_argv,
             returncode=returncode,
-            stdout=stdout_redaction.text,
-            stderr=stderr_redaction.text,
+            stdout=stdout_text,
+            stderr=stderr_text,
             rule=prepared.rule.name,
             reason=reason,
             approval_id=approval_id,
@@ -295,13 +318,15 @@ class LocalRunner:
 
     def _read_output(self, stream: _BinaryStream) -> tuple[str, bool]:
         stream.seek(0)
-        raw = stream.read(self.policy.output_limit_bytes + 1)
+        raw = stream.read(self.policy.output_limit_bytes + OUTPUT_REDACTION_OVERLAP_BYTES + 1)
         truncated = len(raw) > self.policy.output_limit_bytes
-        raw = raw[: self.policy.output_limit_bytes]
-        text = raw.decode("utf-8", errors="replace")
-        if truncated:
-            text += "\n[OUTPUT_TRUNCATED]"
-        return text, truncated
+        return raw.decode("utf-8", errors="replace"), truncated
+
+    def _limit_output(self, text: str, truncated: bool) -> str:
+        if not truncated:
+            return text
+        raw = text.encode("utf-8")[: self.policy.output_limit_bytes]
+        return raw.decode("utf-8", errors="replace") + "\n[OUTPUT_TRUNCATED]"
 
     def _safe_env(self) -> dict[str, str]:
         env: dict[str, str] = {
@@ -327,17 +352,25 @@ class LocalRunner:
     def _terminate_process_tree(process: subprocess.Popen[bytes]) -> None:
         if os.name == "nt":
             taskkill = Path(os.environ.get("SYSTEMROOT", r"C:\Windows")) / "System32" / "taskkill.exe"
-            subprocess.run(
-                [str(taskkill), "/PID", str(process.pid), "/T", "/F"],
-                capture_output=True,
-                check=False,
-            )
+            with suppress(OSError, subprocess.TimeoutExpired):
+                subprocess.run(
+                    [str(taskkill), "/PID", str(process.pid), "/T", "/F"],
+                    capture_output=True,
+                    check=False,
+                    timeout=PROCESS_TERMINATION_GRACE_SECONDS,
+                )
+            if process.poll() is None:
+                with suppress(OSError):
+                    process.kill()
             return
         killpg = cast(Callable[[int, int], None] | None, getattr(os, "killpg", None))
         sigkill = cast(int, getattr(signal, "SIGKILL", signal.SIGTERM))
         if killpg:
             with suppress(ProcessLookupError):
                 killpg(process.pid, sigkill)
+        elif process.poll() is None:
+            with suppress(OSError):
+                process.kill()
 
     @staticmethod
     def _failed(

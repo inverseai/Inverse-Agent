@@ -27,7 +27,7 @@ from inverse_agent.models import (
 )
 from inverse_agent.planner import DeterministicPlanner, Planner
 from inverse_agent.policies import default_policy
-from inverse_agent.runner import CommandRequest, LocalRunner, PolicyViolation
+from inverse_agent.runner import ApprovalNotRequired, CommandRequest, LocalRunner, PolicyViolation
 
 
 class AgentState(TypedDict, total=False):
@@ -207,9 +207,10 @@ class DurableAgentWorkflow:
                 domain=domain,
                 approval_token=str(token),
             )
+        except ApprovalNotRequired:
+            pass
         except PolicyViolation as exc:
-            if "does not require approval" not in str(exc):
-                return {"status": RunStatus.REFUSED.value, "error": str(exc)}
+            return {"status": RunStatus.REFUSED.value, "error": str(exc)}
 
         result = runner.run(request)
         actions = [
