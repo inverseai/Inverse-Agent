@@ -137,6 +137,36 @@ def test_malformed_checkpoint_marks_only_affected_run_failed(
     assert recovered.error and "malformed checkpoint value" in recovered.error
 
 
+def test_recovery_projection_failure_marks_only_affected_run_failed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state_dir = tmp_path / "state"
+    first_service = _service(state_dir)
+    first_service.trust_workspace(FIXTURES / "django_project", trusted_by="tester")
+    created = first_service.create_run(
+        goal="Verify projection recovery",
+        workspace=FIXTURES / "django_project",
+        domain=Domain.DJANGO,
+    )
+    first_service.start(created.run_id)
+    first_service.close()
+
+    def failed_projection(*_args, **_kwargs):
+        raise TypeError("recovery projection failed")
+
+    monkeypatch.setattr(
+        "inverse_agent.service.RunStore.update_from_result",
+        failed_projection,
+    )
+    restarted = _service(state_dir)
+    try:
+        recovered = restarted.get(created.run_id)
+    finally:
+        restarted.close()
+    assert recovered.status == RunStatus.FAILED.value
+    assert recovered.error and "recovery projection failed" in recovered.error
+
+
 def test_pytorch_workflow_is_executable_and_checkpointed(tmp_path: Path) -> None:
     service = _service(tmp_path / "state")
     try:
