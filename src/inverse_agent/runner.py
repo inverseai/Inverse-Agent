@@ -94,6 +94,32 @@ class ApprovalNotRequired(PolicyViolation):
     """Raised when a valid command can run without an approval interrupt."""
 
 
+def build_safe_subprocess_env(allowed_env_names: tuple[str, ...]) -> dict[str, str]:
+    """Build the minimal child environment shared by hardened local readers."""
+
+    env: dict[str, str] = {
+        "GCM_INTERACTIVE": "Never",
+        "GIT_CONFIG_GLOBAL": "NUL" if os.name == "nt" else "/dev/null",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_NO_LAZY_FETCH": "1",
+        "GIT_NO_REPLACE_OBJECTS": "1",
+        "GIT_OPTIONAL_LOCKS": "0",
+        "GIT_TERMINAL_PROMPT": "0",
+        "NO_COLOR": "1",
+        "PIP_NO_INPUT": "1",
+        "PYTHONIOENCODING": "utf-8",
+        "PYTHONUNBUFFERED": "1",
+    }
+    allowed = {name.upper() for name in allowed_env_names}
+    for key, value in os.environ.items():
+        if key.upper() not in allowed:
+            continue
+        if redact_text(f"{key}={value}").blocked:
+            continue
+        env[key] = value
+    return env
+
+
 class LocalRunner:
     def __init__(self, policy: RunnerPolicy, approval_authority: ApprovalAuthority | None = None):
         self.policy = policy
@@ -333,25 +359,7 @@ class LocalRunner:
         return raw.decode("utf-8", errors="replace") + "\n[OUTPUT_TRUNCATED]"
 
     def _safe_env(self) -> dict[str, str]:
-        env: dict[str, str] = {
-            "GCM_INTERACTIVE": "Never",
-            "GIT_CONFIG_GLOBAL": "NUL" if os.name == "nt" else "/dev/null",
-            "GIT_CONFIG_NOSYSTEM": "1",
-            "GIT_OPTIONAL_LOCKS": "0",
-            "GIT_TERMINAL_PROMPT": "0",
-            "NO_COLOR": "1",
-            "PIP_NO_INPUT": "1",
-            "PYTHONIOENCODING": "utf-8",
-            "PYTHONUNBUFFERED": "1",
-        }
-        allowed = {name.upper() for name in self.policy.allowed_env_names}
-        for key, value in os.environ.items():
-            if key.upper() not in allowed:
-                continue
-            if redact_text(f"{key}={value}").blocked:
-                continue
-            env[key] = value
-        return env
+        return build_safe_subprocess_env(self.policy.allowed_env_names)
 
     @staticmethod
     def _terminate_process_tree(process: subprocess.Popen[bytes]) -> None:

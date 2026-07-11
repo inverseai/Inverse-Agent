@@ -70,6 +70,7 @@ class PlannerConfig:
 class PlannerResolution:
     planner: Planner
     config: PlannerConfig
+    client: OpenAICompatibleClient | None = None
 
 
 def resolve_planner(
@@ -136,7 +137,7 @@ def resolve_planner(
         timeout_seconds=timeout_seconds,
         allow_remote=allow_remote,
     )
-    return PlannerResolution(StructuredPlanner(client, max_actions=max_actions), config)
+    return PlannerResolution(StructuredPlanner(client, max_actions=max_actions), config, client)
 
 
 def _string_override(args: Any | None, name: str, fallback: str | None) -> str | None:

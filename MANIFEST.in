@@ -1,0 +1,5 @@
+include docs/commit-review-benchmark.md
+recursive-include benchmarks/commit_review *
+recursive-include src/inverse_agent/benchmark_assets *
+global-exclude *.py[cod]
+prune src/inverse_agent/benchmark_assets/__pycache__

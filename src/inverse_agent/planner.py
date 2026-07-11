@@ -3,19 +3,35 @@
 from __future__ import annotations
 
 import json
+import re
+from collections.abc import Mapping
 from dataclasses import dataclass
 from http.client import HTTPConnection, HTTPException, HTTPResponse, HTTPSConnection
 from ipaddress import ip_address
+from threading import Lock
 from time import monotonic
 from typing import Any, Protocol
 from unicodedata import category
 from urllib.parse import urlsplit, urlunsplit
+
+from jsonschema import Draft202012Validator
+from jsonschema.exceptions import SchemaError, ValidationError
 
 from inverse_agent.models import Domain, WorkspaceProfile
 from inverse_agent.redaction import redact_text
 
 MAX_MODEL_RESPONSE_BYTES = 1024 * 1024
 MAX_MODEL_COMPLETION_TOKENS = 4096
+MODEL_RESPONSE_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/@:+-]{0,255}")
+PLAN_RESPONSE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "actions": {"type": "array", "items": {"type": "string"}},
+        "rationale": {"type": "string"},
+    },
+    "required": ["actions", "rationale"],
+    "additionalProperties": False,
+}
 
 
 class PlannerError(ValueError):
@@ -107,8 +123,55 @@ class OpenAICompatibleClient:
         self.model = model
         self.api_key = api_key
         self.timeout_seconds = timeout_seconds
+        self._observed_response_models: set[str] = set()
+        self._successful_response_count = 0
+        self._attributed_response_count = 0
+        self._observation_lock = Lock()
+
+    @property
+    def observed_response_models(self) -> tuple[str, ...]:
+        with self._observation_lock:
+            return tuple(sorted(self._observed_response_models))
+
+    @property
+    def successful_response_count(self) -> int:
+        with self._observation_lock:
+            return self._successful_response_count
+
+    @property
+    def attributed_response_count(self) -> int:
+        with self._observation_lock:
+            return self._attributed_response_count
 
     def complete_json(self, *, system: str, prompt: str) -> dict[str, Any]:
+        return self.complete_structured_json(
+            system=system,
+            prompt=prompt,
+            schema_name="inverse_agent_plan",
+            schema=PLAN_RESPONSE_SCHEMA,
+        )
+
+    def complete_structured_json(
+        self,
+        *,
+        system: str,
+        prompt: str,
+        schema_name: str,
+        schema: Mapping[str, Any],
+        max_tokens: int = MAX_MODEL_COMPLETION_TOKENS,
+    ) -> dict[str, Any]:
+        """Complete a caller-supplied strict JSON schema over the hardened transport."""
+
+        if not schema_name or not schema_name.replace("_", "").isalnum():
+            raise ValueError("schema name contains unsupported characters")
+        if not 1 <= max_tokens <= MAX_MODEL_COMPLETION_TOKENS:
+            raise ValueError(f"max tokens must be between 1 and {MAX_MODEL_COMPLETION_TOKENS}")
+        schema_payload = dict(schema)
+        try:
+            Draft202012Validator.check_schema(schema_payload)
+            validator = Draft202012Validator(schema_payload)
+        except SchemaError as exc:
+            raise ValueError("model response schema is invalid") from exc
         body = json.dumps(
             {
                 "model": self.model,
@@ -119,24 +182,13 @@ class OpenAICompatibleClient:
                 "response_format": {
                     "type": "json_schema",
                     "json_schema": {
-                        "name": "inverse_agent_plan",
+                        "name": schema_name,
                         "strict": True,
-                        "schema": {
-                            "type": "object",
-                            "properties": {
-                                "actions": {
-                                    "type": "array",
-                                    "items": {"type": "string"},
-                                },
-                                "rationale": {"type": "string"},
-                            },
-                            "required": ["actions", "rationale"],
-                            "additionalProperties": False,
-                        },
+                        "schema": schema_payload,
                     },
                 },
                 "temperature": 0,
-                "max_tokens": MAX_MODEL_COMPLETION_TOKENS,
+                "max_tokens": max_tokens,
             }
         ).encode()
         headers = {"Content-Type": "application/json"}
@@ -171,15 +223,34 @@ class OpenAICompatibleClient:
             connection.close()
         try:
             payload = json.loads(raw)
+            if not isinstance(payload, dict):
+                raise TypeError("response is not an object")
+            reported_model = payload.get("model")
+            if reported_model is not None and (
+                not isinstance(reported_model, str)
+                or MODEL_RESPONSE_ID_PATTERN.fullmatch(reported_model) is None
+            ):
+                raise TypeError("response model identity is invalid")
             choices = payload["choices"]
             content = choices[0]["message"]["content"]
             if not isinstance(content, str):
                 raise TypeError("message content is not text")
             parsed = json.loads(content)
-        except (IndexError, KeyError, TypeError, json.JSONDecodeError) as exc:
+        except (IndexError, KeyError, TypeError, ValueError, RecursionError) as exc:
             raise PlannerProtocolError("model endpoint returned an invalid response") from exc
         if not isinstance(parsed, dict):
             raise PlannerProtocolError("model plan must be a JSON object")
+        try:
+            validator.validate(parsed)
+        except (ValidationError, ValueError, RecursionError) as exc:
+            raise PlannerProtocolError(
+                "model response does not match the requested JSON schema"
+            ) from exc
+        with self._observation_lock:
+            self._successful_response_count += 1
+            if reported_model is not None:
+                self._observed_response_models.add(reported_model)
+                self._attributed_response_count += 1
         return parsed
 
     @staticmethod

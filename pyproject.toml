@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=70", "wheel"]
+requires = ["setuptools>=77", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -8,13 +8,14 @@ version = "0.1.0"
 description = "OSS-composed agentic workbench for developer and research workflows"
 readme = "README.md"
 requires-python = ">=3.12"
-license = { text = "MIT" }
+license = "MIT"
 authors = [{ name = "Inverse.AI" }]
 dependencies = [
   "fastapi>=0.115,<1",
   "langgraph>=0.2,<2",
   "langgraph-checkpoint-sqlite>=3.1,<4",
   "mcp>=1.27,<2",
+  "jsonschema>=4.23,<5",
   "pydantic>=2,<3",
   "rich>=13,<15",
   "typer>=0.12,<1",
@@ -27,6 +28,7 @@ dev = [
   "pytest>=8,<10",
   "pytest-cov>=7.1,<8",
   "ruff>=0.8,<1",
+  "types-jsonschema>=4.23,<5",
 ]
 
 [project.scripts]
@@ -37,6 +39,7 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 "inverse_agent.ui" = ["*.html", "*.css", "*.js"]
+"inverse_agent.benchmark_assets" = ["*.md", "commit_review/**/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -54,6 +57,7 @@ ignore = ["E501"]
 python_version = "3.12"
 strict = true
 files = ["src/inverse_agent"]
+exclude = ["^src/inverse_agent/benchmark_assets/"]
 
 [tool.coverage.run]
 branch = true

@@ -10,6 +10,7 @@ The first dogfood domains match the in-house team:
 - Django full-stack projects
 - PyTorch research engineering
 - Approval-gated generic Git repository inspection for monorepo roots
+- Structured commit review for Android, iOS, C/C++, Django, PyTorch, and generic changes
 
 ## Runtime Shape
 
@@ -113,6 +114,31 @@ When neither model variable is present, Inverse-Agent remains deterministic. Mod
 
 Remote model endpoints are denied by default. They require HTTPS, `INVERSE_AGENT_MODEL_ALLOW_REMOTE=1`, and the `--model-allow-remote` flag together. API keys are accepted only through `INVERSE_AGENT_MODEL_API_KEY`, never through a command-line flag.
 
+## Commit Review
+
+Review a hexadecimal commit object ID with the local model:
+
+```powershell
+uv run inverse-agent review-commit D:\work\project COMMIT_SHA `
+  --domain android `
+  --goal "Review this change for introduced correctness and security defects" `
+  --model inverse-gpt-oss-20b `
+  --model-base-url http://127.0.0.1:1234/v1
+```
+
+The reader resolves the immutable commit with replacement objects and lazy fetch disabled, reads bounded Git blobs and raw tree modes, and constructs the unified diff in Python. It requires a normal in-workspace `.git` directory and refuses linked, common, alternate, grafted, or shallow object histories. It does not invoke repository hooks, external diff drivers, text conversion commands, or workspace code. Two independent model scouts propose findings under a fair candidate budget; PyTorch adds three contract-focused scouts for evaluation mode and normalization leakage so independent experiment defects are not lost to attention competition. A final model pass must accept or reject every labeled candidate. Findings supply verbatim source or Git-metadata evidence and its added/removed side, which Inverse-Agent maps to one unique changed line. Accepted scout findings are retained as provenance so the benchmark can require model support for every expected defect. High-signal Android, iOS, C++, Django, and PyTorch checks provide narrowly scoped redacted evidence, and the OpenAI-compatible client validates returned JSON locally against the requested schema. Omitted changed bytes, mixed line-ending ambiguity, unresolved or partial imported context, bounded dependency/context overflow, and candidate-budget overflow force an `INCOMPLETE` verdict. `review-commit` exits `0` for `PASS`, `1` for `FINDINGS`, and `3` for `INCOMPLETE`.
+
+Run the packaged six-case acceptance benchmark, including the real `482fa05` Inverse-Agent control:
+
+```powershell
+uv run inverse-agent benchmark-review builtin `
+  --repository-root . `
+  --model inverse-gpt-oss-20b `
+  --model-base-url http://127.0.0.1:1234/v1
+```
+
+The source checkout also retains `benchmarks\commit_review\suite.json` for fixture development. See the [commit-review benchmark specification](https://github.com/inverseai/Inverse-Agent/blob/main/docs/commit-review-benchmark.md) for task definitions and scoring.
+
 ## Safety Boundary
 
 - Exact argv matching; unknown flags and trailing arguments are refused.
@@ -123,6 +149,7 @@ Remote model endpoints are denied by default. They require HTTPS, `INVERSE_AGENT
 - Subprocess environments omit API tokens and other undeclared variables.
 - Output is size-capped and secret-like material, including complete PEM blocks, is redacted.
 - Timeouts terminate the spawned process group or Windows process tree.
+- Commit review accepts only bounded hexadecimal object IDs, uses fixed-location system Git discovery, neutralizes likely source-directed model instructions, hides filenames behind opaque IDs, and validates every model-reported line against an immutable changed hunk.
 
 This is an application-layer boundary, not an OS sandbox. See [docs/safety.md](docs/safety.md) for the threat model and residual risks.
 

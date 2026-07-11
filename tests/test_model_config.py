@@ -61,8 +61,8 @@ class _ModelHandler(BaseHTTPRequestHandler):
         return
 
 
-def _response(content: str) -> bytes:
-    return json.dumps({"choices": [{"message": {"content": content}}]}).encode()
+def _response(content: str, *, model: str = "endpoint-reported-model") -> bytes:
+    return json.dumps({"model": model, "choices": [{"message": {"content": content}}]}).encode()
 
 
 def _serve(
@@ -235,7 +235,8 @@ def test_model_configuration_rejects_out_of_range_values(name: str, value: str) 
 
 
 def test_openai_compatible_client_round_trip_and_authorization() -> None:
-    server, thread = _serve(_response(json.dumps({"actions": ["generic.inspect"]})))
+    response_payload = {"actions": ["generic.inspect"], "rationale": "Inspect the workspace"}
+    server, thread = _serve(_response(json.dumps(response_payload)))
     try:
         host, port = server.server_address
         client = OpenAICompatibleClient(
@@ -246,7 +247,10 @@ def test_openai_compatible_client_round_trip_and_authorization() -> None:
         result = client.complete_json(system="system", prompt="prompt")
     finally:
         _stop(server, thread)
-    assert result == {"actions": ["generic.inspect"]}
+    assert result == response_payload
+    assert client.observed_response_models == ("endpoint-reported-model",)
+    assert client.successful_response_count == 1
+    assert client.attributed_response_count == 1
     assert server.authorization == "Bearer secret-model-key"
     assert server.request_payload and server.request_payload["temperature"] == 0
     assert server.request_payload["max_tokens"] == 4096
@@ -266,6 +270,147 @@ def test_openai_compatible_client_round_trip_and_authorization() -> None:
             },
         },
     }
+
+
+def test_openai_compatible_client_accepts_a_bounded_custom_schema() -> None:
+    server, thread = _serve(_response(json.dumps({"verdict": "PASS"})))
+    schema = {
+        "type": "object",
+        "properties": {"verdict": {"type": "string"}},
+        "required": ["verdict"],
+        "additionalProperties": False,
+    }
+    try:
+        host, port = server.server_address
+        client = OpenAICompatibleClient(base_url=f"http://{host}:{port}/v1", model="model")
+        result = client.complete_structured_json(
+            system="system",
+            prompt="prompt",
+            schema_name="commit_review",
+            schema=schema,
+            max_tokens=512,
+        )
+    finally:
+        _stop(server, thread)
+
+    assert result == {"verdict": "PASS"}
+    assert server.request_payload and server.request_payload["max_tokens"] == 512
+    response_format = server.request_payload["response_format"]
+    assert isinstance(response_format, dict)
+    assert response_format["json_schema"] == {
+        "name": "commit_review",
+        "strict": True,
+        "schema": schema,
+    }
+
+
+def test_openai_compatible_client_counts_success_without_reported_model() -> None:
+    response_payload = {"actions": ["generic.inspect"], "rationale": "Inspect"}
+    body = json.dumps(
+        {"choices": [{"message": {"content": json.dumps(response_payload)}}]}
+    ).encode()
+    server, thread = _serve(body)
+    try:
+        host, port = server.server_address
+        client = OpenAICompatibleClient(
+            base_url=f"http://{host}:{port}/v1",
+            model="requested-model",
+        )
+        assert client.complete_json(system="system", prompt="prompt") == response_payload
+    finally:
+        _stop(server, thread)
+
+    assert client.observed_response_models == ()
+    assert client.successful_response_count == 1
+    assert client.attributed_response_count == 0
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        {"verdict": 1},
+        {},
+        {"verdict": "PASS", "unexpected": True},
+    ],
+)
+def test_openai_compatible_client_validates_structured_output_locally(
+    content: dict[str, object],
+) -> None:
+    server, thread = _serve(_response(json.dumps(content)))
+    schema = {
+        "type": "object",
+        "properties": {"verdict": {"type": "string"}},
+        "required": ["verdict"],
+        "additionalProperties": False,
+    }
+    try:
+        host, port = server.server_address
+        client = OpenAICompatibleClient(base_url=f"http://{host}:{port}/v1", model="model")
+        with pytest.raises(PlannerProtocolError, match="requested JSON schema"):
+            client.complete_structured_json(
+                system="system",
+                prompt="prompt",
+                schema_name="commit_review",
+                schema=schema,
+            )
+    finally:
+        _stop(server, thread)
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        pytest.param("[" * 1200 + "0" + "]" * 1200, id="deeply-nested"),
+        pytest.param('{"verdict": ' + "9" * 10_000 + "}", id="oversized-integer"),
+    ],
+)
+def test_openai_compatible_client_contains_pathological_json_errors(content: str) -> None:
+    server, thread = _serve(_response(content))
+    schema = {
+        "type": "object",
+        "properties": {"verdict": {"type": "string"}},
+        "required": ["verdict"],
+        "additionalProperties": False,
+    }
+    try:
+        host, port = server.server_address
+        client = OpenAICompatibleClient(base_url=f"http://{host}:{port}/v1", model="model")
+        with pytest.raises(PlannerProtocolError):
+            client.complete_structured_json(
+                system="system",
+                prompt="prompt",
+                schema_name="commit_review",
+                schema=schema,
+            )
+    finally:
+        _stop(server, thread)
+
+
+def test_openai_compatible_client_rejects_invalid_custom_schema_controls() -> None:
+    client = OpenAICompatibleClient(base_url="http://127.0.0.1:1234/v1", model="model")
+
+    with pytest.raises(ValueError, match="schema name"):
+        client.complete_structured_json(
+            system="system",
+            prompt="prompt",
+            schema_name="invalid-name",
+            schema={},
+        )
+    with pytest.raises(ValueError, match="max tokens"):
+        client.complete_structured_json(
+            system="system",
+            prompt="prompt",
+            schema_name="valid_name",
+            schema={},
+            max_tokens=4097,
+        )
+    with pytest.raises(ValueError, match="schema is invalid"):
+        client.complete_structured_json(
+            system="system",
+            prompt="prompt",
+            schema_name="valid_name",
+            schema={"type": "not-a-json-schema-type"},
+        )
 
 
 def test_openai_compatible_client_rejects_redirects_and_oversized_output() -> None:
@@ -356,7 +501,9 @@ def test_cli_start_returns_failure_when_model_plan_is_invalid(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    server, thread = _serve(_response(json.dumps({"actions": ["unknown.tool"]})))
+    server, thread = _serve(
+        _response(json.dumps({"actions": ["unknown.tool"], "rationale": "Unknown"}))
+    )
     state_dir = tmp_path / "state"
     try:
         host, port = server.server_address

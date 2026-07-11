@@ -4,7 +4,7 @@ Inverse-Agent separates decisions, execution, and product state so no model-cont
 
 ## Components
 
-- `planner.py`: provider-neutral planning. Models select registered tool IDs under a strict action budget; raw commands are rejected.
+- `planner.py`: provider-neutral planning. Models select registered tool IDs under a strict action budget; raw commands are rejected and structured responses are validated locally against JSON Schema.
 - `model_config.py`: validated model configuration, endpoint policy, planner construction, and non-secret provenance.
 - `adapters/`: domain detection and command generation for Django, PyTorch, Android/NDK, and iOS.
 - `policies.py`: exact command rules and the concrete trusted executable map.
@@ -16,6 +16,8 @@ Inverse-Agent separates decisions, execution, and product state so no model-cont
 - `ui/`: dependency-free engineering workbench with task history, plan rationale, approval gates, run output, and workspace inspection.
 - `mcp_server.py`: executable MCP tools. Approval and trust mutation are intentionally absent.
 - `eval.py`: portable trace serialization.
+- `commit_review.py`: immutable Git blob extraction, bounded diff construction, source-instruction neutralization, multi-scout review, evidence adjudication, and structured finding validation.
+- `review_benchmark.py`: hermetic multi-domain repository materialization and acceptance scoring.
 
 ## Trust Flow
 
@@ -42,6 +44,16 @@ The workspace inspector is a read model over profiling, trust, runtime provenanc
 - Android: the absolute project wrapper runs with `--offline`; all Gradle configuration is treated as workspace-code execution.
 - Android NDK: CMake builds require a discovered system CMake and approval.
 - iOS: tools are explicitly unavailable off macOS or without `xcodebuild`; Xcode actions require approval.
+
+## Commit Review Flow
+
+Commit review is a typed read-and-reason path rather than a raw-command workflow. The operator supplies a 7-64 character hexadecimal object ID. Inverse-Agent resolves it to a full commit SHA with fixed-location system Git while replacement objects and lazy fetching are disabled, enumerates changed tree entries, reads bounded blobs with `git cat-file`, and builds its own unified diff. On Windows, trusted installation roots come from the machine registry rather than process environment variables, and linked or junction-backed executable paths are refused. The strict v0.1 reader accepts only an in-workspace `.git` directory and rejects worktree indirection, links, common directories, and alternate object stores. Repository diff configuration, hooks, text conversion, and external diff programs are never invoked.
+
+Likely reviewer-directed instructions in pure comments and commit metadata are replaced while surrounding line structure is preserved. Inline comment handling retains the executable prefix but conservatively marks the review incomplete; an instruction-like source line without a recognizable comment boundary is omitted and also forces `INCOMPLETE`. Nonmatching source is never Unicode-normalized or rewritten, and strict decode failures cannot produce a complete verdict. Filenames are not sent to the model; each file uses an opaque review ID and a constrained extension hint. For Python changes, bounded AST extraction follows imported symbols, namespace-package submodules, full-module imports, and every ancestor package initializer from both repository-root and `src/` layouts. A partially resolved symbol request retains the available definitions but marks the context incomplete. Missing or unsupported in-repository context is never silently omitted.
+
+Two independent general model passes inspect the redacted diff. PyTorch adds one focused evaluation-mode scout plus independent normalization-leakage and evaluation-mode confirmation scouts, isolating those contracts from data, gradient, and state-restoration analysis at the cost of three extra model calls for that domain. Deterministic signals consume the bounded candidate budget first; remaining slots are distributed round-robin across all active scouts, so model noise cannot evict narrowly grounded local candidates. If any unique candidate cannot fit, the report is `INCOMPLETE` even when the retained candidates are rejected, preventing budget pressure from producing a false `PASS`. Scout and deterministic findings are untrusted hypotheses; a final pass verifies every retained candidate against the same diff, and rejected candidates are not presented. Its `accepted` decision means evidence-supported rather than display-unique, allowing Inverse-Agent to retain the accepted scout-origin set before presentation deduplication. Evidence is matched exactly first; a single declared-side diff marker is tolerated only as a fallback, preserving real `++` and `--` source lines. Model findings outside opaque file IDs or changed hunk lines are discarded. High-signal Android, iOS, C++, Django, and PyTorch checks produce mechanically anchored candidates for narrowly provable defect patterns. Android bridge registrations must target the navigated WebView, C++ lifetime scopes include parameterless lambdas, and iOS callback plus Django taint analysis remain inside lexical function/closure boundaries. PyTorch contradiction checks use ordered assignments and kill overwritten provenance before rejecting a model claim. Detector-supplied root lines and multi-label defect categories consolidate only true accepted restatements, so independent nearby findings remain separate. The benchmark can require every expected defect to match an adjudicated scout-origin finding and therefore cannot pass on deterministic rules alone.
+
+The commit-review CLI is deliberately separate from durable command runs in v0.1. It reads source and sends the bounded review prompt to the operator-configured model endpoint, but it neither executes workspace code nor grants approval authority.
 
 ## OSS Composition
 

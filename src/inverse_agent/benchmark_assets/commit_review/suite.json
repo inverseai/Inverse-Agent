@@ -1,0 +1,284 @@
+{
+  "version": 2,
+  "cases": [
+    {
+      "id": "android-exported-webview",
+      "domain": "android",
+      "fixture": "android_exported_webview",
+      "goal": "Review this Android commit for introduced security and correctness defects.",
+      "min_model_supported_findings": 1,
+      "max_alternative_findings": 1,
+      "expected_findings": [
+        {
+          "id": "untrusted-webview-navigation",
+          "paths": [
+            "app/src/main/AndroidManifest.xml",
+            "app/src/main/java/com/inverse/DeepLinkActivity.kt"
+          ],
+          "severities": ["P0", "P1", "P2"],
+          "max_match_findings": 1,
+          "anchors": [
+            {
+              "path": "app/src/main/java/com/inverse/DeepLinkActivity.kt",
+              "change": "added",
+              "lines": [17, 18],
+              "evidence": ["getStringExtra(\"url\")", "loadUrl(target)"]
+            }
+          ],
+          "keyword_groups": [
+            ["loadurl", "navigation", "navigate", "loads a url", "loads the url", "url loaded"],
+            ["external", "untrusted", "arbitrary", "attacker"]
+          ]
+        },
+        {
+          "id": "javascript-bridge-exposure",
+          "paths": [
+            "app/src/main/AndroidManifest.xml",
+            "app/src/main/java/com/inverse/DeepLinkActivity.kt"
+          ],
+          "severities": ["P0", "P1", "P2"],
+          "max_match_findings": 1,
+          "anchors": [
+            {
+              "path": "app/src/main/java/com/inverse/DeepLinkActivity.kt",
+              "change": "added",
+              "lines": [15, 23, 24],
+              "evidence": ["addJavascriptInterface", "@JavascriptInterface", "accountId"]
+            }
+          ],
+          "keyword_groups": [
+            ["javascriptinterface", "javascript interface", "bridge"],
+            [
+              "arbitrary",
+              "untrusted",
+              "loaded page",
+              "any loaded",
+              "external web content",
+              "malicious"
+            ]
+          ]
+        },
+        {
+          "id": "exported-component-exposure",
+          "paths": ["app/src/main/AndroidManifest.xml"],
+          "severities": ["P0", "P1", "P2"],
+          "max_match_findings": 1,
+          "anchors": [
+            {
+              "path": "app/src/main/AndroidManifest.xml",
+              "change": "added",
+              "lines": [5, 7, 9],
+              "evidence": [
+                "android:exported=\"true\"",
+                "android.intent.action.VIEW",
+                "android.intent.category.BROWSABLE"
+              ]
+            }
+          ],
+          "keyword_groups": [
+            ["exported", "external", "intent filter", "launch"],
+            ["activity", "deep link", "component"]
+          ]
+        }
+      ]
+    },
+    {
+      "id": "ios-background-ui-update",
+      "domain": "ios",
+      "fixture": "ios_background_ui",
+      "goal": "Review this iOS commit for introduced correctness and concurrency defects.",
+      "min_model_supported_findings": 1,
+      "expected_findings": [
+        {
+          "id": "uikit-off-main-thread",
+          "paths": ["App/ProfileViewController.swift"],
+          "severities": ["P1", "P2"],
+          "max_match_findings": 1,
+          "anchors": [
+            {
+              "path": "App/ProfileViewController.swift",
+              "change": "added",
+              "lines": [15],
+              "evidence": ["statusLabel.text"]
+            }
+          ],
+          "keyword_groups": [
+            ["main thread", "dispatchqueue.main", "mainactor"],
+            ["statuslabel", "uilabel", "ui update"]
+          ]
+        }
+      ]
+    },
+    {
+      "id": "cpp-dangling-string-view",
+      "domain": "cpp",
+      "fixture": "cpp_dangling_view",
+      "goal": "Review this C++ commit for introduced memory-safety and correctness defects.",
+      "min_model_supported_findings": 1,
+      "expected_findings": [
+        {
+          "id": "dangling-string-view",
+          "paths": ["src/config.cpp"],
+          "severities": ["P0", "P1", "P2"],
+          "max_match_findings": 1,
+          "anchors": [
+            {
+              "path": "src/config.cpp",
+              "change": "added",
+              "lines": [7],
+              "evidence": ["string_view(parsed)"]
+            }
+          ],
+          "keyword_groups": [
+            ["dangling", "lifetime", "destroyed"],
+            ["string_view", "local string", "local variable"]
+          ]
+        }
+      ]
+    },
+    {
+      "id": "django-full-stack-injection",
+      "domain": "django",
+      "fixture": "django_injection",
+      "goal": "Review this Django full-stack commit for introduced security and correctness defects.",
+      "min_model_supported_findings": 1,
+      "expected_findings": [
+        {
+          "id": "sql-injection",
+          "paths": ["projects/views.py"],
+          "severities": ["P0", "P1"],
+          "max_match_findings": 1,
+          "anchors": [
+            {
+              "path": "projects/views.py",
+              "change": "added",
+              "lines": [9],
+              "evidence": ["SELECT id, name", "projects_project WHERE name LIKE"]
+            }
+          ],
+          "keyword_groups": [
+            ["sql injection", "query injection"],
+            ["f-string", "interpolat", "parameter"]
+          ]
+        },
+        {
+          "id": "dom-xss",
+          "paths": ["projects/static/projects/search.js"],
+          "severities": ["P0", "P1", "P2"],
+          "max_match_findings": 1,
+          "anchors": [
+            {
+              "path": "projects/static/projects/search.js",
+              "change": "added",
+              "lines": [2],
+              "evidence": ["container.innerHTML", "item.name"]
+            }
+          ],
+          "keyword_groups": [
+            ["xss", "cross-site scripting", "html injection"],
+            ["innerhtml", "escape", "textcontent"]
+          ]
+        }
+      ]
+    },
+    {
+      "id": "pytorch-invalid-evaluation",
+      "domain": "pytorch",
+      "fixture": "pytorch_invalid_eval",
+      "goal": "Review this PyTorch research commit for introduced validity, leakage, and reproducibility defects.",
+      "min_model_supported_findings": 1,
+      "expected_findings": [
+        {
+          "id": "evaluation-train-mode",
+          "paths": ["experiment.py"],
+          "severities": ["P1", "P2"],
+          "max_match_findings": 1,
+          "anchors": [
+            {
+              "path": "experiment.py",
+              "change": "added",
+              "lines": [15],
+              "evidence": ["model.train()"]
+            },
+            {
+              "path": "experiment.py",
+              "change": "removed",
+              "lines": [15],
+              "evidence": ["model.eval()"]
+            }
+          ],
+          "keyword_groups": [
+            ["model.eval", "train mode", "training mode", "dropout", "batchnorm"],
+            ["evaluation", "evaluate", "inference", "metric", "accuracy"]
+          ]
+        },
+        {
+          "id": "evaluation-gradient-control",
+          "paths": ["experiment.py"],
+          "severities": ["P1", "P2"],
+          "max_match_findings": 1,
+          "anchors": [
+            {
+              "path": "experiment.py",
+              "change": "removed",
+              "lines": [17],
+              "evidence": ["torch.no_grad"]
+            }
+          ],
+          "keyword_groups": [
+            ["gradient", "gradients", "no_grad", "suppress gradients"],
+            ["evaluation", "evaluate", "inference"]
+          ]
+        },
+        {
+          "id": "normalization-data-leakage",
+          "paths": ["experiment.py"],
+          "severities": ["P1", "P2"],
+          "max_match_findings": 1,
+          "anchors": [
+            {
+              "path": "experiment.py",
+              "change": "added",
+              "lines": [5, 6, 8],
+              "evidence": ["features.mean", "features.std", "random_split(normalized"]
+            }
+          ],
+          "keyword_groups": [
+            ["leak", "held-out", "test set", "validation"],
+            ["mean", "standard deviation", "normaliz", "statistics"]
+          ]
+        },
+        {
+          "id": "evaluation-state-restoration",
+          "paths": ["experiment.py"],
+          "severities": ["P1", "P2"],
+          "max_match_findings": 1,
+          "anchors": [
+            {
+              "path": "experiment.py",
+              "change": "removed",
+              "lines": [14, 20, 21],
+              "evidence": ["was_training", "if was_training", "model.train()"]
+            }
+          ],
+          "keyword_groups": [
+            ["restore", "restored", "original training state", "was_training"],
+            ["evaluation", "evaluate", "model state", "training state"]
+          ]
+        }
+      ]
+    }
+  ],
+  "repository_cases": [
+    {
+      "id": "inverse-agent-generic-git",
+      "domain": "generic",
+      "workspace": ".",
+      "commit": "482fa05",
+      "goal": "Review this Inverse-Agent commit for introduced correctness and security defects.",
+      "expected_findings": [],
+      "max_unmatched_findings": 0,
+      "allowed_unmatched_severities": ["P2", "P3"]
+    }
+  ]
+}

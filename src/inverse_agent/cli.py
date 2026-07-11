@@ -6,11 +6,16 @@ import argparse
 import json
 import os
 import sys
+import tempfile
 import time
-from dataclasses import asdict
+from collections.abc import Iterator
+from contextlib import contextmanager, suppress
+from dataclasses import asdict, replace
+from importlib.resources import as_file, files
 from pathlib import Path
 
 from inverse_agent.adapters.registry import detect_workspace
+from inverse_agent.commit_review import ReviewDomain, review_commit
 from inverse_agent.control_plane import create_app
 from inverse_agent.dogfood import evaluate_workspace, save_evaluation
 from inverse_agent.eval import json_default
@@ -18,7 +23,10 @@ from inverse_agent.mcp_server import create_mcp_server
 from inverse_agent.model_config import PlannerResolution, resolve_planner
 from inverse_agent.models import AutonomyLevel, Domain, RunStatus, WorkspaceProfile
 from inverse_agent.redaction import redact_text
+from inverse_agent.review_benchmark import BenchmarkModelProvenance, run_benchmark_suite
 from inverse_agent.service import AgentService
+
+BUILTIN_BENCHMARK_SUITE = "builtin"
 
 
 def default_state_dir() -> str:
@@ -157,6 +165,110 @@ def model_check_command(args: argparse.Namespace) -> int:
         return 1
 
 
+def review_commit_command(args: argparse.Namespace) -> int:
+    resolution = resolve_planner(args=args, require_model=True)
+    if resolution.client is None:  # pragma: no cover - guarded by require_model
+        raise RuntimeError("structured review requires a model client")
+    report = review_commit(
+        Path(args.workspace).resolve(),
+        args.commit,
+        domain=ReviewDomain(args.domain),
+        goal=args.goal,
+        client=resolution.client,
+    )
+    print(json.dumps(asdict(report), default=json_default, indent=2))
+    return {"PASS": 0, "FINDINGS": 1, "INCOMPLETE": 3}[report.verdict]
+
+
+def benchmark_review_command(args: argparse.Namespace) -> int:
+    prepared_output = _prepare_benchmark_output(args.output)
+    output_path, temporary_output = prepared_output or (None, None)
+    try:
+        resolution = resolve_planner(args=args, require_model=True)
+        if resolution.client is None:  # pragma: no cover - guarded by require_model
+            raise RuntimeError("review benchmark requires a model client")
+        repository_root = Path(args.repository_root).resolve() if args.repository_root else None
+        with _benchmark_suite_path(args.suite) as suite_path:
+            result = run_benchmark_suite(
+                suite_path,
+                client=resolution.client,
+                repository_root=repository_root,
+            )
+        requested_model = resolution.config.model
+        base_url = resolution.config.base_url
+        if requested_model is None or base_url is None:  # pragma: no cover - require_model guard
+            raise RuntimeError("review benchmark model provenance is unavailable")
+        reported_models = resolution.client.observed_response_models
+        successful_responses = resolution.client.successful_response_count
+        attributed_responses = resolution.client.attributed_response_count
+        endpoint_model_consistent = (
+            reported_models == (requested_model,)
+            and successful_responses > 0
+            and attributed_responses == successful_responses
+        )
+        result = replace(
+            result,
+            passed=result.passed and endpoint_model_consistent,
+            model_provenance=BenchmarkModelProvenance(
+                kind=resolution.config.kind,
+                requested_model=requested_model,
+                base_url=base_url,
+                config_fingerprint=resolution.config.fingerprint,
+                endpoint_reported_models=reported_models,
+                successful_responses=successful_responses,
+                attributed_responses=attributed_responses,
+                endpoint_model_consistent=endpoint_model_consistent,
+            ),
+        )
+        payload = json.dumps(asdict(result), default=json_default, indent=2)
+        if output_path is not None and temporary_output is not None:
+            temporary_output.write_text(payload + "\n", encoding="utf-8")
+            os.replace(temporary_output, output_path)
+            temporary_output = None
+        print(payload)
+        return 0 if result.passed else 1
+    finally:
+        if temporary_output is not None:
+            with suppress(OSError):
+                temporary_output.unlink()
+
+
+@contextmanager
+def _benchmark_suite_path(value: str) -> Iterator[Path]:
+    if value != BUILTIN_BENCHMARK_SUITE:
+        yield Path(value).resolve()
+        return
+    packaged_root = files("inverse_agent.benchmark_assets").joinpath("commit_review")
+    with as_file(packaged_root) as extracted_root:
+        yield Path(extracted_root) / "suite.json"
+
+
+def _prepare_benchmark_output(value: str | None) -> tuple[Path, Path] | None:
+    if not value:
+        return None
+    output_path = Path(value).resolve()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    if output_path.exists():
+        if not output_path.is_file():
+            raise ValueError("benchmark output path must be a file")
+        if output_path.stat().st_mode & 0o222 == 0:
+            raise PermissionError("benchmark output file is not writable")
+        try:
+            with output_path.open("ab"):
+                pass
+        except OSError as exc:
+            raise PermissionError("benchmark output file is not writable") from exc
+    with tempfile.NamedTemporaryFile(
+        mode="wb",
+        prefix=f".{output_path.name}.",
+        suffix=".tmp",
+        dir=output_path.parent,
+        delete=False,
+    ) as temporary:
+        temporary_path = Path(temporary.name)
+    return output_path, temporary_path
+
+
 def _service(
     args: argparse.Namespace,
     workspace_root: Path,
@@ -253,6 +365,30 @@ def build_parser() -> argparse.ArgumentParser:
     model_check = sub.add_parser("model-check", help="Verify model-backed structured planning")
     _add_model_arguments(model_check)
     model_check.set_defaults(func=model_check_command)
+
+    review = sub.add_parser("review-commit", help="Review an immutable Git commit")
+    review.add_argument("workspace")
+    review.add_argument("commit")
+    review.add_argument("--domain", required=True, choices=[item.value for item in ReviewDomain])
+    review.add_argument(
+        "--goal",
+        default="Review this commit for introduced correctness and security defects",
+    )
+    _add_model_arguments(review)
+    review.set_defaults(func=review_commit_command)
+
+    benchmark_review = sub.add_parser(
+        "benchmark-review",
+        help="Run the multi-domain commit-review acceptance suite",
+    )
+    benchmark_review.add_argument(
+        "suite",
+        help="Suite JSON path, or 'builtin' for the packaged acceptance suite",
+    )
+    benchmark_review.add_argument("--repository-root")
+    benchmark_review.add_argument("--output")
+    _add_model_arguments(benchmark_review)
+    benchmark_review.set_defaults(func=benchmark_review_command)
     return parser
 
 
