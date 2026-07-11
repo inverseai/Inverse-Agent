@@ -284,7 +284,7 @@ class DeterministicPlanner:
         Domain.ANDROID: ("android.tasks", "android.test", "android.lint"),
         Domain.ANDROID_NDK: ("android_ndk.cmake_build",),
         Domain.IOS: ("ios.list", "ios.test"),
-        Domain.GENERIC: (),
+        Domain.GENERIC: ("generic.status", "generic.tracked_files"),
     }
 
     def plan(

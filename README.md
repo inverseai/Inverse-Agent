@@ -9,6 +9,7 @@ The first dogfood domains match the in-house team:
 - Native iOS and Xcode
 - Django full-stack projects
 - PyTorch research engineering
+- Approval-gated generic Git repository inspection for monorepo roots
 
 ## Runtime Shape
 

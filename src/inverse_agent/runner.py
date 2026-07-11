@@ -337,6 +337,7 @@ class LocalRunner:
             "GCM_INTERACTIVE": "Never",
             "GIT_CONFIG_GLOBAL": "NUL" if os.name == "nt" else "/dev/null",
             "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_OPTIONAL_LOCKS": "0",
             "GIT_TERMINAL_PROMPT": "0",
             "NO_COLOR": "1",
             "PIP_NO_INPUT": "1",

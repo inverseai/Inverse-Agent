@@ -3,6 +3,7 @@ import json
 import platform
 import shutil
 import sqlite3
+import subprocess
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -507,6 +508,49 @@ def test_advisory_mode_plans_without_executing(tmp_path: Path) -> None:
         service.close()
     assert result.status == RunStatus.SUCCEEDED.value
     assert result.pending_approval is None
+
+
+def test_generic_git_workflow_requires_approval_for_each_inspection(tmp_path: Path) -> None:
+    git = shutil.which("git")
+    if not git:
+        pytest.skip("Git is unavailable")
+    repository = tmp_path / "workspace"
+    repository.mkdir()
+    (repository / "README.md").write_text("# Generic fixture\n", encoding="utf-8")
+    subprocess.run(
+        [git, "init", "--quiet", str(repository)],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        [git, "-C", str(repository), "add", "README.md"],
+        check=True,
+        capture_output=True,
+    )
+    service = AgentService(
+        workspace_root=repository,
+        state_dir=tmp_path / "state",
+        approval_secret=SECRET,
+    )
+    try:
+        service.trust_workspace(repository, trusted_by="tester")
+        created = service.create_run(
+            goal="Inspect repository status and tracked files",
+            workspace=repository,
+            domain=Domain.GENERIC,
+        )
+        first = service.start(created.run_id)
+        second = _approve(service, first, "tester")
+        result = _approve(service, second, "tester")
+    finally:
+        service.close()
+
+    assert result.status == RunStatus.SUCCEEDED.value
+    assert result.plan == ("generic.status", "generic.tracked_files")
+    assert result.completed_actions == 2
+    assert result.pending_approval is None
+    assert first.pending_approval and first.pending_approval["rule"] == "git-status"
+    assert second.pending_approval and second.pending_approval["rule"] == "git-ls-files"
 
 
 def test_untrusted_workspace_refuses_execution(tmp_path: Path) -> None:

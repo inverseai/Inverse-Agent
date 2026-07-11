@@ -7,6 +7,7 @@ from pathlib import Path
 from inverse_agent.adapters.android import AndroidAdapter, AndroidNdkAdapter
 from inverse_agent.adapters.base import ToolchainAdapter
 from inverse_agent.adapters.django import DjangoAdapter
+from inverse_agent.adapters.generic import GenericGitAdapter
 from inverse_agent.adapters.ios import IosAdapter
 from inverse_agent.adapters.pytorch import PyTorchAdapter
 from inverse_agent.models import Domain, WorkspaceProfile
@@ -19,6 +20,7 @@ def default_adapters() -> list[ToolchainAdapter]:
         AndroidAdapter(),
         AndroidNdkAdapter(),
         IosAdapter(),
+        GenericGitAdapter(),
     ]
 
 

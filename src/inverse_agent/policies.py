@@ -11,6 +11,19 @@ from inverse_agent.environments import (
 )
 from inverse_agent.models import CommandRule, Domain, RunnerPolicy
 
+GIT_SAFE_PREFIX = (
+    "git",
+    "--no-optional-locks",
+    "-c",
+    "core.fsmonitor=",
+    "-c",
+    "core.pager=cat",
+    "-c",
+    "pager.status=false",
+)
+GIT_STATUS_ARGV = (*GIT_SAFE_PREFIX, "status", "--short", "--branch", "--untracked-files=no")
+GIT_LS_FILES_ARGV = (*GIT_SAFE_PREFIX, "ls-files")
+
 
 def default_policy(workspace_root: Path) -> RunnerPolicy:
     """Create a default-deny policy with exact argv and trusted executable paths."""
@@ -33,22 +46,24 @@ def default_policy(workspace_root: Path) -> RunnerPolicy:
             discover_system_executable(name),
         )
 
-    git_safe = (
-        "git",
-        "-c",
-        "core.fsmonitor=",
-        "-c",
-        "core.pager=cat",
-        "-c",
-        "pager.status=false",
-    )
     rules = [
         CommandRule(
             "git-status",
-            (*git_safe, "status", "--short", "--branch", "--untracked-files=no"),
+            GIT_STATUS_ARGV,
             Domain.GENERIC,
+            requires_approval=True,
+            reason=(
+                "Git status executes an operator-selected system binary and may invoke "
+                "repository-configured clean/filter helpers"
+            ),
         ),
-        CommandRule("git-ls-files", (*git_safe, "ls-files"), Domain.GENERIC),
+        CommandRule(
+            "git-ls-files",
+            GIT_LS_FILES_ARGV,
+            Domain.GENERIC,
+            requires_approval=True,
+            reason="Git inspection executes an operator-selected system binary",
+        ),
         CommandRule(
             "django-check",
             ("python", "manage.py", "check"),

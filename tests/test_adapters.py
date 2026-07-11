@@ -3,10 +3,12 @@ from pathlib import Path
 
 from inverse_agent.adapters.android import AndroidAdapter, AndroidNdkAdapter
 from inverse_agent.adapters.django import DjangoAdapter
+from inverse_agent.adapters.generic import GenericGitAdapter
 from inverse_agent.adapters.ios import IosAdapter
 from inverse_agent.adapters.pytorch import PyTorchAdapter
 from inverse_agent.adapters.registry import detect_workspace
 from inverse_agent.models import Domain
+from inverse_agent.policies import GIT_STATUS_ARGV, default_policy
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -59,3 +61,23 @@ def test_registry_merges_domains_with_deterministic_labels() -> None:
     assert Domain.ANDROID in profile.domains
     assert Domain.ANDROID_NDK in profile.domains
     assert all(name.startswith(("android.", "android_ndk.")) for name in profile.commands)
+
+
+def test_generic_git_adapter_registers_hardened_read_tools(tmp_path: Path) -> None:
+    (tmp_path / ".git").mkdir()
+    adapter = GenericGitAdapter()
+    profile = adapter.profile(tmp_path)
+
+    assert adapter.detect(tmp_path)
+    assert Domain.GENERIC in profile.domains
+    assert set(profile.commands) == {"status", "tracked_files"}
+    assert Path(profile.commands["status"][0]).is_absolute()
+    assert profile.commands["status"][1:] == list(GIT_STATUS_ARGV[1:])
+    assert "--no-optional-locks" in profile.commands["status"]
+    assert {tool.safety for tool in adapter.tools()} == {"approval-required"}
+    git_rules = [
+        rule for rule in default_policy(tmp_path).allowed_commands if rule.name.startswith("git-")
+    ]
+    assert git_rules and all(rule.requires_approval for rule in git_rules)
+    status_rule = next(rule for rule in git_rules if rule.name == "git-status")
+    assert "repository-configured clean/filter helpers" in status_rule.reason

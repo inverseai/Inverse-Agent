@@ -313,14 +313,16 @@ def test_runner_does_not_inherit_secret_environment(
     script.write_text(
         "import os\n"
         "print(os.environ.get('INVERSE_AGENT_API_TOKEN', 'missing'))\n"
-        "print(os.environ.get('INVERSE_AGENT_MODEL_API_KEY', 'missing'))\n",
+        "print(os.environ.get('INVERSE_AGENT_MODEL_API_KEY', 'missing'))\n"
+        "print(os.environ.get('GIT_OPTIONAL_LOCKS', 'missing'))\n"
+        "print(os.environ.get('GIT_CONFIG_NOSYSTEM', 'missing'))\n",
         encoding="utf-8",
     )
     argv = (sys.executable, "env_probe.py")
     runner, _rule, _authority = _python_runner(tmp_path, argv)
     result = runner.run(CommandRequest(argv, tmp_path, Domain.GENERIC))
     assert result.status == RunStatus.SUCCEEDED
-    assert result.stdout.splitlines() == ["missing", "missing"]
+    assert result.stdout.splitlines() == ["missing", "missing", "0", "1"]
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows path-spoof regression")

@@ -23,7 +23,7 @@ The planner, model endpoint, and workspace content are untrusted. The approval s
 
 ## Tool Hardening
 
-Git commands use exact read shapes with global/system configuration, terminal prompts, pagers, and fsmonitor disabled. Gradle commands use the absolute project wrapper, run offline, and always require approval because configuration evaluates project code. Django, PyTorch, CMake, and Xcode actions likewise require approval.
+Git commands use exact read shapes with global/system configuration, optional locks, terminal prompts, pagers, and fsmonitor disabled. Generic Git actions still require approval because `git status` can invoke clean/filter helpers configured by the repository. Gradle commands use the absolute project wrapper, run offline, and always require approval because configuration evaluates project code. Django, PyTorch, CMake, and Xcode actions likewise require approval.
 
 ## Residual Risks
 
