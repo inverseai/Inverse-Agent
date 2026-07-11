@@ -73,3 +73,13 @@ Live GPT-OSS browser QA covered advisory planning, trust, exact-command approval
 The execution platform denied a final review of the private worktree under its external-disclosure policy. After the code was pushed, the user directed Claude to review the public GitHub commit instead. The exact Fable 5 max-effort public re-review ran for 941 seconds against commit `00f0ea0`; `modelUsage` confirmed `claude-fable-5`, and the verdict was PASS with no P0-P3 findings.
 
 The reviewer recorded non-blocking P4 opportunities around defensive recovery redaction, profile-fetch rendering, synchronous trace loading in the UI, cross-tab waiting-state polling, explicit service cleanup, malformed trace-duration handling, automated browser fencing tests, and an empty assisted-plan guard. These remain hardening and product-polish work; this milestone passes its required review gates but is not declared v1.
+
+## 2026-07-11 - Generic Git Workspace Gate
+
+The workbench initially classified Git monorepo roots without a root-level domain marker as generic but exposed no executable tools. Commit `2f75cb1` added approval-gated `generic.status` and `generic.tracked_files` tools, exact shared Git argv policy constants, optional-lock suppression, deterministic generic planning, and end-to-end durable approval coverage.
+
+The independent Codex review initially identified optional Git index writes, broad system-Git provenance, and incomplete disclosure of repository-configured clean/filter helper execution. The implementation added `--no-optional-locks`, `GIT_OPTIONAL_LOCKS=0`, mandatory per-command approval, exact executable/digest binding, and an explicit filter-helper warning. The final Codex verdict was PASS with no P0-P3 findings.
+
+The public Claude Fable 5 max-effort review ran for 784 seconds against commit `2f75cb1`; runtime `modelUsage` included exact model `claude-fable-5`, and the verdict was PASS. It found no P0 or P1 issues and treated the disclosed, trust- and approval-gated Git filter-helper risk as a non-blocking P2 residual. Its P3 observations covered Windows script-wrapper discovery breadth, redundant optional-lock hardening, and minor advisory/filter test gaps.
+
+Final local verification: 114 passed, 1 platform skip, 87.97% coverage, Ruff clean, strict Mypy clean for Windows/Linux/macOS, universal lock check clean, and `git diff --check` clean.
