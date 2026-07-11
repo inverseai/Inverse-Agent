@@ -35,6 +35,9 @@ inverse-agent = "inverse_agent.cli:main"
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+"inverse_agent.ui" = ["*.html", "*.css", "*.js"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]

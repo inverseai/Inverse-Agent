@@ -25,6 +25,10 @@ jobs:
           enable-cache: true
       - name: Install locked environment
         run: uv sync --locked --extra dev --python 3.12
+      - name: Build and verify workbench assets
+        run: |
+          uv build
+          uv run python scripts/verify-package-assets.py
       - name: Ruff
         run: uv run ruff check .
       - name: Mypy

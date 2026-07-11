@@ -109,7 +109,9 @@ def serve_command(args: argparse.Namespace) -> int:
         service=service,
         api_token=api_token,
         approver_tokens={approver_token: approver_id},
+        planner_summary=resolution.config.safe_summary(),
     )
+    print(f"Inverse-Agent workbench: http://127.0.0.1:{args.port}", file=sys.stderr)
     uvicorn.run(app, host="127.0.0.1", port=args.port)
     return 0
 

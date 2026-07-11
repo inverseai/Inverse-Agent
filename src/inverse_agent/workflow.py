@@ -279,6 +279,8 @@ class DurableAgentWorkflow:
             status=status,
             duration_seconds=float(state.get("duration_seconds", 0.0)),
             planner_fingerprint=str(state.get("planner_fingerprint", "deterministic")),
+            plan=list(state.get("plan", [])),
+            plan_rationale=str(state.get("plan_rationale", "")),
         )
         for action in state.get("actions", []):
             trace.record_action(action["tool"], **action)

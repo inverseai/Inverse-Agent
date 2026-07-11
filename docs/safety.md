@@ -11,12 +11,15 @@ The planner, model endpoint, and workspace content are untrusted. The approval s
 - The runner executes its own resolved absolute executable, never the caller's executable string.
 - Workspace-local executables are allowed only for approval-gated rules.
 - Each capability is signed and bound to the resolved workspace, domain, rule, and argv. Capabilities expire and are consumed once through a SQLite uniqueness constraint.
-- The control plane fails to start without distinct operator and approver credentials. Human identity comes from server configuration, not request text. Only `/health` is public, and the CLI binds the server to loopback.
+- The control plane fails to start without distinct operator and approver credentials. Human identity comes from server configuration, not request text. Only `/health` and the exact same-origin UI assets are public, and the CLI binds the server to loopback.
 - The child environment is allowlisted and does not inherit Inverse-Agent credentials.
 - Output capture is bounded, decoded defensively, and redacted before it enters traces.
 - Timeout cleanup targets process groups on POSIX and process trees on Windows.
 - Model endpoints are loopback-only by default. Remote inference requires dual operator opt-in and HTTPS. Redirects and environment proxies are disabled, responses are size-capped, and endpoint failures never trigger a deterministic fallback.
 - Model API keys are environment-only configuration and remain excluded from workspace subprocess environments, traces, fingerprints, and startup summaries.
+- The browser receives only safe run projections and bounded, re-redacted trace previews. Absolute state paths, capability IDs, and command internals outside the human approval view remain server-side.
+- The same-origin workbench uses strict browser security headers, no CORS or cookies, separate operator and approver authorization, and no dynamic HTML execution sinks.
+- A process-lifetime OS file lease enforces one service writer per state directory, so restart recovery cannot race an active planning or approval operation.
 
 ## Tool Hardening
 

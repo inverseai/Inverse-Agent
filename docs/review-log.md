@@ -31,7 +31,7 @@ Verdict: BLOCK with no P0 findings.
 
 - P1: one bearer credential could both operate and approve. Fixed with distinct operator and approver credentials; approver identity is server-derived.
 - P2: concurrent approvals could race. Fixed with a SQLite `BEGIN IMMEDIATE` compare-and-swap claim and a client-supplied expected action digest, preventing stale approval from advancing the next action.
-- P2: a crash could leave the run projection behind the LangGraph checkpoint. Fixed with startup reconciliation from the durable graph state; commands retain at-least-once semantics after a mid-execution process crash.
+- P2: a crash could leave the run projection behind the LangGraph checkpoint. Startup reconciliation restores terminal states and approval interrupts; later workbench hardening made nonterminal, non-interrupt checkpoints fail with an unknown outcome instead of replaying a command.
 - P2: state could default inside a model-writable workspace. Fixed by refusing state directories under the workspace root and defaulting to the operating system's per-user state directory.
 
 Verification after fixes: 52 passed, 1 platform skip, 85% coverage, strict Mypy clean, Ruff clean, and universal lock check clean.
@@ -61,3 +61,13 @@ The final independent Codex review returned PASS with no P0, P1, P2, or P3 findi
 Final verification: Ruff clean, strict Mypy clean for Windows/Linux/macOS, 103 tests passed, 1 platform skip, 88.54% coverage, and `git diff --check` clean.
 
 LM Studio 0.4.19 loaded OpenAI GPT-OSS-20B MXFP4 with full GPU offload and a 16K context on an RTX 3090 Ti. Inverse-Agent's real `model-check` selected only `generic.inspect`, completed model inference in 0.797 seconds, and confirmed the loopback endpoint with no API key or fallback. The loaded setup used approximately 15.1 GiB of 24 GiB GPU memory.
+
+## 2026-07-11 - Engineering Workbench Gates
+
+The exact Claude Fable 5 max-effort implementation review ran for 1,022 seconds and `modelUsage` confirmed `claude-fable-5`. It returned BLOCK on three product defects: non-interrupt checkpoints could become permanent `running` tasks after a crash, persisted `planned` tasks had no UI resume action, and stale long-running responses could replace a newer task selection.
+
+The remediation added conservative unknown-outcome recovery, an idempotent Start run control, navigation-epoch response fencing, expected-status CAS writes, and a cross-platform process-lifetime state-directory lease. Follow-up independent Codex reviews reproduced and closed two deeper interleavings: a stale worker overwriting recovery and recovery racing active approval/decline. The final independent Codex verdict was PASS with no P0-P3 findings.
+
+Live GPT-OSS browser QA covered advisory planning, trust, exact-command approval, decline, approver re-entry after reload, persisted-plan resume, stale-response selection fencing, and 375x812 layout without horizontal overflow or console warnings. Final local verification: 112 passed, 1 platform skip, 87.93% coverage, Ruff clean, strict Mypy clean for Windows/Linux/macOS, lock check clean, PowerShell 5.1 launcher validation, and verified UI assets in both wheel and source archive.
+
+The user explicitly approved transmitting the final private worktree for the required Fable re-review. The execution platform nevertheless denied that outbound review under its external-disclosure policy and prohibited retry or indirect workarounds. The final Fable verdict is therefore not recorded as PASS, and this milestone is not declared v1.

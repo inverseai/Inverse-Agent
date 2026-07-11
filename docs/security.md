@@ -17,3 +17,11 @@ The canonical threat model, trust boundaries, and residual risks are documented 
 Command-line model values override environment values. There is deliberately no API-key flag. Non-loopback endpoints also require `--model-allow-remote` and HTTPS. Configuration is frozen when `serve` or `mcp` starts; restart the process to apply changes.
 
 Run records and traces store a non-secret planner fingerprint. A planned run refuses to start if the model configuration changes before planning. A workflow already waiting for approval resumes from its durable plan without invoking the model again.
+
+## Browser Credentials
+
+The operator and approver are separate bearer credentials. The operator token is stored in `sessionStorage` so it is scoped to one browser tab. The approver token exists only in JavaScript memory and is cleared by a reload. Neither credential is accepted in a URL, cookie, or request body, and requests never send both credentials together.
+
+The workbench is same-origin and loopback-only. It does not enable CORS. Host validation rejects non-loopback hostnames. Normal application responses disable caching and supply a restrictive Content Security Policy, Trusted Types enforcement, MIME sniffing protection, frame prohibition, referrer suppression, and cross-origin isolation headers. Dynamic content is constructed with DOM text nodes; HTML injection sinks and third-party assets are absent.
+
+`scripts/start-workbench.ps1` creates fresh operator and approver credentials for each server process. It stores only the approval signing secret as a per-user environment variable so a durable pending approval remains verifiable after a normal restart. Session credentials are printed to the local terminal and are not written to the repository or browser URL.

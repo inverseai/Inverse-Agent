@@ -31,6 +31,18 @@ uv run ruff check .
 uv run mypy
 ```
 
+### Engineering Workbench
+
+Start the local GPT-OSS-20B model and Codex-style workbench together. The workspace root is the boundary within which engineers can select Android, iOS, Django, C/C++, or PyTorch projects.
+
+```powershell
+.\scripts\start-workbench.ps1 -WorkspaceRoot "D:\Office Repos"
+```
+
+Open the printed loopback URL and enter the two session credentials shown in the same terminal. The operator token can profile workspaces and create tasks. The separate approver token is required to trust a workspace, approve a command, or decline a pending command. Operator access lasts only for the browser tab; approval access is memory-only and must be re-entered after a reload.
+
+The workbench exposes the capabilities implemented in v0.1: advisory planning and approval-gated verification runs. It shows the model rationale, registered-tool plan, exact command awaiting approval, durable task state, bounded output, and redacted traces. It does not yet edit source code or provide an unrestricted shell.
+
 Configure local secrets. The approval secret must be stable across CLI invocations because it signs resume capabilities; these credentials are not inherited by workspace subprocesses.
 
 ```powershell
@@ -61,7 +73,7 @@ uv run inverse-agent approve RUN_ID `
 
 ## Control Plane And MCP
 
-The FastAPI control plane binds to `127.0.0.1`, refuses to start without both required secrets, and authenticates every endpoint except `/health`.
+The FastAPI control plane serves the workbench and API from the same `127.0.0.1` origin, refuses to start without both required secrets, and authenticates every endpoint except the UI assets and `/health`.
 
 ```powershell
 uv run inverse-agent serve --workspace-root D:\work

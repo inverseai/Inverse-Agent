@@ -2,23 +2,42 @@
 
 from __future__ import annotations
 
+import builtins
 import json
 import sqlite3
+import sys
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO
+
+if sys.platform == "win32":
+    import msvcrt
+else:
+    import fcntl
 
 from inverse_agent.approvals import (
     ApprovalAuthority,
     SqliteApprovalReplayStore,
     action_digest,
 )
+from inverse_agent.eval import load_trace
 from inverse_agent.models import AutonomyLevel, Domain, RunSpec, RunStatus
 from inverse_agent.planner import Planner
 from inverse_agent.policies import default_policy
 from inverse_agent.redaction import redact_text
 from inverse_agent.workflow import DurableAgentWorkflow, WorkflowResult
+
+TRACE_PREVIEW_MAX_ACTIONS = 32
+TRACE_PREVIEW_MAX_CHARS = 200_000
+TRACE_PREVIEW_FIELD_CHARS = 4_096
+TRACE_PREVIEW_STREAM_CHARS = 16_384
+
+
+def _safe_preview_text(value: Any) -> str:
+    if value is None:
+        return ""
+    return redact_text(str(value)).text
 
 
 @dataclass(frozen=True)
@@ -35,6 +54,9 @@ class RunRecord:
     created_at: float
     updated_at: float
     planner_fingerprint: str
+    plan: tuple[str, ...] = ()
+    plan_rationale: str = ""
+    completed_actions: int = 0
 
 
 class RunStore:
@@ -56,7 +78,10 @@ class RunStore:
                     error TEXT,
                     created_at REAL NOT NULL,
                     updated_at REAL NOT NULL,
-                    planner_fingerprint TEXT NOT NULL DEFAULT 'deterministic'
+                    planner_fingerprint TEXT NOT NULL DEFAULT 'deterministic',
+                    plan TEXT NOT NULL DEFAULT '[]',
+                    plan_rationale TEXT NOT NULL DEFAULT '',
+                    completed_actions INTEGER NOT NULL DEFAULT 0
                 )
                 """
             )
@@ -65,6 +90,16 @@ class RunStore:
                 connection.execute(
                     "ALTER TABLE runs ADD COLUMN planner_fingerprint "
                     "TEXT NOT NULL DEFAULT 'deterministic'"
+                )
+            if "plan" not in columns:
+                connection.execute("ALTER TABLE runs ADD COLUMN plan TEXT NOT NULL DEFAULT '[]'")
+            if "plan_rationale" not in columns:
+                connection.execute(
+                    "ALTER TABLE runs ADD COLUMN plan_rationale TEXT NOT NULL DEFAULT ''"
+                )
+            if "completed_actions" not in columns:
+                connection.execute(
+                    "ALTER TABLE runs ADD COLUMN completed_actions INTEGER NOT NULL DEFAULT 0"
                 )
 
     def create(self, spec: RunSpec) -> RunRecord:
@@ -85,13 +120,21 @@ class RunStore:
         )
         with sqlite3.connect(self.path) as connection:
             connection.execute(
-                "INSERT INTO runs VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO runs VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 self._to_row(record),
             )
         return record
 
-    def update_from_result(self, run_id: str, result: WorkflowResult) -> RunRecord:
+    def update_from_result(
+        self,
+        run_id: str,
+        result: WorkflowResult,
+        *,
+        expected_status: str,
+    ) -> RunRecord:
         current = self.require(run_id)
+        if current.status != expected_status:
+            return current
         trace_path = next(
             (str(artifact.path) for artifact in result.trace.artifacts if artifact.path),
             current.trace_path,
@@ -112,13 +155,19 @@ class RunStore:
                 "trace_path": trace_path,
                 "error": error_action,
                 "updated_at": time.time(),
+                "plan": tuple(result.trace.plan),
+                "plan_rationale": result.trace.plan_rationale,
+                "completed_actions": sum(
+                    action["name"] != "workflow.error" for action in result.trace.actions
+                ),
             }
         )
         with sqlite3.connect(self.path) as connection:
             connection.execute(
                 """
-                UPDATE runs SET status=?, pending_approval=?, trace_path=?, error=?, updated_at=?
-                WHERE run_id=?
+                UPDATE runs SET status=?, pending_approval=?, trace_path=?, error=?, updated_at=?,
+                    plan=?, plan_rationale=?, completed_actions=?
+                WHERE run_id=? AND status=?
                 """,
                 (
                     updated.status,
@@ -126,10 +175,40 @@ class RunStore:
                     updated.trace_path,
                     updated.error,
                     updated.updated_at,
+                    json.dumps(updated.plan),
+                    updated.plan_rationale,
+                    updated.completed_actions,
                     run_id,
+                    expected_status,
                 ),
             )
-        return updated
+        return self.require(run_id)
+
+    def claim_start(self, run_id: str) -> RunRecord | None:
+        with sqlite3.connect(self.path, timeout=30, isolation_level=None) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute("SELECT * FROM runs WHERE run_id=?", (run_id,)).fetchone()
+            if row is None:
+                connection.rollback()
+                raise KeyError(f"unknown run: {run_id}")
+            record = self._from_row(row)
+            if record.status != RunStatus.PLANNED.value:
+                connection.rollback()
+                return None
+            cursor = connection.execute(
+                "UPDATE runs SET status=?, updated_at=? WHERE run_id=? AND status=?",
+                (
+                    RunStatus.STARTING.value,
+                    time.time(),
+                    run_id,
+                    RunStatus.PLANNED.value,
+                ),
+            )
+            if cursor.rowcount != 1:
+                connection.rollback()
+                return None
+            connection.commit()
+        return self.require(run_id)
 
     def claim_pending(self, run_id: str, expected_action_digest: str) -> RunRecord:
         with sqlite3.connect(self.path, timeout=30, isolation_level=None) as connection:
@@ -161,11 +240,21 @@ class RunStore:
             connection.commit()
         return record
 
-    def mark_failed(self, run_id: str, error: str) -> RunRecord:
+    def mark_failed(self, run_id: str, error: str, *, expected_status: str) -> RunRecord:
         with sqlite3.connect(self.path) as connection:
             connection.execute(
-                "UPDATE runs SET status=?, pending_approval=NULL, error=?, updated_at=? WHERE run_id=?",
-                (RunStatus.FAILED.value, error, time.time(), run_id),
+                "UPDATE runs SET status=?, pending_approval=NULL, error=?, updated_at=? "
+                "WHERE run_id=? AND status=?",
+                (RunStatus.FAILED.value, error, time.time(), run_id, expected_status),
+            )
+        return self.require(run_id)
+
+    def mark_refused(self, run_id: str, error: str, *, expected_status: str) -> RunRecord:
+        with sqlite3.connect(self.path) as connection:
+            connection.execute(
+                "UPDATE runs SET status=?, pending_approval=NULL, error=?, updated_at=? "
+                "WHERE run_id=? AND status=?",
+                (RunStatus.REFUSED.value, error, time.time(), run_id, expected_status),
             )
         return self.require(run_id)
 
@@ -180,9 +269,23 @@ class RunStore:
             raise KeyError(f"unknown run: {run_id}")
         return record
 
-    def list(self) -> list[RunRecord]:
+    def list(self, *, limit: int = 100, offset: int = 0) -> list[RunRecord]:
         with sqlite3.connect(self.path) as connection:
-            rows = connection.execute("SELECT * FROM runs ORDER BY created_at DESC").fetchall()
+            rows = connection.execute(
+                "SELECT * FROM runs ORDER BY created_at DESC LIMIT ? OFFSET ?",
+                (limit, offset),
+            ).fetchall()
+        return [self._from_row(row) for row in rows]
+
+    def list_by_status(self, statuses: tuple[str, ...]) -> builtins.list[RunRecord]:
+        if not statuses:
+            return []
+        placeholders = ", ".join("?" for _status in statuses)
+        with sqlite3.connect(self.path) as connection:
+            rows = connection.execute(
+                f"SELECT * FROM runs WHERE status IN ({placeholders}) ORDER BY created_at DESC",
+                statuses,
+            ).fetchall()
         return [self._from_row(row) for row in rows]
 
     @staticmethod
@@ -200,6 +303,9 @@ class RunStore:
             record.created_at,
             record.updated_at,
             record.planner_fingerprint,
+            json.dumps(record.plan),
+            record.plan_rationale,
+            record.completed_actions,
         )
 
     @staticmethod
@@ -217,6 +323,9 @@ class RunStore:
             created_at=row[9],
             updated_at=row[10],
             planner_fingerprint=row[11],
+            plan=tuple(json.loads(row[12])) if row[12] else (),
+            plan_rationale=row[13],
+            completed_actions=row[14],
         )
 
 
@@ -253,12 +362,54 @@ class WorkspaceTrustStore:
         return {"workspace": resolved, "trusted_by": trusted_by, "trusted_at": trusted_at}
 
     def is_trusted(self, workspace: Path) -> bool:
+        return self.status(workspace) is not None
+
+    def status(self, workspace: Path) -> dict[str, Any] | None:
         with sqlite3.connect(self.path) as connection:
             row = connection.execute(
-                "SELECT 1 FROM trusted_workspaces WHERE workspace=?",
+                "SELECT workspace, trusted_by, trusted_at FROM trusted_workspaces WHERE workspace=?",
                 (str(workspace.resolve()),),
             ).fetchone()
-        return row is not None
+        if row is None:
+            return None
+        return {"workspace": row[0], "trusted_by": row[1], "trusted_at": row[2]}
+
+
+class StateDirectoryLease:
+    def __init__(self, path: Path) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self._handle: BinaryIO = path.open("a+b")
+        self._locked = False
+        try:
+            self._handle.seek(0, 2)
+            if self._handle.tell() == 0:
+                self._handle.write(b"\0")
+                self._handle.flush()
+            self._handle.seek(0)
+            if sys.platform == "win32":
+                msvcrt.locking(self._handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                fcntl.flock(
+                    self._handle.fileno(),
+                    fcntl.LOCK_EX | fcntl.LOCK_NB,
+                )
+            self._locked = True
+        except OSError as exc:
+            self._handle.close()
+            raise RuntimeError("state directory is already in use") from exc
+
+    def close(self) -> None:
+        if not self._locked:
+            return
+        self._handle.seek(0)
+        try:
+            if sys.platform == "win32":
+                msvcrt.locking(self._handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(self._handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            self._locked = False
+            self._handle.close()
 
 
 class AgentService:
@@ -277,20 +428,33 @@ class AgentService:
         if self.state_dir.is_relative_to(self.workspace_root):
             raise ValueError("state directory must be outside the workspace root")
         self.state_dir.mkdir(parents=True, exist_ok=True)
-        replay_store = SqliteApprovalReplayStore(self.state_dir / "approval-replay.sqlite")
-        self.approval_authority = ApprovalAuthority(approval_secret, replay_store)
-        self.runs = RunStore(self.state_dir / "runs.sqlite")
-        self.trust = WorkspaceTrustStore(self.state_dir / "workspace-trust.sqlite")
-        self.workflow = DurableAgentWorkflow(
-            checkpoint_path=self.state_dir / "checkpoints.sqlite",
-            trace_dir=self.state_dir / "traces",
-            approval_authority=self.approval_authority,
-            planner=planner,
-        )
-        self._reconcile_incomplete_runs()
+        state_lease = StateDirectoryLease(self.state_dir / "service.lock")
+        workflow: DurableAgentWorkflow | None = None
+        try:
+            replay_store = SqliteApprovalReplayStore(self.state_dir / "approval-replay.sqlite")
+            self.approval_authority = ApprovalAuthority(approval_secret, replay_store)
+            self.runs = RunStore(self.state_dir / "runs.sqlite")
+            self.trust = WorkspaceTrustStore(self.state_dir / "workspace-trust.sqlite")
+            workflow = DurableAgentWorkflow(
+                checkpoint_path=self.state_dir / "checkpoints.sqlite",
+                trace_dir=self.state_dir / "traces",
+                approval_authority=self.approval_authority,
+                planner=planner,
+            )
+            self.workflow = workflow
+            self._reconcile_incomplete_runs()
+        except Exception:
+            if workflow is not None:
+                workflow.close()
+            state_lease.close()
+            raise
+        self._state_lease = state_lease
 
     def close(self) -> None:
-        self.workflow.close()
+        try:
+            self.workflow.close()
+        finally:
+            self._state_lease.close()
 
     def create_run(
         self,
@@ -317,15 +481,30 @@ class AgentService:
     def start(self, run_id: str) -> RunRecord:
         record = self.runs.require(run_id)
         if record.status != RunStatus.PLANNED.value:
-            raise ValueError(f"run cannot start from status {record.status}")
+            return record
         if record.planner_fingerprint != self.planner_fingerprint:
             raise ValueError("planner configuration changed after run creation")
         if record.autonomy_level != AutonomyLevel.ADVISORY.value and not self.trust.is_trusted(
             Path(record.workspace)
         ):
             raise ValueError("workspace is not trusted for code execution")
-        spec = self._spec(record)
-        return self.runs.update_from_result(run_id, self.workflow.start(spec))
+        claimed = self.runs.claim_start(run_id)
+        if claimed is None:
+            return self.runs.require(run_id)
+        try:
+            return self.runs.update_from_result(
+                run_id,
+                self.workflow.start(self._spec(claimed)),
+                expected_status=RunStatus.STARTING.value,
+            )
+        except Exception as exc:
+            error = redact_text(str(exc)).text
+            self.runs.mark_failed(
+                run_id,
+                f"workflow start failed: {error}",
+                expected_status=RunStatus.STARTING.value,
+            )
+            raise
 
     def approve_and_resume(
         self,
@@ -359,16 +538,42 @@ class AgentService:
                 argv=argv,
                 approved_by=approved_by,
             )
-            return self.runs.update_from_result(run_id, self.workflow.resume(run_id, token))
+            return self.runs.update_from_result(
+                run_id,
+                self.workflow.resume(run_id, token),
+                expected_status=RunStatus.APPROVING.value,
+            )
         except Exception as exc:
-            self.runs.mark_failed(run_id, f"approval resume failed: {exc}")
+            error = redact_text(str(exc)).text
+            self.runs.mark_failed(
+                run_id,
+                f"approval resume failed: {error}",
+                expected_status=RunStatus.APPROVING.value,
+            )
             raise
+
+    def decline(
+        self,
+        run_id: str,
+        *,
+        declined_by: str,
+        expected_action_digest: str,
+    ) -> RunRecord:
+        identity = redact_text(declined_by.strip()).text
+        if not identity:
+            raise ValueError("declined_by is required")
+        self.runs.claim_pending(run_id, expected_action_digest)
+        return self.runs.mark_refused(
+            run_id,
+            f"declined by {identity}",
+            expected_status=RunStatus.APPROVING.value,
+        )
 
     def get(self, run_id: str) -> RunRecord:
         return self.runs.require(run_id)
 
-    def list(self) -> list[RunRecord]:
-        return self.runs.list()
+    def list(self, *, limit: int = 100, offset: int = 0) -> list[RunRecord]:
+        return self.runs.list(limit=limit, offset=offset)
 
     def trust_workspace(self, workspace: Path, *, trusted_by: str) -> dict[str, Any]:
         resolved = workspace.resolve()
@@ -380,19 +585,123 @@ class AgentService:
             raise ValueError("trusted_by is required")
         return self.trust.trust(resolved, trusted_by=trusted_by.strip())
 
-    def _reconcile_incomplete_runs(self) -> None:
-        for record in self.runs.list():
-            if record.status not in {
-                RunStatus.APPROVING.value,
-                RunStatus.WAITING_FOR_APPROVAL.value,
-                RunStatus.RUNNING.value,
-            }:
+    def workspace_trust_status(self, workspace: Path) -> dict[str, Any]:
+        resolved = workspace.resolve()
+        if not resolved.is_relative_to(self.workspace_root):
+            raise ValueError("workspace is outside configured workspace root")
+        if not resolved.is_dir():
+            raise ValueError("workspace directory does not exist")
+        status = self.trust.status(resolved)
+        return {
+            "workspace": str(resolved),
+            "trusted": status is not None,
+            "trusted_by": status["trusted_by"] if status else None,
+            "trusted_at": status["trusted_at"] if status else None,
+        }
+
+    def plan_view(self, run_id: str) -> dict[str, Any]:
+        record = self.runs.require(run_id)
+        return {
+            "run_id": record.run_id,
+            "status": record.status,
+            "plan": list(record.plan),
+            "rationale": record.plan_rationale,
+            "completed_actions": record.completed_actions,
+        }
+
+    def trace_preview(self, run_id: str) -> dict[str, Any]:
+        record = self.runs.require(run_id)
+        trace_path = (self.state_dir / "traces" / f"{record.run_id}.trace.json").resolve()
+        if not trace_path.is_file():
+            raise FileNotFoundError("run trace is not available")
+        try:
+            trace = load_trace(trace_path)
+        except (OSError, ValueError) as exc:
+            raise ValueError("run trace is unavailable") from exc
+
+        raw_actions = trace.get("actions", [])
+        if not isinstance(raw_actions, list):
+            raise ValueError("run trace actions are unavailable")
+        budget = TRACE_PREVIEW_MAX_CHARS
+        actions: list[dict[str, Any]] = []
+        for raw_action in raw_actions[:TRACE_PREVIEW_MAX_ACTIONS]:
+            if not isinstance(raw_action, dict):
                 continue
+            metadata = raw_action.get("metadata", {})
+            if not isinstance(metadata, dict):
+                metadata = {}
+            action: dict[str, Any] = {
+                "name": _safe_preview_text(raw_action.get("name", ""))[
+                    :TRACE_PREVIEW_FIELD_CHARS
+                ],
+                "status": _safe_preview_text(metadata.get("status", ""))[
+                    :TRACE_PREVIEW_FIELD_CHARS
+                ],
+                "rule": _safe_preview_text(metadata.get("rule", ""))[
+                    :TRACE_PREVIEW_FIELD_CHARS
+                ],
+                "reason": _safe_preview_text(metadata.get("reason", ""))[
+                    :TRACE_PREVIEW_FIELD_CHARS
+                ],
+                "returncode": (
+                    metadata.get("returncode")
+                    if isinstance(metadata.get("returncode"), int)
+                    and not isinstance(metadata.get("returncode"), bool)
+                    else None
+                ),
+            }
+            for field_name in ("stdout", "stderr"):
+                value = _safe_preview_text(metadata.get(field_name, ""))
+                clip_length = min(budget, TRACE_PREVIEW_STREAM_CHARS)
+                clipped = value[:clip_length]
+                action[field_name] = clipped
+                action[f"{field_name}_truncated"] = len(value) > len(clipped)
+                budget -= len(clipped)
+            actions.append(action)
+            if budget <= 0:
+                break
+        return {
+            "run_id": record.run_id,
+            "status": record.status,
+            "duration_seconds": float(trace.get("duration_seconds", 0.0)),
+            "actions": actions,
+            "actions_truncated": len(raw_actions) > len(actions),
+            "output_truncated": budget <= 0,
+        }
+
+    def _reconcile_incomplete_runs(self) -> None:
+        incomplete_statuses = (
+            RunStatus.STARTING.value,
+            RunStatus.APPROVING.value,
+            RunStatus.WAITING_FOR_APPROVAL.value,
+            RunStatus.RUNNING.value,
+        )
+        for record in self.runs.list_by_status(incomplete_statuses):
             try:
                 result = self.workflow.current(record.run_id)
-                self.runs.update_from_result(record.run_id, result)
+                if result.pending_approval is None and result.trace.status not in {
+                    RunStatus.SUCCEEDED,
+                    RunStatus.FAILED,
+                    RunStatus.REFUSED,
+                }:
+                    self.runs.mark_failed(
+                        record.run_id,
+                        "workflow was interrupted before a durable pause; "
+                        "command outcome may be unknown",
+                        expected_status=record.status,
+                    )
+                    continue
+                self.runs.update_from_result(
+                    record.run_id,
+                    result,
+                    expected_status=record.status,
+                )
             except Exception as exc:
-                self.runs.mark_failed(record.run_id, f"workflow recovery failed: {exc}")
+                self.runs.mark_failed(
+                    record.run_id,
+                    f"workflow recovery failed: {exc}",
+                    expected_status=record.status,
+                )
                 continue
 
     @staticmethod

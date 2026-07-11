@@ -46,6 +46,7 @@ class ArtifactKind(StrEnum):
 
 class RunStatus(StrEnum):
     PLANNED = "planned"
+    STARTING = "starting"
     WAITING_FOR_APPROVAL = "waiting_for_approval"
     APPROVING = "approving"
     RUNNING = "running"
@@ -179,6 +180,8 @@ class EvalTrace:
     status: RunStatus = RunStatus.PLANNED
     human_edits_after_output: int = 0
     planner_fingerprint: str = "deterministic"
+    plan: list[str] = field(default_factory=list)
+    plan_rationale: str = ""
     created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
 
     def record_action(self, name: str, **metadata: Any) -> None:

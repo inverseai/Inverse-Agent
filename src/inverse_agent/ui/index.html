@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Inverse Agent</title>
+  <link rel="stylesheet" href="/assets/app.css">
+  <script src="/assets/app.js" defer></script>
+</head>
+<body>
+  <div class="app-shell" id="app-shell">
+    <button class="mobile-backdrop" id="mobile-backdrop" type="button" aria-label="Close task list"></button>
+
+    <aside class="sidebar" id="sidebar" aria-label="Task navigation">
+      <div class="brand-row">
+        <div class="brand-mark" aria-hidden="true">IA</div>
+        <div>
+          <strong>Inverse Agent</strong>
+          <span>Engineering workbench</span>
+        </div>
+      </div>
+
+      <button class="new-task-button" id="new-task-button" type="button">
+        <span aria-hidden="true">+</span>
+        New task
+      </button>
+
+      <div class="sidebar-label">Tasks</div>
+      <nav class="run-list" id="run-list" aria-label="Recent tasks"></nav>
+
+      <div class="sidebar-footer">
+        <div class="connection-row">
+          <span class="connection-dot" id="connection-dot" aria-hidden="true"></span>
+          <span id="connection-label">Not connected</span>
+        </div>
+        <button class="quiet-button" id="settings-button" type="button">Settings</button>
+      </div>
+    </aside>
+
+    <main class="main-column">
+      <header class="topbar">
+        <button class="icon-button mobile-only" id="sidebar-toggle" type="button" title="Show tasks" aria-label="Show tasks">&#9776;</button>
+        <button class="workspace-button" id="workspace-button" type="button" title="Change workspace">
+          <span class="workspace-name" id="workspace-name">Choose workspace</span>
+          <span class="workspace-path" id="workspace-path"></span>
+        </button>
+        <div class="topbar-controls">
+          <label class="select-wrap">
+            <span class="sr-only">Domain</span>
+            <select id="domain-select" aria-label="Domain"></select>
+          </label>
+          <div class="segmented-control" aria-label="Execution mode">
+            <button type="button" data-mode="0">Advisory</button>
+            <button type="button" data-mode="1" class="active">Assisted</button>
+          </div>
+          <button class="icon-button inspector-toggle" id="inspector-toggle" type="button" title="Toggle inspector" aria-label="Toggle inspector">&#8943;</button>
+        </div>
+      </header>
+
+      <section class="conversation" id="conversation" aria-live="polite"></section>
+
+      <footer class="composer-band">
+        <div class="composer" id="composer">
+          <textarea id="goal-input" rows="1" maxlength="4000" placeholder="Describe a verification task" aria-label="Task goal"></textarea>
+          <div class="composer-row">
+            <span class="planner-note" id="planner-note">Connect to inspect the planner</span>
+            <button class="send-button" id="send-button" type="button" title="Start task" aria-label="Start task">&#8593;</button>
+          </div>
+        </div>
+      </footer>
+    </main>
+
+    <aside class="inspector" id="inspector" aria-label="Workspace inspector">
+      <section class="inspector-section">
+        <div class="section-heading">Runtime</div>
+        <dl class="detail-list" id="runtime-details"></dl>
+      </section>
+      <section class="inspector-section">
+        <div class="section-heading">Workspace</div>
+        <dl class="detail-list" id="workspace-details"></dl>
+      </section>
+      <section class="inspector-section">
+        <div class="section-heading">Available tools</div>
+        <div class="tool-list" id="tool-list"></div>
+      </section>
+    </aside>
+  </div>
+
+  <dialog class="modal" id="settings-dialog" aria-labelledby="settings-title">
+    <div class="modal-header">
+      <div>
+        <h2 id="settings-title">Connect workbench</h2>
+        <p>Credentials remain in this tab. Approval access is cleared on reload.</p>
+      </div>
+      <button class="icon-button" id="settings-close" type="button" aria-label="Close settings">&#215;</button>
+    </div>
+    <div class="field-stack">
+      <label>
+        <span>Operator token</span>
+        <input id="operator-token-input" type="password" autocomplete="off" spellcheck="false">
+      </label>
+      <label>
+        <span>Approver token <small>optional until trust or approval</small></span>
+        <input id="approver-token-input" type="password" autocomplete="off" spellcheck="false">
+      </label>
+      <label>
+        <span>Workspace path</span>
+        <input id="workspace-input" type="text" autocomplete="off" spellcheck="false" placeholder="D:\work\project">
+      </label>
+    </div>
+    <div class="modal-status" id="settings-status" role="status"></div>
+    <div class="modal-actions">
+      <button class="danger-quiet-button" id="forget-button" type="button">Forget access</button>
+      <div class="action-spacer"></div>
+      <button class="quiet-button" id="settings-cancel" type="button">Cancel</button>
+      <button class="primary-button" id="connect-button" type="button">Connect</button>
+    </div>
+  </dialog>
+
+  <dialog class="modal consent-modal" id="trust-dialog" aria-labelledby="trust-title">
+    <div class="consent-mark" aria-hidden="true">!</div>
+    <h2 id="trust-title">Trust this workspace?</h2>
+    <p class="consent-path" id="trust-path"></p>
+    <p>Approved verification commands can execute code from this directory with your user permissions. Trust cannot be revoked from this UI.</p>
+    <div class="modal-status" id="trust-status" role="status"></div>
+    <div class="modal-actions">
+      <div class="action-spacer"></div>
+      <button class="quiet-button" id="trust-cancel" type="button">Cancel</button>
+      <button class="warning-button" id="trust-confirm" type="button">Trust workspace</button>
+    </div>
+  </dialog>
+
+  <div class="toast-region" id="toast-region" aria-live="assertive"></div>
+</body>
+</html>

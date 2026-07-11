@@ -3,6 +3,8 @@ import json
 import platform
 import shutil
 import sqlite3
+import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -10,7 +12,7 @@ import pytest
 
 from inverse_agent.cli import approve_command, main
 from inverse_agent.models import AutonomyLevel, Domain, RunStatus
-from inverse_agent.planner import Planner
+from inverse_agent.planner import DeterministicPlanner, Planner
 from inverse_agent.service import AgentService, RunRecord, RunStore
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -189,6 +191,46 @@ def test_run_store_migrates_planner_fingerprint_column(tmp_path: Path) -> None:
     with sqlite3.connect(path) as connection:
         columns = {row[1] for row in connection.execute("PRAGMA table_info(runs)")}
     assert "planner_fingerprint" in columns
+    assert "plan" in columns
+    assert "plan_rationale" in columns
+    assert "completed_actions" in columns
+
+
+def test_concurrent_double_start_invokes_workflow_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service = _service(tmp_path / "state")
+    service.trust_workspace(FIXTURES / "django_project", trusted_by="tester")
+    created = service.create_run(
+        goal="Start only once",
+        workspace=FIXTURES / "django_project",
+        domain=Domain.DJANGO,
+    )
+    original_start = service.workflow.start
+    counter = 0
+    counter_lock = threading.Lock()
+
+    def counted_start(spec):
+        nonlocal counter
+        with counter_lock:
+            counter += 1
+        time.sleep(0.1)
+        return original_start(spec)
+
+    monkeypatch.setattr(service.workflow, "start", counted_start)
+    try:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            records = list(executor.map(lambda _index: service.start(created.run_id), range(2)))
+        current = service.get(created.run_id)
+    finally:
+        service.close()
+
+    assert counter == 1
+    assert {record.status for record in records} <= {
+        RunStatus.STARTING.value,
+        RunStatus.WAITING_FOR_APPROVAL.value,
+    }
+    assert current.status == RunStatus.WAITING_FOR_APPROVAL.value
 
 
 def test_workflow_resumes_after_service_restart(tmp_path: Path) -> None:
@@ -217,6 +259,98 @@ def test_workflow_resumes_after_service_restart(tmp_path: Path) -> None:
         resumed_service.close()
     assert resumed.status == RunStatus.WAITING_FOR_APPROVAL.value
     assert resumed.pending_approval["rule"] == "django-test"
+
+
+def test_restart_reconciles_incomplete_run_older_than_default_page(tmp_path: Path) -> None:
+    state_dir = tmp_path / "state"
+    first_service = _service(state_dir)
+    oldest = first_service.create_run(
+        goal="Recover this old run",
+        workspace=FIXTURES / "django_project",
+        domain=Domain.DJANGO,
+        autonomy_level=AutonomyLevel.ADVISORY,
+    )
+    for index in range(100):
+        first_service.create_run(
+            goal=f"Newer run {index}",
+            workspace=FIXTURES / "django_project",
+            domain=Domain.DJANGO,
+            autonomy_level=AutonomyLevel.ADVISORY,
+        )
+    first_service.close()
+    with sqlite3.connect(state_dir / "runs.sqlite") as connection:
+        connection.execute(
+            "UPDATE runs SET status=?, created_at=0 WHERE run_id=?",
+            (RunStatus.STARTING.value, oldest.run_id),
+        )
+
+    restarted = _service(state_dir)
+    try:
+        recovered = restarted.get(oldest.run_id)
+    finally:
+        restarted.close()
+
+    assert recovered.status == RunStatus.FAILED.value
+    assert recovered.error and "workflow recovery failed" in recovered.error
+
+
+def test_restart_fails_mid_graph_checkpoint_without_replaying_work(
+    tmp_path: Path,
+) -> None:
+    state_dir = tmp_path / "state"
+    planner_entered = threading.Event()
+    release_planner = threading.Event()
+    delegate = DeterministicPlanner()
+
+    class BlockingPlanner:
+        def plan(self, **kwargs):
+            planner_entered.set()
+            if not release_planner.wait(timeout=10):
+                raise RuntimeError("test planner was not released")
+            return delegate.plan(**kwargs)
+
+    first_service = _service(state_dir, planner=BlockingPlanner())
+    first_service.trust_workspace(FIXTURES / "django_project", trusted_by="tester")
+    created = first_service.create_run(
+        goal="Pause during planning",
+        workspace=FIXTURES / "django_project",
+        domain=Domain.DJANGO,
+    )
+    executor = ThreadPoolExecutor(max_workers=1)
+    future = executor.submit(first_service.start, created.run_id)
+    restarted = None
+    try:
+        assert planner_entered.wait(timeout=5)
+        first_service._state_lease.close()
+        restarted = _service(state_dir)
+        recovered = restarted.get(created.run_id)
+        assert recovered.status == RunStatus.FAILED.value
+        assert recovered.error and "outcome may be unknown" in recovered.error
+    finally:
+        if restarted is not None:
+            restarted.close()
+        release_planner.set()
+        stale_result = future.result(timeout=10)
+        final_record = first_service.get(created.run_id)
+        executor.shutdown()
+        first_service.close()
+
+    assert stale_result.status == RunStatus.FAILED.value
+    assert final_record.status == RunStatus.FAILED.value
+    assert final_record.error and "outcome may be unknown" in final_record.error
+
+
+def test_state_directory_refuses_concurrent_service_writer(tmp_path: Path) -> None:
+    state_dir = tmp_path / "state"
+    first_service = _service(state_dir)
+    try:
+        with pytest.raises(RuntimeError, match="state directory is already in use"):
+            _service(state_dir)
+    finally:
+        first_service.close()
+
+    replacement = _service(state_dir)
+    replacement.close()
 
 
 def test_missing_checkpoint_marks_incomplete_run_failed(tmp_path: Path) -> None:
