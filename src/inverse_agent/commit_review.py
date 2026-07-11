@@ -2892,6 +2892,8 @@ class CommitReviewer:
 
         navigation: tuple[int, str, int, str, str] | None = None
         for line, text in added:
+            if line not in evidence_by_line:
+                continue
             match = re.search(
                 r"\b([A-Za-z_]\w*)\s*\.\s*loadUrl\s*\(\s*([A-Za-z_]\w*)\b",
                 text,
