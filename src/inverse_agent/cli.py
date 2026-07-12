@@ -389,7 +389,116 @@ def build_parser() -> argparse.ArgumentParser:
     benchmark_review.add_argument("--output")
     _add_model_arguments(benchmark_review)
     benchmark_review.set_defaults(func=benchmark_review_command)
+
+    benchmark_investigation = sub.add_parser(
+        "benchmark-investigation",
+        help="Run the seven-domain read-only investigation acceptance gate",
+    )
+    benchmark_investigation.add_argument("--output")
+    benchmark_investigation.add_argument(
+        "--model",
+        help="Drive the gate with a model identifier instead of the scripted solver",
+    )
+    benchmark_investigation.add_argument(
+        "--model-base-url",
+        help="OpenAI-compatible endpoint (default http://127.0.0.1:1234/v1)",
+    )
+    benchmark_investigation.add_argument(
+        "--model-allow-remote",
+        action="store_true",
+        help="Permit a non-loopback model endpoint (requires https)",
+    )
+    benchmark_investigation.set_defaults(func=benchmark_investigation_command)
     return parser
+
+
+def benchmark_investigation_command(args: argparse.Namespace) -> int:
+    from inverse_agent.investigation_benchmark import (
+        BenchmarkCase,
+        default_cases,
+        run_benchmark,
+        run_benchmark_with_planner,
+    )
+
+    cases = default_cases()
+    endpoint_model_consistent = True
+    provenance: dict[str, object] | None = None
+    if args.model:
+        import os
+
+        from inverse_agent.investigation_model import ModelInvestigationPlanner
+        from inverse_agent.planner import OpenAICompatibleClient, validate_model_endpoint
+
+        base_url = args.model_base_url or os.environ.get(
+            "INVERSE_AGENT_MODEL_BASE_URL", "http://127.0.0.1:1234/v1"
+        )
+        # Remote endpoints require the same dual opt-in as every other model path:
+        # the environment variable AND the CLI flag, together, plus https.
+        env_allows_remote = os.environ.get("INVERSE_AGENT_MODEL_ALLOW_REMOTE", "0") in {
+            "1",
+            "true",
+            "True",
+        }
+        allow_remote = env_allows_remote and bool(getattr(args, "model_allow_remote", False))
+        normalized_url = validate_model_endpoint(base_url, allow_remote=allow_remote)
+        client = OpenAICompatibleClient(
+            base_url=normalized_url,
+            model=args.model,
+            api_key=os.environ.get("INVERSE_AGENT_MODEL_API_KEY") or None,
+            allow_remote=allow_remote,
+            timeout_seconds=120,
+        )
+
+        from inverse_agent.investigation import AgentBudget
+
+        def factory(case: BenchmarkCase, goal: str) -> ModelInvestigationPlanner:
+            return ModelInvestigationPlanner(client=client)
+
+        # A local 20B model needs more exploration budget than the tight default
+        # to locate evidence across files and recover from a wrong first guess.
+        budget = AgentBudget(max_decisions=20, max_tool_calls=16, max_physical_requests=30)
+        result = run_benchmark_with_planner(cases, factory, budget=budget)
+        # Every successful response must be attributed to exactly the requested
+        # model; a substituted or unattributed model is gate-fatal.
+        endpoint_model_consistent = (
+            client.observed_response_models == (args.model,)
+            and client.successful_response_count > 0
+            and client.attributed_response_count == client.successful_response_count
+        )
+        provenance = {
+            "requested_model": args.model,
+            "reported_models": list(client.observed_response_models),
+            "successful_responses": client.successful_response_count,
+            "attributed_responses": client.attributed_response_count,
+            "endpoint_model_consistent": endpoint_model_consistent,
+        }
+    else:
+        result = run_benchmark(cases)
+    gate_passed = result.gate_passed and endpoint_model_consistent
+    summary = {
+        "planner": "model" if args.model else "deterministic",
+        "cases_passed": result.cases_passed,
+        "total_cases": result.total_cases,
+        "variants_passed": result.variants_passed,
+        "total_variants": result.total_variants,
+        "gate_passed": gate_passed,
+        "model_provenance": provenance,
+        "variants": [
+            {
+                "case": variant.case,
+                "passed": variant.passed,
+                "verdict": variant.verdict,
+                "reason": variant.reason,
+            }
+            for variant in result.variants
+        ],
+    }
+    if args.output:
+        Path(args.output).resolve().write_text(
+            json.dumps(summary, indent=2), encoding="utf-8"
+        )
+    print(json.dumps(summary, indent=2))
+    return 0 if gate_passed else 1
 
 
 def main(argv: list[str] | None = None) -> int:
