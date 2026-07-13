@@ -155,15 +155,11 @@ def _require_utf8(value: str, label: str) -> None:
         raise RequestValidationError(f"{label} contains non-UTF-8 text") from exc
 
 
-def _reject_component(name: str) -> None:
+def _reject_component_policy(name: str) -> None:
     if not name or name in {".", ".."}:
         raise PolicyViolationError("path traversal is not permitted")
     if "\x00" in name:
         raise PolicyViolationError("path contains a null byte")
-    try:
-        name.encode("utf-8")
-    except UnicodeEncodeError as exc:
-        raise PolicyViolationError("path contains non-UTF-8 text") from exc
     if ":" in name:
         # NTFS alternate-data-stream syntax (name:stream) and drive-letter syntax.
         raise PolicyViolationError("path contains an alternate-data-stream or drive separator")
@@ -176,15 +172,20 @@ def _reject_component(name: str) -> None:
         raise PolicyViolationError(f"path uses a reserved device name: {name}")
 
 
+def _reject_component(name: str) -> None:
+    _reject_component_policy(name)
+    _require_utf8(name, "path component")
+
+
 def _reject_sensitive_name(name: str) -> None:
     for pattern in _DENIED_NAME_PATTERNS:
         if pattern.search(name):
             raise PolicyViolationError(f"file is denied by the sensitive-file policy: {name}")
 
 
-def _relative_parts(raw_path: str) -> tuple[str, ...]:
-    if not raw_path or len(raw_path) > PATH_MAX_CHARS:
-        raise PolicyViolationError("path is empty or exceeds the length limit")
+def _relative_parts(raw_path: str, *, reject_sensitive_final: bool = False) -> tuple[str, ...]:
+    if not raw_path:
+        raise PolicyViolationError("path is empty")
     if "\x00" in raw_path:
         raise PolicyViolationError("path contains a null byte")
     normalized = raw_path.replace("\\", "/")
@@ -193,7 +194,12 @@ def _relative_parts(raw_path: str) -> tuple[str, ...]:
         raise PolicyViolationError("absolute paths are not permitted")
     parts = tuple(part for part in pure.parts if part not in ("", "."))
     for part in parts:
-        _reject_component(part)
+        _reject_component_policy(part)
+    if reject_sensitive_final and parts:
+        _reject_sensitive_name(parts[-1])
+    if len(raw_path) > PATH_MAX_CHARS:
+        raise RequestValidationError("path exceeds the length limit")
+    _require_utf8(raw_path, "path")
     return parts
 
 
@@ -333,11 +339,10 @@ class WorkspaceReader:
     ) -> ToolObservation:
         # Security-sensitive path policy takes precedence over correctable
         # request-shape errors when several arguments are invalid together.
-        parts = _relative_parts(path)
+        parts = _relative_parts(path, reject_sensitive_final=True)
         if not parts:
             raise PolicyViolationError("path must reference a file inside the workspace")
         relative = "/".join(parts)
-        _reject_sensitive_name(relative.rsplit("/", 1)[-1])
         if start_line < 1:
             raise RequestValidationError("start_line must be >= 1")
         if not 1 <= max_lines <= READ_MAX_LINES:

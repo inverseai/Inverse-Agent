@@ -14,6 +14,7 @@ from inverse_agent.fs_tools import (
     READ_MAX_LINES,
     FsToolError,
     PolicyViolationError,
+    RequestValidationError,
     WorkspaceReader,
     _sanitize_line_preserving,
 )
@@ -117,6 +118,26 @@ def test_read_file_rejects_trailing_dot_alias(workspace: Path) -> None:
     reader = WorkspaceReader.open(workspace)
     with pytest.raises(FsToolError, match="trailing dot or space"):
         reader.read_file("src/app.py.")
+
+
+def test_path_shape_errors_are_retryable_request_validation(workspace: Path) -> None:
+    reader = WorkspaceReader.open(workspace)
+    with pytest.raises(RequestValidationError, match="length limit"):
+        reader.list_files("x" * 513)
+    with pytest.raises(RequestValidationError, match="non-UTF-8"):
+        reader.read_file("src/\ud800.py")
+
+
+def test_path_policy_precedes_overlong_request_shape(workspace: Path) -> None:
+    reader = WorkspaceReader.open(workspace)
+    with pytest.raises(PolicyViolationError, match="traversal"):
+        reader.list_files("../" + "x" * 513)
+    sensitive = "x" * 508 + "/.env"
+    assert len(sensitive) == 513
+    with pytest.raises(PolicyViolationError, match="sensitive-file policy"):
+        reader.read_file(sensitive)
+    with pytest.raises(PolicyViolationError, match="sensitive-file policy"):
+        reader.read_file("\ud800/.env")
 
 
 def test_read_file_redacts_secrets_line_preserving(tmp_path: Path) -> None:
@@ -248,10 +269,9 @@ def test_windows_listing_counts_undecodable_name_without_platform_api(
     assert not listing.truncated
 
 
-def test_secure_listing_defaults_new_accounting_fields() -> None:
-    listing = SecureListing(entries=(), visited=0, refused=0)
-    assert listing.filtered == 0
-    assert listing.truncated is False
+def test_secure_listing_requires_all_accounting_fields() -> None:
+    with pytest.raises(TypeError):
+        SecureListing(entries=(), visited=0, refused=0)  # type: ignore[call-arg]
 
 
 def test_posix_root_non_directory_is_workspace_policy(
@@ -791,6 +811,8 @@ def test_flat_listing_counts_directory_suffix_in_path_limit(
         ),
         visited=1,
         refused=0,
+        filtered=0,
+        truncated=False,
     )
 
     def fake_listing(*args: object, **kwargs: object) -> SecureListing:
@@ -802,6 +824,34 @@ def test_flat_listing_counts_directory_suffix_in_path_limit(
     assert observation.lines == ()
     assert observation.incomplete and observation.truncated
     assert observation.metadata["filtered_entry_count"] == 1
+
+
+def test_recursive_listing_enforces_rendered_file_path_limit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reader = WorkspaceReader.open(tmp_path)
+    maximum = "a/" * 255 + "bb"
+    overlong = f"{maximum}b"
+
+    def fake_walk(
+        self: WorkspaceReader,
+        base_parts: tuple[str, ...],
+        *,
+        deadline: float,
+    ) -> tuple[list[str], bool, bool, int]:
+        del self, base_parts, deadline
+        return [maximum, overlong], False, False, 0
+
+    monkeypatch.setattr(WorkspaceReader, "_walk_files", fake_walk)
+    observation = reader.list_files(".", glob="**/*")
+
+    assert len(maximum) == 512
+    assert len(overlong) == 513
+    assert observation.lines == (maximum,)
+    assert all(not line.endswith("/") for line in observation.lines)
+    assert observation.incomplete and observation.truncated
+    assert observation.metadata["omitted_entry_count"] == 1
 
 
 def test_recursive_listing_omits_overlong_path_without_slicing(

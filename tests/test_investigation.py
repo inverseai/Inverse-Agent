@@ -7,7 +7,9 @@ from pathlib import Path
 
 import pytest
 
+import inverse_agent.investigation as investigation_module
 from inverse_agent.attestations import AttestationScope, ScopedTrustStore
+from inverse_agent.fs_tools import FsToolError, WorkspaceReader
 from inverse_agent.investigation import (
     AgentAnswer,
     AgentBudget,
@@ -20,6 +22,7 @@ from inverse_agent.investigation import (
     ToolCall,
     ToolObservation,
     _has_unresolved_negative_uncertainty,
+    _validate_citations,
     citation_intersects_redaction,
 )
 
@@ -321,6 +324,10 @@ def test_recursive_list_retry_uses_the_same_uncertainty_scope(
         ),
         (
             ToolCall(tool="list_files", path=".", glob="x" * 200),
+            ToolCall(tool="list_files", path="."),
+        ),
+        (
+            ToolCall(tool="list_files", path="x" * 513),
             ToolCall(tool="list_files", path="."),
         ),
     ],
@@ -773,7 +780,7 @@ def test_successful_case_alias_retry_supersedes_earlier_refusal(tmp_path: Path) 
     assert report.verdict is InvestigationVerdict.PASS
 
 
-def test_unknown_case_variant_refusal_requires_exact_variant_retry() -> None:
+def test_unknown_case_variant_refusal_can_be_cleared_by_exact_cited_retry() -> None:
     cited = ToolObservation(
         observation_id="obs-cited",
         tool="read_file",
@@ -815,15 +822,93 @@ def test_unknown_case_variant_refusal_requires_exact_variant_retry() -> None:
         citations=(SourceCitation("obs-cited", "123/A.py", 1, 1),),
         issue_present=False,
     )
+    identities = {
+        "obs-cited": "file-a",
+        "obs-cited-retry": "file-a",
+        "obs-variant-retry": "file-b",
+    }
+    identity_for = identities.get
 
     assert _has_unresolved_negative_uncertainty(
         answer,
-        (cited, refusal, cited_retry),
+        (cited, refusal),
+        identity_for=identity_for,
     )
     assert not _has_unresolved_negative_uncertainty(
         answer,
-        (cited, refusal, cited_retry, variant_retry),
+        (cited, refusal, cited_retry),
+        identity_for=identity_for,
     )
+    assert not _has_unresolved_negative_uncertainty(
+        answer,
+        (cited, refusal, variant_retry),
+        identity_for=identity_for,
+    )
+
+
+def test_loop_exact_cited_retry_clears_wrong_case_not_found(
+    trusted_workspace: tuple[Path, ScopedTrustStore],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace, trust = trusted_workspace
+    real_dispatch = investigation_module._dispatch
+
+    def case_sensitive_dispatch(reader: WorkspaceReader, call: ToolCall) -> ToolObservation:
+        if call.tool == "read_file" and call.path == "APP.PY":
+            raise FsToolError("path component could not be opened")
+        return real_dispatch(reader, call)
+
+    monkeypatch.setattr(investigation_module, "_dispatch", case_sensitive_dispatch)
+
+    def negative_answer(catalog: tuple[ToolObservation, ...]) -> AgentAnswer:
+        first = catalog[0]
+        return AgentAnswer(
+            summary="the localized issue is absent",
+            findings=("the cited function remains safe",),
+            next_actions=("Keep the exact cited path readable.",),
+            citations=(SourceCitation(first.observation_id, first.path, 1, 1),),
+            issue_present=False,
+        )
+
+    planner = ScriptedInvestigationPlanner(
+        steps=(
+            ToolCall(tool="read_file", path="app.py"),
+            ToolCall(tool="read_file", path="APP.PY"),
+            ToolCall(tool="read_file", path="app.py"),
+        ),
+        build_answer=negative_answer,
+    )
+    report = InvestigationLoop(planner=planner, trust=trust).run(
+        run_id="r-case-variant-recovered",
+        goal="check the localized issue",
+        workspace=workspace,
+    )
+    assert report.verdict is InvestigationVerdict.PASS
+    assert report.stop_reason is StopReason.FINISHED
+
+
+def test_citation_validation_fails_closed_when_runtime_identity_is_lost() -> None:
+    observation = ToolObservation(
+        observation_id="obs-lost-identity",
+        tool="read_file",
+        path="README.md",
+        content_hash="sanitized-hash",
+        text="evidence",
+        lines=("1: evidence",),
+    )
+    answer = AgentAnswer(
+        summary="grounded claim",
+        findings=("the evidence exists",),
+        next_actions=("Rehydrate the private evidence identity before reconnect.",),
+        citations=(SourceCitation(observation.observation_id, observation.path, 1, 1),),
+    )
+
+    error = _validate_citations(
+        answer,
+        (observation,),
+        identity_for=lambda observation_id: None,
+    )
+    assert error == "citation evidence identity is unavailable"
 
 
 def test_empty_substantive_answer_is_rejected(
@@ -1202,6 +1287,7 @@ def test_policy_violation_after_valid_read_still_fatal(tmp_path: Path) -> None:
     [
         ToolCall(tool="read_file", path="../escape.py", start_line=0),
         ToolCall(tool="list_files", path="../escape", glob="x" * 200),
+        ToolCall(tool="read_file", path="x" * 508 + "/.env", start_line=0),
     ],
 )
 def test_path_policy_precedes_other_invalid_arguments(

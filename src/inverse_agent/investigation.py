@@ -291,11 +291,9 @@ def _validate_citations(
         if not any(line_body(line).strip() for line in observation.lines[lo:hi]):
             return "citation resolves only to blank or redacted content"
         identity = identity_for(observation.observation_id)
-        source_key: tuple[object, ...]
-        if identity is not None:
-            source_key = ("file", identity)
-        else:
-            source_key = ("path", _canonical_request_path(observation.path))
+        if identity is None:
+            return "citation evidence identity is unavailable"
+        source_key: tuple[object, ...] = ("file", identity)
         range_key = (source_key, citation.start_line, citation.end_line)
         if range_key in physical_ranges:
             return "each finding must use a distinct physical citation range"
@@ -306,6 +304,8 @@ def _validate_citations(
 def _has_unresolved_negative_uncertainty(
     answer: AgentAnswer,
     catalog: tuple[ToolObservation, ...],
+    *,
+    identity_for: Callable[[str], str | None],
 ) -> bool:
     """Whether current evidence can support the answer's negative conclusion.
 
@@ -345,19 +345,31 @@ def _has_unresolved_negative_uncertainty(
         if cited_observation is not None:
             cited_observations.append(cited_observation)
     for cited in cited_observations:
+        cited_identity = identity_for(cited.observation_id)
         cited_path = _canonical_request_path(cited.path)
         folded_path = cited_path.casefold()
-        latest_variants: dict[str, ToolObservation] = {}
-        for observation in catalog:
+        latest_variants: dict[str, tuple[int, ToolObservation]] = {}
+        last_authoritative_success = -1
+        for index, observation in enumerate(catalog):
             if observation.tool != "read_file" or observation.metadata.get("request_invalid"):
                 continue
             observed_path = _canonical_request_path(observation.path)
             if observed_path.casefold() != folded_path:
                 continue
-            latest_variants[observed_path] = observation
+            latest_variants[observed_path] = (index, observation)
+            observed_identity = identity_for(observation.observation_id)
+            same_identity = (
+                observed_identity is not None
+                and cited_identity is not None
+                and observed_identity == cited_identity
+            )
+            unresolved = observation.incomplete or bool(observation.metadata.get("refused"))
+            if not unresolved and (same_identity or observed_path == cited_path):
+                last_authoritative_success = index
         if any(
-            observation.incomplete or bool(observation.metadata.get("refused"))
-            for observation in latest_variants.values()
+            index > last_authoritative_success
+            and (observation.incomplete or bool(observation.metadata.get("refused")))
+            for index, observation in latest_variants.values()
         ):
             return True
     return False
@@ -506,6 +518,7 @@ class InvestigationLoop:
                     and _has_unresolved_negative_uncertainty(
                         decision,
                         tuple(catalog),
+                        identity_for=reader.evidence_identity,
                     )
                 )
                 if not decision.complete or unresolved_uncertainty:
