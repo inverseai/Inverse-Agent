@@ -20,6 +20,7 @@ from typing import Any, Protocol
 
 from inverse_agent.fs_tools import (
     CHARS_PER_TOKEN,
+    FILE_MAX_BYTES,
     PATH_MAX_CHARS,
     READ_MAX_LINES,
     READ_MAX_TOKENS,
@@ -182,7 +183,7 @@ def _render_block(obs: ToolObservation) -> tuple[str, bool]:
     )
     header = f"id={obs.observation_id} tool={obs.tool} path={obs.path} status[{status}] ({citable})"
     if redacted_lines:
-        header += f" non_citable_redacted_lines={_compact_line_ranges(redacted_lines)}"
+        header += f" non_citable_redacted_lines={_render_redacted_lines(redacted_lines)}"
     if obs.metadata.get("refused"):
         return f"{header}\n  REFUSED: {obs.text}", False
     if obs.metadata.get("binary"):
@@ -215,38 +216,35 @@ def _encoded_string_tokens(value: str, *, bytes_per_token: float) -> int:
     return math.ceil(encoded_bytes / bytes_per_token)
 
 
-def _compact_line_ranges(lines: set[int]) -> str:
-    """Render a bounded integer set without repeating a label per source line."""
+def _render_redacted_lines(lines: set[int]) -> str:
+    """Render at most 200 non-citable line numbers with a simple length bound."""
 
-    if not lines:
-        return ""
-    ordered = sorted(lines)
-    ranges: list[str] = []
-    start = previous = ordered[0]
-    for line in ordered[1:]:
-        if line == previous + 1:
-            previous = line
-            continue
-        ranges.append(str(start) if start == previous else f"{start}-{previous}")
-        start = previous = line
-    ranges.append(str(start) if start == previous else f"{start}-{previous}")
-    return ",".join(ranges)
+    return ",".join(str(line) for line in sorted(lines))
 
 
-def _maximum_read_probe_tokens(*, bytes_per_token: float) -> int:
-    """Token estimate for the largest JSON-bounded read the tool can emit."""
+def _maximum_read_probe() -> ToolObservation:
+    """Build a conservative maximum legal read observation for calibration."""
 
     serialized_budget = READ_MAX_TOKENS * CHARS_PER_TOKEN
     line_break_bytes = 2 * (READ_MAX_LINES - 1)
     # BEL is accepted as text by the read tier and expands to six ASCII bytes in
     # JSON. Filling with it models the worst per-source-byte prompt expansion.
-    content_chars = max(1, (serialized_budget - 2 - line_break_bytes) // 6)
-    width, remainder = divmod(content_chars, READ_MAX_LINES)
+    content_budget = serialized_budget - 2 - line_break_bytes
+    bel_count, ascii_remainder = divmod(content_budget, 6)
+    payload = "\a" * bel_count + "x" * ascii_remainder
+    width, remainder = divmod(len(payload), READ_MAX_LINES)
+    start_line = FILE_MAX_BYTES - READ_MAX_LINES + 2
+    line_contents: list[str] = []
+    cursor = 0
+    for offset in range(READ_MAX_LINES):
+        size = width + (1 if offset < remainder else 0)
+        line_contents.append(payload[cursor : cursor + size])
+        cursor += size
+    source_text = "\n".join(line_contents)
     lines = tuple(
-        f"{line}: " + "\a" * (width + (1 if line <= remainder else 0))
-        for line in range(1, READ_MAX_LINES + 1)
+        f"{start_line + offset}: {content}" for offset, content in enumerate(line_contents)
     )
-    probe = ToolObservation(
+    return ToolObservation(
         observation_id="obs_0123456789abcdef",
         tool="read_file",
         # One non-BMP code point is four UTF-8 bytes and twelve bytes under
@@ -254,14 +252,23 @@ def _maximum_read_probe_tokens(*, bytes_per_token: float) -> int:
         # text. Component limits can only make a real path smaller.
         path="\U00010000" * PATH_MAX_CHARS,
         content_hash="h" * 64,
-        text="",
+        text=source_text,
         lines=lines,
-        start_line=1,
+        start_line=start_line,
         truncated=True,
         incomplete=True,
         redacted=True,
-        metadata={"redacted_lines": tuple(range(1, READ_MAX_LINES))},
+        # Leave one visible line so the maximum observation remains citable.
+        # Explicit line-number rendering makes all 199 redacted lines the exact
+        # maximum metadata overhead, independent of their grouping pattern.
+        metadata={"redacted_lines": tuple(range(start_line, start_line + READ_MAX_LINES - 1))},
     )
+
+
+def _maximum_read_probe_tokens(*, bytes_per_token: float) -> int:
+    """Token estimate for the largest JSON-bounded read the tool can emit."""
+
+    probe = _maximum_read_probe()
     block, _citable = _render_block(probe)
     return _encoded_string_tokens(block, bytes_per_token=bytes_per_token)
 

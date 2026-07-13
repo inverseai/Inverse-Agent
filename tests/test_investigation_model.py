@@ -20,6 +20,8 @@ from inverse_agent.investigation import (
 from inverse_agent.investigation_model import (
     ModelInvestigationPlanner,
     _encoded_string_tokens,
+    _maximum_read_probe,
+    _maximum_read_probe_tokens,
     _render_catalog,
     parse_decision,
 )
@@ -241,13 +243,40 @@ def test_retry_limits_cannot_exceed_protocol_contract() -> None:
         ModelInvestigationPlanner(client=FakeClient([]), max_schema_retries=2)
 
 
-def test_dense_estimator_requires_context_that_can_render_a_legal_read() -> None:
+def test_maximum_read_probe_defines_context_estimator_boundary() -> None:
+    context_tokens = 16_384
+    catalog_budget = context_tokens // 2
+    encoded_probe_bytes = _maximum_read_probe_tokens(bytes_per_token=1.0)
+    boundary = encoded_probe_bytes / catalog_budget
+
     with pytest.raises(ValueError, match="context/estimator pair"):
         ModelInvestigationPlanner(
             client=FakeClient([]),
-            context_tokens=16_384,
-            estimator_bytes_per_token=2.0,
+            context_tokens=context_tokens,
+            estimator_bytes_per_token=boundary - 1e-6,
         )
+    planner = ModelInvestigationPlanner(
+        client=FakeClient([]),
+        context_tokens=context_tokens,
+        estimator_bytes_per_token=boundary + 1e-6,
+    )
+    probe = _maximum_read_probe()
+    planner._turn = 1
+    allowance = planner._completion_allowance()
+    history_budget = planner._history_token_budget(goal="inspect", completion_reserve=allowance)
+
+    _text, ids = _render_catalog(
+        (probe,),
+        token_budget=history_budget,
+        estimator_bytes_per_token=planner.estimator_bytes_per_token,
+    )
+
+    assert probe.start_line > 1_000_000
+    assert _encoded_string_tokens(probe.text, bytes_per_token=1.0) == 12_000
+    redacted_lines = probe.metadata["redacted_lines"]
+    assert isinstance(redacted_lines, tuple)
+    assert len(redacted_lines) == 199
+    assert ids == frozenset({probe.observation_id})
 
 
 def test_unsupported_action_raises() -> None:
@@ -508,7 +537,7 @@ def test_calibrated_context_bounds_full_prompt() -> None:
     )
 
 
-def test_json_escape_heavy_maximum_read_remains_citable_at_16k_context(
+def test_json_escape_heavy_maximum_read_remains_citable_at_safe_context(
     tmp_path: Path,
 ) -> None:
     source = tmp_path / "large.py"
@@ -516,8 +545,8 @@ def test_json_escape_heavy_maximum_read_remains_citable_at_16k_context(
     read = WorkspaceReader.open(tmp_path).read_file("large.py")
     planner = ModelInvestigationPlanner(
         client=FakeClient([]),
-        context_tokens=16_384,
-        estimator_bytes_per_token=2.5,
+        context_tokens=24_576,
+        estimator_bytes_per_token=2.0,
     )
     planner._turn = 1
     allowance = planner._completion_allowance()
@@ -547,12 +576,12 @@ def test_redacted_line_metadata_does_not_crowd_out_citable_read_at_16k() -> None
         truncated=True,
         incomplete=True,
         redacted=True,
-        metadata={"redacted_lines": tuple(range(1, 200))},
+        metadata={"redacted_lines": tuple(range(1, 200, 2))},
     )
     planner = ModelInvestigationPlanner(
         client=FakeClient([]),
-        context_tokens=16_384,
-        estimator_bytes_per_token=2.5,
+        context_tokens=24_576,
+        estimator_bytes_per_token=2.0,
     )
     planner._turn = 1
     allowance = planner._completion_allowance()
@@ -564,7 +593,8 @@ def test_redacted_line_metadata_does_not_crowd_out_citable_read_at_16k() -> None
         estimator_bytes_per_token=planner.estimator_bytes_per_token,
     )
 
-    assert "non_citable_redacted_lines=1-199" in text
+    assert "non_citable_redacted_lines=1,3,5" in text
+    assert ",197,199" in text
     assert ids == frozenset({read.observation_id})
 
 

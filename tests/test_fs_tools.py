@@ -382,10 +382,17 @@ def test_reader_deadline_is_capped_by_run_deadline(
 ) -> None:
     import inverse_agent.fs_tools as fs_tools
 
-    reader = WorkspaceReader.open(tmp_path, active_deadline=105.0)
     monkeypatch.setattr(fs_tools.time, "monotonic", lambda: 100.0)
+    operation_deadline = 100.0 + fs_tools.FS_OPERATION_TIMEOUT_SECONDS
+    run_deadline = operation_deadline - 1.0
+    reader = WorkspaceReader.open(tmp_path, active_deadline=run_deadline)
 
-    assert reader._deadline() == 105.0
+    assert reader._deadline() == run_deadline
+
+    later_run_deadline = operation_deadline + 1.0
+    reader = WorkspaceReader.open(tmp_path, active_deadline=later_run_deadline)
+
+    assert reader._deadline() == operation_deadline
 
 
 def test_recursive_list_and_search_propagate_deadline(

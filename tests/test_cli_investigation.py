@@ -119,6 +119,6 @@ def test_model_context_help_matches_required_live_contract(
     with pytest.raises(SystemExit, match="0"):
         build_parser().parse_args(["benchmark-investigation", "--help"])
 
-    help_text = capsys.readouterr().out
+    help_text = " ".join(capsys.readouterr().out.split())
     assert "INVERSE_AGENT_MODEL_CONTEXT_TOKENS for model runs" in help_text
     assert "or 16384" not in help_text
