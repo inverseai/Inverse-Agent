@@ -186,8 +186,18 @@ def _line_body(numbered: str) -> str:
 
 
 def _is_evidence(observation: ToolObservation) -> bool:
-    """Only real, non-refusal observations with actual content can be cited."""
+    """Only a real, non-refusal ``read_file`` observation with content is citable.
 
+    Pointer results (``list_files`` / ``search_text``) locate files but are not
+    citable evidence: their "lines" are directory entries or ``path:line: match``
+    snippets whose numbering is a result index, not a source line, so a citation
+    against them would resolve to nothing meaningful. Requiring a ``read_file``
+    observation keeps the grounding invariant honest — an answer must cite content
+    from a file it actually read.
+    """
+
+    if observation.tool != "read_file":
+        return False
     if observation.metadata.get("refused"):
         return False
     if not observation.content_hash:

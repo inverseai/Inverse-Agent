@@ -46,3 +46,25 @@ def test_redact_text_allows_non_secret_text() -> None:
     assert not result.blocked
     assert result.matches == ()
     assert result.text == "ordinary build output"
+
+
+def test_private_key_block_is_not_catastrophic() -> None:
+    # A workspace file full of unterminated BEGIN markers must not drive the
+    # private-key-block pattern into O(n^2) backtracking (ReDoS on the read tier).
+    import time
+
+    payload = "-----BEGIN A PRIVATE KEY-----\n" * 40000  # ~1.2 MB
+    started = time.perf_counter()
+    result = redact_text(payload)
+    elapsed = time.perf_counter() - started
+    assert result.blocked  # the prefix pattern still catches unterminated keys
+    assert elapsed < 20.0, f"redaction took {elapsed:.1f}s on pathological input"
+
+
+def test_private_key_block_still_redacts_real_key() -> None:
+    body = "MIIEvQ" + "A" * 400
+    value = f"x\n-----BEGIN RSA PRIVATE KEY-----\n{body}\n-----END RSA PRIVATE KEY-----\ny"
+    result = redact_text(value)
+    assert result.blocked
+    assert body not in result.text
+    assert "BEGIN RSA PRIVATE KEY" not in result.text

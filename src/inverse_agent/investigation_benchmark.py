@@ -81,9 +81,13 @@ class BenchmarkResult:
 
 
 def _marker_citation(catalog: tuple[ToolObservation, ...], marker: str) -> SourceCitation | None:
-    """Find the observation line containing the marker and cite it precisely."""
+    """Find the read observation line containing the marker and cite it precisely."""
 
     for observation in catalog:
+        # Only a read_file observation is citable evidence (a search snippet's
+        # line number is a match index, not a source line).
+        if observation.tool != "read_file":
+            continue
         for numbered in observation.lines:
             # numbered lines look like "<n>: <text>"
             head, _, body = numbered.partition(": ")

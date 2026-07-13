@@ -74,6 +74,39 @@ def test_loop_blocks_without_attestation(tmp_path: Path) -> None:
     assert report.stop_reason is StopReason.NOT_ATTESTED
 
 
+def test_citation_to_search_pointer_is_rejected(
+    trusted_workspace: tuple[Path, ScopedTrustStore],
+) -> None:
+    # A citation to a search_text/list_files pointer observation is not grounded
+    # evidence: only a read_file observation is citable.
+    workspace, trust = trusted_workspace
+
+    def cite_search(catalog: tuple[ToolObservation, ...]) -> AgentAnswer:
+        pointer = next(o for o in catalog if o.tool == "search_text")
+        return AgentAnswer(
+            summary="claim",
+            findings=("f",),
+            next_actions=(),
+            citations=(
+                SourceCitation(
+                    observation_id=pointer.observation_id,
+                    path=pointer.path,
+                    start_line=pointer.start_line,
+                    end_line=pointer.start_line,
+                ),
+            ),
+        )
+
+    planner = ScriptedInvestigationPlanner(
+        steps=(ToolCall(tool="search_text", query="return"),),
+        build_answer=cite_search,
+    )
+    loop = InvestigationLoop(planner=planner, trust=trust)
+    report = loop.run(run_id="r1", goal="x", workspace=workspace)
+    assert report.verdict is InvestigationVerdict.INCOMPLETE
+    assert report.stop_reason is StopReason.UNSUPPORTED_CITATION
+
+
 def test_unsupported_citation_forces_incomplete(
     trusted_workspace: tuple[Path, ScopedTrustStore],
 ) -> None:

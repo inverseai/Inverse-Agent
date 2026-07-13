@@ -164,7 +164,7 @@ def _is_reparse_point(entry: os.stat_result) -> bool:
     return stat.S_ISLNK(entry.st_mode)
 
 
-def _relative_parts(workspace: Path, raw_path: str) -> tuple[str, ...]:
+def _relative_parts(raw_path: str) -> tuple[str, ...]:
     if not raw_path or len(raw_path) > PATH_MAX_CHARS:
         raise PolicyViolationError("path is empty or exceeds the length limit")
     if "\x00" in raw_path:
@@ -192,7 +192,7 @@ def _resolve_within(workspace: Path, raw_path: str) -> tuple[Path, str]:
     residual mid-traversal swap race is deferred to the hardened v0.2b build.
     """
 
-    parts = _relative_parts(workspace, raw_path)
+    parts = _relative_parts(raw_path)
     if not parts:
         raise PolicyViolationError("path must reference a file or directory inside the workspace")
     current = workspace

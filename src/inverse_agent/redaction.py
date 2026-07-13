@@ -5,11 +5,21 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
+# The PEM body span is bounded to a realistic key size so that many unterminated
+# "BEGIN PRIVATE KEY" markers in attacker-controlled workspace content cannot
+# drive the lazy scan to EOF for each marker (O(n^2) catastrophic backtracking /
+# ReDoS on the untrusted read tier). A real key body is well under this bound;
+# the linear private-key-prefix pattern still catches a genuinely unterminated
+# block, so coverage is unchanged.
+_PRIVATE_KEY_BODY_MAX = 8192
+
 SECRET_PATTERNS = (
     (
         "private-key-block",
         re.compile(
-            r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----",
+            r"-----BEGIN [A-Z ]*PRIVATE KEY-----"
+            rf".{{0,{_PRIVATE_KEY_BODY_MAX}}}?"
+            r"-----END [A-Z ]*PRIVATE KEY-----",
             re.DOTALL,
         ),
     ),
