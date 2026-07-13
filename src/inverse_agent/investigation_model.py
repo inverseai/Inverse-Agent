@@ -22,6 +22,7 @@ from inverse_agent.investigation import (
     SourceCitation,
     ToolCall,
     ToolObservation,
+    _citation_intersects_redaction,
 )
 from inverse_agent.planner import (
     MAX_MODEL_COMPLETION_TOKENS,
@@ -102,12 +103,16 @@ _SYSTEM_PROMPT = (
     "In final_answer set condition_holds=true when the code confirms the "
     "condition or fact the goal asks about (e.g. the component IS exported, the "
     "entrypoint DOES exist, the bug IS present) and false only if the code shows "
-    "it genuinely does not hold; give a non-empty summary and at least one "
-    "finding.\n"
+    "it genuinely does not hold; give a non-empty summary, at least one finding, "
+    "and at least one recommended next action. Provide exactly one citation for "
+    "each finding in the same order.\n"
     "Observation completeness: headers explicitly show truncated/incomplete flags. "
-    "Never infer absence from a truncated or incomplete observation. If the final "
-    "answer depends on missing content, set complete=false. Set complete=true on "
-    "tool actions.\n"
+    "A bounded read_file window may support a localized claim when every cited line "
+    "is visible. Never infer broad absence from an incomplete or truncated list_files "
+    "or search_text result, or from an incomplete read of a cited path. Retry the same "
+    "catalog request successfully to replace earlier uncertainty. If the final answer "
+    "still depends on missing content, set complete=false. Set complete=true on tool "
+    "actions.\n"
     'Fill unused fields with "" or [].'
 )
 
@@ -127,10 +132,22 @@ class SupportsStructuredJson(Protocol):
 def _render_block(obs: ToolObservation) -> tuple[str, bool]:
     """Render one observation to a prompt block, returning (block, is_citable_read)."""
 
+    raw_redacted = obs.metadata.get("redacted_lines", ())
+    redacted_lines = (
+        {item for item in raw_redacted if isinstance(item, int)}
+        if isinstance(raw_redacted, list | tuple)
+        else set()
+    )
+    has_citable_line = any(
+        obs.start_line + offset not in redacted_lines and line.partition(": ")[2].strip()
+        for offset, line in enumerate(obs.lines)
+    )
     if obs.metadata.get("refused"):
         citable = "not citable"
     elif obs.metadata.get("binary"):
         citable = "not citable (binary)"
+    elif obs.tool == "read_file" and not has_citable_line:
+        citable = "not citable (blank or redacted)"
     elif obs.tool == "read_file":
         citable = "CITABLE - cite this observation_id with its N: line numbers"
     else:
@@ -151,13 +168,20 @@ def _render_block(obs: ToolObservation) -> tuple[str, bool]:
     limit = len(obs.lines) if obs.tool == "read_file" else CATALOG_LINES_PER_OBS
     shown = obs.lines[:limit]
     fully_rendered = limit >= len(obs.lines)
-    body = "\n".join(f"  {line}" for line in shown) or "  (no matching content)"
+    rendered_lines = []
+    for offset, line in enumerate(shown):
+        line_number = obs.start_line + offset
+        suffix = " [NON-CITABLE: REDACTED LINE]" if line_number in redacted_lines else ""
+        rendered_lines.append(f"  {line}{suffix}")
+    body = "\n".join(rendered_lines) or "  (no matching content)"
     if obs.incomplete or obs.truncated:
         body = (
             "  WARNING: this result is incomplete; omitted content may change a "
             f"negative conclusion.\n{body}"
         )
-    is_citable_read = obs.tool == "read_file" and bool(obs.content_hash) and fully_rendered
+    is_citable_read = (
+        obs.tool == "read_file" and bool(obs.content_hash) and fully_rendered and has_citable_line
+    )
     return f"{header}\n{body}", is_citable_read
 
 
@@ -230,21 +254,30 @@ def _repair_citations(
     by_id = {obs.observation_id: obs for obs in reads}
 
     def rebind(citation: SourceCitation) -> SourceCitation:
+        if citation.start_line < 1 or citation.end_line < citation.start_line:
+            return citation
         existing = by_id.get(citation.observation_id)
-        if existing is not None and existing.path == citation.path:
+        if (
+            existing is not None
+            and existing.path == citation.path
+            and not _citation_intersects_redaction(existing, citation)
+        ):
             return citation
         for obs in reads:
             if obs.path != citation.path:
                 continue
             last = obs.start_line + len(obs.lines) - 1
-            if obs.start_line <= citation.start_line <= last:
-                return SourceCitation(
-                    observation_id=obs.observation_id,
-                    path=obs.path,
-                    start_line=citation.start_line,
-                    end_line=min(citation.end_line, last),
-                    note=citation.note,
-                )
+            repaired = SourceCitation(
+                observation_id=obs.observation_id,
+                path=obs.path,
+                start_line=citation.start_line,
+                end_line=min(citation.end_line, last),
+                note=citation.note,
+            )
+            if obs.start_line <= citation.start_line <= last and not _citation_intersects_redaction(
+                obs, repaired
+            ):
+                return repaired
         return citation
 
     return AgentAnswer(
@@ -295,13 +328,17 @@ def _parse_decision(payload: Mapping[str, Any]) -> Decision:
             for item in payload.get("citations", [])
             if isinstance(item, Mapping)
         )
+        complete = payload["complete"]
+        condition_holds = payload["condition_holds"]
+        if type(complete) is not bool or type(condition_holds) is not bool:
+            raise TypeError("complete and condition_holds must be JSON booleans")
         return AgentAnswer(
             summary=str(payload.get("summary", "")),
             findings=tuple(str(f) for f in payload.get("findings", [])),
             next_actions=tuple(str(a) for a in payload.get("next_actions", [])),
             citations=citations,
-            complete=bool(payload.get("complete", True)),
-            issue_present=bool(payload.get("condition_holds", True)),
+            complete=complete,
+            issue_present=condition_holds,
         )
     if action in {"read_file", "list_files", "search_text"}:
         return ToolCall(

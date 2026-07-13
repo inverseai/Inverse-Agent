@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import os
 import sys
 from pathlib import Path
@@ -14,8 +15,15 @@ from inverse_agent.fs_tools import (
     FsToolError,
     PolicyViolationError,
     WorkspaceReader,
+    _sanitize_line_preserving,
 )
-from inverse_agent.secure_fs import SecureFsPolicyError
+from inverse_agent.secure_fs import (
+    SecureEntry,
+    SecureFsPolicyError,
+    SecureFsWorkspacePolicyError,
+    SecureListing,
+    _decode_windows_directory_name,
+)
 
 
 @pytest.fixture
@@ -105,6 +113,27 @@ def test_read_file_redacts_secrets_line_preserving(tmp_path: Path) -> None:
     assert obs.lines[2] == "3: safe = 2"
 
 
+def test_redaction_mask_is_bounded_to_returned_window() -> None:
+    text = "\n".join(f"api_key=sk_live_{line:016d}" for line in range(1, 1001))
+    sanitized, redacted, redacted_lines = _sanitize_line_preserving(
+        text,
+        deadline=float("inf"),
+        redacted_line_window=(400, 410),
+    )
+    assert redacted
+    assert "sk_live_" not in sanitized
+    assert redacted_lines == tuple(range(400, 411))
+
+
+def test_redaction_honors_expired_deadline() -> None:
+    with pytest.raises(FsToolError, match="deadline"):
+        _sanitize_line_preserving(
+            "api_key=sk_live_0123456789abcdef",
+            deadline=float("-inf"),
+            redacted_line_window=(1, 1),
+        )
+
+
 def test_read_file_refuses_non_utf8(tmp_path: Path) -> None:
     (tmp_path / "blob.txt").write_bytes(b"valid\n\xff\xfe not utf8\n")
     reader = WorkspaceReader.open(tmp_path)
@@ -118,6 +147,34 @@ def test_read_file_flags_binary(tmp_path: Path) -> None:
     obs = reader.read_file("image.bin")
     assert obs.metadata.get("binary") is True
     assert obs.text == ""
+
+
+def test_search_binary_skip_is_explicitly_incomplete(tmp_path: Path) -> None:
+    (tmp_path / "utf16_config.txt").write_bytes("hidden setting\n".encode("utf-16-le"))
+    reader = WorkspaceReader.open(tmp_path)
+    observation = reader.search_text("hidden setting")
+    assert observation.lines == ()
+    assert observation.incomplete and observation.truncated
+    assert observation.metadata["binary_skipped"] == 1
+
+
+def test_invalid_utf16_directory_name_is_skippable() -> None:
+    assert _decode_windows_directory_name("valid.txt".encode("utf-16-le")) == "valid.txt"
+    assert _decode_windows_directory_name(b"\x00\xd8") is None
+
+
+def test_posix_root_non_directory_is_workspace_policy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import inverse_agent.secure_fs as secure_fs
+
+    def non_directory(*args: object, **kwargs: object) -> int:
+        del args, kwargs
+        raise OSError(errno.ENOTDIR, "not a directory")
+
+    monkeypatch.setattr(secure_fs.os, "open", non_directory)
+    with pytest.raises(SecureFsWorkspacePolicyError), secure_fs._posix_root(tmp_path):
+        raise AssertionError("unreachable")
 
 
 def test_read_file_rejects_symlink(tmp_path: Path) -> None:
@@ -158,6 +215,14 @@ def test_read_file_rejects_hard_link(tmp_path: Path) -> None:
     reader = WorkspaceReader.open(tmp_path)
     with pytest.raises(FsToolError, match="multiple hard links"):
         reader.read_file("linked.txt")
+    listing = reader.list_files(".")
+    assert listing.incomplete and listing.truncated
+    assert listing.metadata["filtered_entry_count"] >= 1
+    assert "linked.txt" not in listing.lines
+    search = reader.search_text("outside secret")
+    assert search.incomplete and search.truncated
+    assert search.metadata["walk_omitted_entry_count"] >= 1
+    assert search.lines == ()
 
 
 def test_read_file_uses_validated_handle_not_path_reopen(
@@ -312,6 +377,166 @@ def test_read_file_redacts_multiline_private_key(tmp_path: Path) -> None:
     assert "6: after = 2" in obs.lines
 
 
+def test_complete_then_unterminated_private_keys_are_both_redacted() -> None:
+    first_body = "FIRST_PRIVATE_KEY_BODY_" + "A" * 40
+    second_body = "SECOND_PRIVATE_KEY_BODY_" + "B" * 40
+    text = (
+        "-----BEGIN PRIVATE KEY-----\n"
+        f"{first_body}\n"
+        "-----END PRIVATE KEY-----\n"
+        "safe_between = 1\n"
+        "-----BEGIN PRIVATE KEY-----\n"
+        f"{second_body}\n"
+    )
+    sanitized, redacted, redacted_lines = _sanitize_line_preserving(
+        text,
+        deadline=float("inf"),
+        redacted_line_window=(1, 20),
+    )
+    assert redacted
+    assert first_body not in sanitized
+    assert second_body not in sanitized
+    assert "BEGIN PRIVATE KEY" not in sanitized
+    assert "safe_between = 1" in sanitized
+    assert set(redacted_lines) == {1, 2, 3, 5, 6}
+
+
+def test_nested_private_key_markers_redact_outer_tail() -> None:
+    outer_tail = "OUTER_PRIVATE_KEY_TAIL_" + "C" * 40
+    text = (
+        "safe_before = 1\n"
+        "-----BEGIN PRIVATE KEY-----\n"
+        "OUTER_HEAD\n"
+        "-----BEGIN PRIVATE KEY-----\n"
+        "INNER_BODY\n"
+        "-----END PRIVATE KEY-----\n"
+        f"{outer_tail}\n"
+        "-----END PRIVATE KEY-----\n"
+        "safe_after = 2\n"
+    )
+    sanitized, redacted, redacted_lines = _sanitize_line_preserving(
+        text,
+        deadline=float("inf"),
+        redacted_line_window=(1, 20),
+    )
+    assert redacted
+    assert "OUTER_HEAD" not in sanitized
+    assert "INNER_BODY" not in sanitized
+    assert outer_tail not in sanitized
+    assert "PRIVATE KEY" not in sanitized
+    assert "safe_before = 1" in sanitized
+    assert "safe_after = 2" in sanitized
+    assert set(redacted_lines) == set(range(2, 9))
+
+
+@pytest.mark.parametrize(
+    "label",
+    [
+        "PGP PRIVATE KEY BLOCK",
+        "ED25519 PRIVATE KEY",
+        "X" * 53 + " PRIVATE KEY",
+    ],
+)
+def test_private_key_armor_label_variants_are_redacted(label: str) -> None:
+    body = "PRIVATE_KEY_BODY_" + "D" * 40
+    text = f"-----BEGIN {label}-----\n{body}\n-----END {label}-----\n"
+    sanitized, redacted, redacted_lines = _sanitize_line_preserving(
+        text,
+        deadline=float("inf"),
+        redacted_line_window=(1, 10),
+    )
+    assert redacted
+    assert body not in sanitized
+    assert label not in sanitized
+    assert set(redacted_lines) == {1, 2, 3}
+
+
+def test_unicode_case_expansion_before_private_key_does_not_shift_offsets() -> None:
+    body = "PRIVATE_KEY_BODY_" + "E" * 40
+    text = f"Unicode prefix: ß -----BEGIN PRIVATE KEY-----\n{body}\n-----END PRIVATE KEY-----\n"
+    sanitized, redacted, _redacted_lines = _sanitize_line_preserving(
+        text,
+        deadline=float("inf"),
+        redacted_line_window=(1, 10),
+    )
+    assert redacted
+    assert body not in sanitized
+    assert "Unicode prefix: ß" in sanitized
+
+
+@pytest.mark.parametrize("dash_count", range(6, 10))
+@pytest.mark.parametrize("shifted_marker", ["begin", "end"])
+def test_overlapping_dash_runs_do_not_hide_private_key_markers(
+    dash_count: int, shifted_marker: str
+) -> None:
+    body = "PRIVATE_KEY_BODY_" + "F" * 40
+    dashes = "-" * dash_count
+    begin_dashes = dashes if shifted_marker == "begin" else "-----"
+    end_dashes = dashes if shifted_marker == "end" else "-----"
+    text = (
+        f"{begin_dashes}BEGIN PRIVATE KEY-----\n"
+        f"{body}\n"
+        f"{end_dashes}END PRIVATE KEY-----\n"
+        "safe_after = 1\n"
+    )
+    sanitized, redacted, _redacted_lines = _sanitize_line_preserving(
+        text,
+        deadline=float("inf"),
+        redacted_line_window=(1, 10),
+    )
+    assert redacted
+    assert body not in sanitized
+    assert "PRIVATE KEY" not in sanitized
+    assert "safe_after = 1" in sanitized
+
+
+def test_nested_provider_token_does_not_hide_credential_url_password() -> None:
+    token = "sk_" + "A" * 24
+    password = "PlainPassword123"
+    text = f"url=https://{token}:{password}@internal.example/path\n"
+    sanitized, redacted, redacted_lines = _sanitize_line_preserving(
+        text,
+        deadline=float("inf"),
+        redacted_line_window=(1, 1),
+    )
+    assert redacted
+    assert token not in sanitized
+    assert password not in sanitized
+    assert sanitized == "url=[REDACTED_SECRET]internal.example/path\n"
+    assert redacted_lines == (1,)
+
+
+def test_provider_token_scheme_does_not_hide_credential_url_password() -> None:
+    scheme_token = "sk-" + "A" * 24
+    password = "PlainPassword123"
+    text = f"url={scheme_token}://alice:{password}@internal.example/path\n"
+    sanitized, redacted, redacted_lines = _sanitize_line_preserving(
+        text,
+        deadline=float("inf"),
+        redacted_line_window=(1, 1),
+    )
+    assert redacted
+    assert scheme_token not in sanitized
+    assert password not in sanitized
+    assert sanitized == "url=[REDACTED_SECRET]internal.example/path\n"
+    assert redacted_lines == (1,)
+
+
+def test_complete_private_key_does_not_hide_adjacent_github_token() -> None:
+    token = "ghp_" + "A" * 30
+    text = f"-----BEGIN PRIVATE KEY-----\nPRIVATE_BODY\n-----END PRIVATE KEY-----{token}\n"
+    sanitized, redacted, redacted_lines = _sanitize_line_preserving(
+        text,
+        deadline=float("inf"),
+        redacted_line_window=(1, 10),
+    )
+    assert redacted
+    assert token not in sanitized
+    assert "PRIVATE_BODY" not in sanitized
+    assert sanitized == "[REDACTED_SECRET]\n\n\n"
+    assert set(redacted_lines) == {1, 2, 3}
+
+
 def test_redacted_content_hash_is_not_a_raw_secret_oracle(tmp_path: Path) -> None:
     first = "before\n-----BEGIN PRIVATE KEY-----\nSECRET_A\n-----END PRIVATE KEY-----\nafter\n"
     second = first.replace("SECRET_A", "SECRET_B")
@@ -335,6 +560,23 @@ def test_search_skips_oversized_file_and_marks_result_incomplete(tmp_path: Path)
     assert observation.lines == ()
     assert observation.incomplete and observation.truncated
     assert observation.metadata["oversized_skipped"] == 1
+
+
+def test_search_degrades_post_walk_policy_race_to_incomplete(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "raced.py").write_text("needle\n", encoding="utf-8")
+    reader = WorkspaceReader.open(tmp_path)
+
+    def refuse_raced_path(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        raise SecureFsPolicyError("file has multiple hard links")
+
+    monkeypatch.setattr(reader.secure, "read_bytes", refuse_raced_path)
+    observation = reader.search_text("needle")
+    assert observation.lines == ()
+    assert observation.incomplete and observation.truncated
+    assert observation.metadata["policy_race_refused"] == 1
 
 
 def test_read_file_past_eof_yields_no_citable_lines(tmp_path: Path) -> None:
@@ -387,6 +629,59 @@ def test_list_files_response_ceiling(tmp_path: Path) -> None:
     reader = WorkspaceReader.open(tmp_path)
     obs = reader.list_files(".")
     assert len(obs.text.encode()) <= 16 * 1024
+
+
+def test_flat_listing_omits_overlong_name_without_slicing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    reader = WorkspaceReader.open(tmp_path)
+    overlong = "a" * 532
+    listing = SecureListing(
+        entries=(
+            SecureEntry(
+                name=overlong,
+                is_dir=False,
+                is_file=True,
+                size=1,
+                link_count=1,
+                identity=(1, 1),
+                change_token=(1, 1),
+            ),
+        ),
+        visited=1,
+        refused=0,
+        filtered=0,
+        truncated=False,
+    )
+
+    def fake_listing(*args: object, **kwargs: object) -> SecureListing:
+        del args, kwargs
+        return listing
+
+    monkeypatch.setattr(reader.secure, "list_directory", fake_listing)
+    observation = reader.list_files(".")
+    assert observation.lines == ()
+    assert observation.incomplete and observation.truncated
+    assert observation.metadata["filtered_entry_count"] == 1
+
+
+def test_recursive_listing_omits_overlong_path_without_slicing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    reader = WorkspaceReader.open(tmp_path)
+    overlong = "a" * 513 + ".py"
+
+    def fake_walk(
+        self: WorkspaceReader, base_parts: tuple[str, ...], *, deadline: float
+    ) -> tuple[list[str], bool, bool, int]:
+        del self, base_parts, deadline
+        return [overlong], False, False, 0
+
+    monkeypatch.setattr(WorkspaceReader, "_walk_files", fake_walk)
+    observation = reader.list_files(".", glob="**/*.py")
+    assert observation.lines == ()
+    assert observation.incomplete and observation.truncated
+    assert observation.metadata["omitted_entry_count"] == 1
 
 
 def test_search_skips_denied_dir_case_insensitively(tmp_path: Path) -> None:

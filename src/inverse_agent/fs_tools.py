@@ -17,16 +17,18 @@ from __future__ import annotations
 import hashlib
 import re
 import time
+from bisect import bisect_left
 from dataclasses import dataclass, field
 from fnmatch import fnmatch
 from pathlib import Path, PurePosixPath
 
-from inverse_agent.redaction import SECRET_PATTERNS
+from inverse_agent.redaction import SECRET_PATTERNS, private_key_spans
 from inverse_agent.secure_fs import (
     SecureFsDeadlineError,
     SecureFsError,
     SecureFsPolicyError,
     SecureFsTooLargeError,
+    SecureFsWorkspacePolicyError,
     SecureWorkspace,
 )
 
@@ -112,8 +114,9 @@ class ToolObservation:
     """A durable, model-visible result of one read-tool call.
 
     ``incomplete`` is set when content was redacted or otherwise could not be
-    delivered faithfully; ``truncated`` is a normal property of large results and
-    does not by itself make an observation incomplete.
+    delivered faithfully. ``truncated`` records bounded omission; a read window
+    can still ground a localized cited claim, while a truncated list/search
+    cannot establish broad absence.
     """
 
     observation_id: str
@@ -210,7 +213,12 @@ def _decode_strict(data: bytes) -> str:
     return decoded.replace("\r\n", "\n").replace("\r", "\n")
 
 
-def _sanitize_line_preserving(text: str) -> tuple[str, bool]:
+def _sanitize_line_preserving(
+    text: str,
+    *,
+    deadline: float,
+    redacted_line_window: tuple[int, int] | None = None,
+) -> tuple[str, bool, tuple[int, ...]]:
     """Redact secrets over the FULL text while preserving the line count.
 
     Redacting line by line would defeat the multi-line private-key patterns
@@ -219,16 +227,53 @@ def _sanitize_line_preserving(text: str) -> tuple[str, bool]:
     same number of newlines it covered, so downstream line numbers stay valid.
     """
 
-    redacted = {"any": False}
-
-    def _replace(match: re.Match[str]) -> str:
-        redacted["any"] = True
-        return "[REDACTED_SECRET]" + "\n" * match.group(0).count("\n")
-
-    result = text
+    # Every ordinary pattern scans the original text, so an inner match can
+    # never suppress a later enclosing match (for example a provider token used
+    # as either the username or scheme of a credential-bearing URL). Private
+    # keys use a linear marker-aware scan so nested or malformed blocks cannot
+    # hide an outer BEGIN marker and leak the remaining key tail.
+    spans = [(start, end) for start, end, _complete in private_key_spans(text)]
+    if time.monotonic() > deadline:
+        raise FsToolError("source sanitization exceeded its deadline")
     for _name, pattern in SECRET_PATTERNS:
-        result = pattern.sub(_replace, result)
-    return result, redacted["any"]
+        if time.monotonic() > deadline:
+            raise FsToolError("source sanitization exceeded its deadline")
+        for match in pattern.finditer(text):
+            spans.append(match.span())
+            if len(spans) % 128 == 0 and time.monotonic() > deadline:
+                raise FsToolError("source sanitization exceeded its deadline")
+    if not spans:
+        return text, False, ()
+
+    spans.sort()
+    merged: list[tuple[int, int]] = []
+    for start, end in spans:
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+
+    newline_offsets = [index for index, character in enumerate(text) if character == "\n"]
+    redacted_lines: set[int] = set()
+    output_pieces: list[str] = []
+    cursor = 0
+    for start, end in merged:
+        if time.monotonic() > deadline:
+            raise FsToolError("source sanitization exceeded its deadline")
+        output_pieces.append(text[cursor:start])
+        matched = text[start:end]
+        output_pieces.append("[REDACTED_SECRET]" + "\n" * matched.count("\n"))
+        if redacted_line_window is not None:
+            first_line = bisect_left(newline_offsets, start) + 1
+            last_character = max(start, end - 1)
+            last_line = bisect_left(newline_offsets, last_character) + 1
+            window_start, window_end = redacted_line_window
+            redacted_lines.update(
+                range(max(first_line, window_start), min(last_line, window_end) + 1)
+            )
+        cursor = end
+    output_pieces.append(text[cursor:])
+    return "".join(output_pieces), True, tuple(sorted(redacted_lines))
 
 
 def _tool_error(exc: SecureFsError) -> FsToolError:
@@ -274,11 +319,12 @@ class WorkspaceReader:
             raise PolicyViolationError("path must reference a file inside the workspace")
         relative = "/".join(parts)
         _reject_sensitive_name(relative.rsplit("/", 1)[-1])
+        deadline = self._deadline()
         try:
             secure_read = self.secure.read_bytes(
                 parts,
                 maximum_bytes=FILE_MAX_BYTES,
-                deadline=self._deadline(),
+                deadline=deadline,
             )
         except SecureFsError as exc:
             raise _tool_error(exc) from exc
@@ -300,7 +346,11 @@ class WorkspaceReader:
         decoded = _decode_strict(data)
         # Sanitize the WHOLE file before slicing so a window starting inside a
         # multi-line secret cannot leak the body, and redaction is line-preserving.
-        sanitized_full, redacted = _sanitize_line_preserving(decoded)
+        sanitized_full, redacted, redacted_lines = _sanitize_line_preserving(
+            decoded,
+            deadline=deadline,
+            redacted_line_window=(start_line, start_line + max_lines - 1),
+        )
         sanitized_hash = hashlib.sha256(sanitized_full.encode("utf-8")).hexdigest()
         window_salt = f"{sanitized_hash}:{start_line}:{max_lines}"
         all_lines = sanitized_full.split("\n")
@@ -329,7 +379,7 @@ class WorkspaceReader:
             truncated=truncated,
             incomplete=redacted,
             redacted=redacted,
-            metadata={"total_lines": total_lines},
+            metadata={"total_lines": total_lines, "redacted_lines": redacted_lines},
         )
 
     def list_files(self, path: str = ".", *, glob: str | None = None) -> ToolObservation:
@@ -365,7 +415,8 @@ class WorkspaceReader:
             )
         except SecureFsError as exc:
             raise _tool_error(exc) from exc
-        truncated_scan = listing.truncated or listing.refused > 0
+        filtered_count = listing.filtered
+        truncated_scan = listing.truncated or listing.refused > 0 or filtered_count > 0
         for entry in listing.entries:
             visited += 1
             if visited > WALK_VISIT_LIMIT or len(rows) >= LIST_MAX_ENTRIES * 4:
@@ -375,24 +426,29 @@ class WorkspaceReader:
             try:
                 _reject_component(name)
             except FsToolError:
+                filtered_count += 1
+                continue
+            if len(name) > PATH_MAX_CHARS:
+                filtered_count += 1
                 continue
             is_dir = entry.is_dir
             if not is_dir:
                 if entry.link_count > 1:
+                    filtered_count += 1
                     continue
                 try:
                     _reject_sensitive_name(name)
                 except FsToolError:
+                    filtered_count += 1
                     continue
             if glob is not None and not is_dir and not _glob_match(glob, name):
                 continue
             rows.append((name, is_dir))
         rows.sort()
         rendered_entries = [
-            f"{name}{'/' if is_dir else ''}"[:PATH_MAX_CHARS]
-            for name, is_dir in rows[:LIST_MAX_ENTRIES]
+            f"{name}{'/' if is_dir else ''}" for name, is_dir in rows[:LIST_MAX_ENTRIES]
         ]
-        cap_hit = truncated_scan or len(rows) > LIST_MAX_ENTRIES
+        cap_hit = truncated_scan or filtered_count > 0 or len(rows) > LIST_MAX_ENTRIES
         rendered_entries, ceiling_hit = _apply_response_ceiling(rendered_entries)
         ceiling_hit = ceiling_hit or cap_hit
         text = "\n".join(rendered_entries)
@@ -405,10 +461,12 @@ class WorkspaceReader:
             text=text,
             lines=tuple(rendered_entries),
             truncated=ceiling_hit,
-            incomplete=listing.refused > 0,
+            incomplete=listing.refused > 0 or filtered_count > 0,
             metadata={
                 "entry_count": len(rendered_entries),
                 "refused_entry_count": listing.refused,
+                "filtered_entry_count": filtered_count,
+                "glob": glob,
             },
         )
 
@@ -423,7 +481,9 @@ class WorkspaceReader:
         """Return a bounded tree of workspace-relative files matching a ``**`` glob."""
 
         matches: list[str] = []
-        walked, walk_truncated, walk_incomplete = self._walk_files(base_parts, deadline=deadline)
+        walked, walk_truncated, walk_incomplete, omitted_count = self._walk_files(
+            base_parts, deadline=deadline
+        )
         cap_hit = walk_truncated or walk_incomplete
         for relative_file in walked:
             if len(matches) >= LIST_MAX_ENTRIES:
@@ -436,8 +496,16 @@ class WorkspaceReader:
                 # Sensitive files are denied by name in recursive listings too.
                 _reject_sensitive_name(name)
             except FsToolError:
+                omitted_count += 1
+                walk_incomplete = True
+                cap_hit = True
                 continue
-            matches.append(relative_file[:PATH_MAX_CHARS])
+            if len(relative_file) > PATH_MAX_CHARS:
+                omitted_count += 1
+                walk_incomplete = True
+                cap_hit = True
+                continue
+            matches.append(relative_file)
         matches.sort()
         matches, ceiling_hit = _apply_response_ceiling(matches)
         text = "\n".join(matches)
@@ -451,7 +519,12 @@ class WorkspaceReader:
             lines=tuple(matches),
             truncated=cap_hit or ceiling_hit,
             incomplete=walk_incomplete,
-            metadata={"entry_count": len(matches), "recursive": True},
+            metadata={
+                "entry_count": len(matches),
+                "recursive": True,
+                "glob": glob,
+                "omitted_entry_count": omitted_count,
+            },
         )
 
     def search_text(self, query: str, *, glob: str | None = None) -> ToolObservation:
@@ -471,7 +544,12 @@ class WorkspaceReader:
         decode_refused = False
         read_refused = False
         oversized_skipped = 0
-        walked, walk_truncated, walk_incomplete = self._walk_files((), deadline=deadline)
+        binary_skipped = 0
+        policy_race_refused = 0
+        sensitive_skipped = 0
+        walked, walk_truncated, walk_incomplete, omitted_count = self._walk_files(
+            (), deadline=deadline
+        )
         scan_truncated = False
         for relative in walked:
             if files_scanned >= SEARCH_MAX_FILES or bytes_scanned >= SEARCH_MAX_SCAN_BYTES:
@@ -483,6 +561,7 @@ class WorkspaceReader:
             try:
                 _reject_sensitive_name(name)
             except FsToolError:
+                sensitive_skipped += 1
                 continue
             try:
                 secure_read = self.secure.read_bytes(
@@ -492,8 +571,16 @@ class WorkspaceReader:
                 )
             except SecureFsDeadlineError as exc:
                 raise _tool_error(exc) from exc
-            except SecureFsPolicyError as exc:
+            except SecureFsWorkspacePolicyError as exc:
                 raise _tool_error(exc) from exc
+            except SecureFsPolicyError:
+                # The path came from a handle-validated walk. A later link or
+                # hard-link refusal is therefore a workspace mutation, not a
+                # denied path requested by the model. Preserve the refusal as
+                # incomplete search evidence instead of misclassifying the run.
+                read_refused = True
+                policy_race_refused += 1
+                continue
             except SecureFsTooLargeError:
                 oversized_skipped += 1
                 continue
@@ -507,6 +594,7 @@ class WorkspaceReader:
             files_scanned += 1
             bytes_scanned += len(data)
             if _looks_binary(data):
+                binary_skipped += 1
                 continue
             try:
                 decoded = _decode_strict(data)
@@ -516,7 +604,9 @@ class WorkspaceReader:
                 continue
             # Sanitize the WHOLE file before matching so a match inside a secret
             # body cannot leak it, and search only the sanitized representation.
-            sanitized_full, redacted = _sanitize_line_preserving(decoded)
+            sanitized_full, redacted, _redacted_lines = _sanitize_line_preserving(
+                decoded, deadline=deadline
+            )
             if redacted:
                 redacted_any = True
             for line_number, line in enumerate(sanitized_full.split("\n"), start=1):
@@ -546,6 +636,8 @@ class WorkspaceReader:
                 or scan_truncated
                 or read_refused
                 or oversized_skipped > 0
+                or binary_skipped > 0
+                or sensitive_skipped > 0
             ),
             incomplete=(
                 redacted_any
@@ -553,6 +645,8 @@ class WorkspaceReader:
                 or walk_incomplete
                 or read_refused
                 or oversized_skipped > 0
+                or binary_skipped > 0
+                or sensitive_skipped > 0
             ),
             redacted=redacted_any,
             metadata={
@@ -561,6 +655,12 @@ class WorkspaceReader:
                 "decode_refused": decode_refused,
                 "read_refused": read_refused,
                 "oversized_skipped": oversized_skipped,
+                "binary_skipped": binary_skipped,
+                "policy_race_refused": policy_race_refused,
+                "sensitive_skipped": sensitive_skipped,
+                "walk_omitted_entry_count": omitted_count,
+                "query": query,
+                "glob": glob,
             },
         )
 
@@ -569,7 +669,7 @@ class WorkspaceReader:
         base_parts: tuple[str, ...],
         *,
         deadline: float,
-    ) -> tuple[list[str], bool, bool]:
+    ) -> tuple[list[str], bool, bool, int]:
         """Collect regular files under a workspace-relative directory.
 
         Returns the collected files and whether the ``WALK_VISIT_LIMIT`` work
@@ -584,11 +684,12 @@ class WorkspaceReader:
         stack: list[tuple[str, ...]] = [base_parts]
         visited = 0
         incomplete = False
+        omitted_count = 0
         while stack:
             directory_parts = stack.pop()
             remaining = WALK_VISIT_LIMIT - visited
             if remaining <= 0:
-                return sorted(collected), True, incomplete
+                return sorted(collected), True, incomplete, omitted_count
             try:
                 listing = self.secure.list_directory(
                     directory_parts,
@@ -600,14 +701,20 @@ class WorkspaceReader:
             except SecureFsError as exc:
                 raise _tool_error(exc) from exc
             visited += listing.visited
-            incomplete = incomplete or listing.refused > 0
+            directory_omissions = listing.refused + listing.filtered
+            omitted_count += directory_omissions
+            incomplete = incomplete or directory_omissions > 0
             for entry in listing.entries:
                 name = entry.name
                 if name.lower() in _DENIED_DIR_NAMES:
+                    omitted_count += 1
+                    incomplete = True
                     continue
                 try:
                     _reject_component(name)
                 except FsToolError:
+                    omitted_count += 1
+                    incomplete = True
                     continue
                 child_parts = (*directory_parts, name)
                 if entry.is_dir:
@@ -616,11 +723,21 @@ class WorkspaceReader:
                     try:
                         _reject_sensitive_name(name)
                     except FsToolError:
+                        omitted_count += 1
+                        incomplete = True
                         continue
-                    collected.append("/".join(child_parts))
+                    relative_file = "/".join(child_parts)
+                    if len(relative_file) > PATH_MAX_CHARS:
+                        omitted_count += 1
+                        incomplete = True
+                        continue
+                    collected.append(relative_file)
+                elif entry.is_file:
+                    omitted_count += 1
+                    incomplete = True
             if listing.truncated:
-                return sorted(collected), True, incomplete
-        return sorted(collected), False, incomplete
+                return sorted(collected), True, incomplete, omitted_count
+        return sorted(collected), False, incomplete, omitted_count
 
 
 def _glob_match(pattern: str, name: str, *, relative_path: str | None = None) -> bool:

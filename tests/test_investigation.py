@@ -18,6 +18,7 @@ from inverse_agent.investigation import (
     StopReason,
     ToolCall,
     ToolObservation,
+    _citation_intersects_redaction,
 )
 
 
@@ -74,7 +75,7 @@ def test_negative_answer_cannot_pass_after_incomplete_search(
         return AgentAnswer(
             summary="issue absent",
             findings=("app.py looks normal",),
-            next_actions=(),
+            next_actions=("Review the omitted search scope.",),
             citations=(
                 SourceCitation(
                     observation_id=read.observation_id,
@@ -103,7 +104,7 @@ def test_negative_answer_cannot_pass_after_incomplete_search(
     assert report.stop_reason is StopReason.INCOMPLETE_EVIDENCE
 
 
-def test_negative_answer_cannot_pass_after_retryable_read_refusal(
+def test_unrelated_retryable_read_refusal_does_not_poison_grounded_negative(
     trusted_workspace: tuple[Path, ScopedTrustStore],
 ) -> None:
     workspace, trust = trusted_workspace
@@ -111,9 +112,9 @@ def test_negative_answer_cannot_pass_after_retryable_read_refusal(
     def negative_answer(catalog: tuple[ToolObservation, ...]) -> AgentAnswer:
         read = next(observation for observation in catalog if observation.content_hash)
         return AgentAnswer(
-            summary="missing file means issue absent",
-            findings=("unrelated app.py was readable",),
-            next_actions=(),
+            summary="app.py does not return zero",
+            findings=("app.py returns 42",),
+            next_actions=("Keep the current return value.",),
             citations=(
                 SourceCitation(
                     observation_id=read.observation_id,
@@ -134,12 +135,218 @@ def test_negative_answer_cannot_pass_after_retryable_read_refusal(
     )
     report = InvestigationLoop(planner=planner, trust=trust).run(
         run_id="r-refused-negative",
-        goal="is the missing implementation safe",
+        goal="does app.py return zero",
         workspace=workspace,
     )
     assert report.catalog[0].metadata["refused"] is True
     assert report.catalog[0].incomplete and report.catalog[0].truncated
-    assert report.verdict is InvestigationVerdict.INCOMPLETE
+    assert report.verdict is InvestigationVerdict.PASS
+    assert report.stop_reason is StopReason.FINISHED
+
+
+def test_bounded_read_window_can_support_localized_negative(
+    trusted_workspace: tuple[Path, ScopedTrustStore],
+) -> None:
+    workspace, trust = trusted_workspace
+    (workspace / "long.py").write_text(
+        "\n".join(f"value_{line} = {line}" for line in range(1, 401)) + "\n",
+        encoding="utf-8",
+    )
+
+    def negative_answer(catalog: tuple[ToolObservation, ...]) -> AgentAnswer:
+        read = catalog[0]
+        return AgentAnswer(
+            summary="the cited assignment is not zero",
+            findings=("value_250 is assigned 250",),
+            next_actions=("Keep the assignment unchanged.",),
+            citations=(
+                SourceCitation(
+                    observation_id=read.observation_id,
+                    path=read.path,
+                    start_line=250,
+                    end_line=250,
+                ),
+            ),
+            issue_present=False,
+        )
+
+    planner = ScriptedInvestigationPlanner(
+        steps=(ToolCall(tool="read_file", path="long.py", start_line=250, max_lines=20),),
+        build_answer=negative_answer,
+    )
+    report = InvestigationLoop(planner=planner, trust=trust).run(
+        run_id="r-window-negative",
+        goal="is value_250 assigned zero",
+        workspace=workspace,
+    )
+    assert report.catalog[0].truncated
+    assert not report.catalog[0].incomplete
+    assert report.verdict is InvestigationVerdict.PASS
+
+
+def test_positive_answer_can_pass_over_unrelated_incomplete_catalog(
+    trusted_workspace: tuple[Path, ScopedTrustStore],
+) -> None:
+    workspace, trust = trusted_workspace
+    (workspace / "large.txt").write_text("x" * (1024 * 1024 + 1), encoding="utf-8")
+
+    def positive_answer(catalog: tuple[ToolObservation, ...]) -> AgentAnswer:
+        read = next(observation for observation in catalog if observation.tool == "read_file")
+        return AgentAnswer(
+            summary="app.py returns 42",
+            findings=("the return statement is present",),
+            next_actions=("Keep the return statement.",),
+            citations=(
+                SourceCitation(
+                    observation_id=read.observation_id,
+                    path=read.path,
+                    start_line=2,
+                    end_line=2,
+                ),
+            ),
+            issue_present=True,
+        )
+
+    planner = ScriptedInvestigationPlanner(
+        steps=(
+            ToolCall(tool="search_text", query="never-present"),
+            ToolCall(tool="read_file", path="app.py"),
+        ),
+        build_answer=positive_answer,
+    )
+    report = InvestigationLoop(planner=planner, trust=trust).run(
+        run_id="r-positive-partial",
+        goal="does app.py return 42",
+        workspace=workspace,
+    )
+    assert report.catalog[0].incomplete and report.catalog[0].truncated
+    assert report.verdict is InvestigationVerdict.PASS
+
+
+def test_later_complete_pointer_result_supersedes_earlier_uncertainty(
+    trusted_workspace: tuple[Path, ScopedTrustStore],
+) -> None:
+    workspace, trust = trusted_workspace
+    oversized = workspace / "large.txt"
+    oversized.write_text("x" * (1024 * 1024 + 1), encoding="utf-8")
+
+    class RecoversCoverage:
+        turn = 0
+
+        def decide(self, *, goal: str, catalog: tuple[ToolObservation, ...]) -> Decision:
+            del goal
+            self.turn += 1
+            if self.turn == 1:
+                return ToolCall(tool="search_text", query="return 0")
+            if self.turn == 2:
+                oversized.unlink()
+                return ToolCall(tool="search_text", query="return 0")
+            if self.turn == 3:
+                return ToolCall(tool="read_file", path="app.py")
+            read = next(observation for observation in catalog if observation.tool == "read_file")
+            return AgentAnswer(
+                summary="app.py does not return zero",
+                findings=("the function returns 42",),
+                next_actions=("Keep the current return value.",),
+                citations=(
+                    SourceCitation(
+                        observation_id=read.observation_id,
+                        path=read.path,
+                        start_line=2,
+                        end_line=2,
+                    ),
+                ),
+                issue_present=False,
+            )
+
+    report = InvestigationLoop(planner=RecoversCoverage(), trust=trust).run(
+        run_id="r-recovered-pointer",
+        goal="does app.py return zero",
+        workspace=workspace,
+    )
+    searches = [observation for observation in report.catalog if observation.tool == "search_text"]
+    assert searches[0].incomplete and searches[0].truncated
+    assert not searches[1].incomplete and not searches[1].truncated
+    assert report.verdict is InvestigationVerdict.PASS
+
+
+def test_recursive_list_retry_uses_the_same_uncertainty_scope(
+    trusted_workspace: tuple[Path, ScopedTrustStore],
+) -> None:
+    workspace, trust = trusted_workspace
+
+    class RecoversRecursiveList:
+        turn = 0
+
+        def decide(self, *, goal: str, catalog: tuple[ToolObservation, ...]) -> Decision:
+            del goal
+            self.turn += 1
+            if self.turn == 1:
+                return ToolCall(tool="list_files", path="generated/.", glob="**/*.py")
+            if self.turn == 2:
+                (workspace / "generated").mkdir()
+                return ToolCall(tool="list_files", path="generated/.", glob="**/*.py")
+            if self.turn == 3:
+                return ToolCall(tool="read_file", path="app.py")
+            read = next(observation for observation in catalog if observation.tool == "read_file")
+            return AgentAnswer(
+                summary="app.py does not return zero",
+                findings=("the function returns 42",),
+                next_actions=("Keep the current return value.",),
+                citations=(SourceCitation(read.observation_id, read.path, 2, 2),),
+                issue_present=False,
+            )
+
+    report = InvestigationLoop(planner=RecoversRecursiveList(), trust=trust).run(
+        run_id="r-recovered-recursive-list",
+        goal="does app.py return zero",
+        workspace=workspace,
+    )
+    listings = [observation for observation in report.catalog if observation.tool == "list_files"]
+    assert listings[0].metadata["recursive"] is True
+    assert listings[0].incomplete and listings[0].truncated
+    assert listings[1].metadata["recursive"] is True
+    assert not listings[1].incomplete and not listings[1].truncated
+    assert report.verdict is InvestigationVerdict.PASS
+
+
+def test_literal_none_glob_cannot_supersede_unfiltered_scope(
+    trusted_workspace: tuple[Path, ScopedTrustStore],
+) -> None:
+    workspace, trust = trusted_workspace
+    sensitive = workspace / ".env"
+    sensitive.write_text("TOKEN=secret\n", encoding="utf-8")
+
+    class DifferentScopes:
+        turn = 0
+
+        def decide(self, *, goal: str, catalog: tuple[ToolObservation, ...]) -> Decision:
+            del goal
+            self.turn += 1
+            if self.turn == 1:
+                return ToolCall(tool="list_files", path=".")
+            if self.turn == 2:
+                sensitive.unlink()
+                return ToolCall(tool="list_files", path=".", glob="None")
+            if self.turn == 3:
+                return ToolCall(tool="read_file", path="app.py")
+            read = next(observation for observation in catalog if observation.tool == "read_file")
+            return AgentAnswer(
+                summary="app.py does not return zero",
+                findings=("the function returns 42",),
+                next_actions=("Keep the current return value.",),
+                citations=(SourceCitation(read.observation_id, read.path, 2, 2),),
+                issue_present=False,
+            )
+
+    report = InvestigationLoop(planner=DifferentScopes(), trust=trust).run(
+        run_id="r-distinct-none-glob",
+        goal="does app.py return zero",
+        workspace=workspace,
+    )
+    listings = [observation for observation in report.catalog if observation.tool == "list_files"]
+    assert listings[0].metadata["glob"] is None and listings[0].incomplete
+    assert listings[1].metadata["glob"] == "None" and not listings[1].incomplete
     assert report.stop_reason is StopReason.INCOMPLETE_EVIDENCE
 
 
@@ -243,6 +450,146 @@ def test_unsupported_citation_forces_incomplete(
     report = loop.run(run_id="r1", goal="x", workspace=workspace)
     assert report.verdict is InvestigationVerdict.INCOMPLETE
     assert report.stop_reason is StopReason.UNSUPPORTED_CITATION
+
+
+def test_unsupported_citation_precedes_answer_incompleteness(
+    trusted_workspace: tuple[Path, ScopedTrustStore],
+) -> None:
+    workspace, trust = trusted_workspace
+
+    def incomplete_fabrication(catalog: tuple[ToolObservation, ...]) -> AgentAnswer:
+        del catalog
+        return AgentAnswer(
+            summary="uncertain claim",
+            findings=("fabricated",),
+            next_actions=(),
+            citations=(
+                SourceCitation(
+                    observation_id="obs_fabricated",
+                    path="app.py",
+                    start_line=1,
+                    end_line=1,
+                ),
+            ),
+            complete=False,
+        )
+
+    planner = ScriptedInvestigationPlanner(
+        steps=(ToolCall(tool="read_file", path="app.py"),),
+        build_answer=incomplete_fabrication,
+    )
+    report = InvestigationLoop(planner=planner, trust=trust).run(
+        run_id="r-invalid-incomplete",
+        goal="inspect app",
+        workspace=workspace,
+    )
+    assert report.verdict is InvestigationVerdict.INCOMPLETE
+    assert report.stop_reason is StopReason.UNSUPPORTED_CITATION
+
+
+def test_each_finding_requires_a_corresponding_citation(
+    trusted_workspace: tuple[Path, ScopedTrustStore],
+) -> None:
+    workspace, trust = trusted_workspace
+
+    def floating_finding(catalog: tuple[ToolObservation, ...]) -> AgentAnswer:
+        grounded = _cite_first_line(catalog)
+        return AgentAnswer(
+            summary="two claims",
+            findings=("grounded", "floating"),
+            next_actions=("Investigate both claims.",),
+            citations=grounded.citations,
+        )
+
+    planner = ScriptedInvestigationPlanner(
+        steps=(ToolCall(tool="read_file", path="app.py"),),
+        build_answer=floating_finding,
+    )
+    report = InvestigationLoop(planner=planner, trust=trust).run(
+        run_id="r-floating-finding",
+        goal="inspect app",
+        workspace=workspace,
+    )
+    assert report.stop_reason is StopReason.UNSUPPORTED_CITATION
+    assert "each finding" in report.error
+
+
+def test_empty_substantive_answer_is_rejected(
+    trusted_workspace: tuple[Path, ScopedTrustStore],
+) -> None:
+    workspace, trust = trusted_workspace
+
+    def empty_summary(catalog: tuple[ToolObservation, ...]) -> AgentAnswer:
+        grounded = _cite_first_line(catalog)
+        return AgentAnswer(
+            summary="",
+            findings=grounded.findings,
+            next_actions=(),
+            citations=grounded.citations,
+        )
+
+    planner = ScriptedInvestigationPlanner(
+        steps=(ToolCall(tool="read_file", path="app.py"),),
+        build_answer=empty_summary,
+    )
+    report = InvestigationLoop(planner=planner, trust=trust).run(
+        run_id="r-empty-answer",
+        goal="inspect app",
+        workspace=workspace,
+    )
+    assert report.stop_reason is StopReason.UNSUPPORTED_CITATION
+    assert "summary is empty" in report.error
+
+
+def test_citation_intersecting_redacted_line_is_rejected(tmp_path: Path) -> None:
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    (workspace / "config.py").write_text(
+        "safe = 1\napi_key=sk_live_0123456789abcdef\nafter = 2\n",
+        encoding="utf-8",
+    )
+    trust = ScopedTrustStore(tmp_path / "att.sqlite")
+    trust.grant(workspace, AttestationScope.SOURCE_READ, granted_by="tester")
+
+    def cite_secret(catalog: tuple[ToolObservation, ...]) -> AgentAnswer:
+        read = catalog[0]
+        return AgentAnswer(
+            summary="secret claim",
+            findings=("the source contains a credential",),
+            next_actions=("Rotate the credential outside this tool.",),
+            citations=(SourceCitation(read.observation_id, read.path, 2, 2),),
+        )
+
+    planner = ScriptedInvestigationPlanner(
+        steps=(ToolCall(tool="read_file", path="config.py"),),
+        build_answer=cite_secret,
+    )
+    report = InvestigationLoop(planner=planner, trust=trust).run(
+        run_id="r-redacted-citation",
+        goal="inspect config",
+        workspace=workspace,
+    )
+    assert report.stop_reason is StopReason.UNSUPPORTED_CITATION
+    assert "redacted" in report.error
+
+
+def test_huge_citation_range_redaction_check_is_bounded() -> None:
+    observation = ToolObservation(
+        observation_id="obs_mask",
+        tool="read_file",
+        path="config.py",
+        content_hash="h",
+        text="[REDACTED_SECRET]",
+        lines=("1: [REDACTED_SECRET]",),
+        metadata={"redacted_lines": (1,)},
+    )
+    citation = SourceCitation(
+        observation_id=observation.observation_id,
+        path=observation.path,
+        start_line=1,
+        end_line=10**12,
+    )
+    assert _citation_intersects_redaction(observation, citation)
 
 
 def test_citation_outside_returned_range_forces_incomplete(

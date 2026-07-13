@@ -14,7 +14,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import StrEnum
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Protocol
 
 from inverse_agent.attestations import AttestationScope, ScopedTrustStore
@@ -186,6 +186,28 @@ def _line_body(numbered: str) -> str:
     return body
 
 
+def _redacted_lines(observation: ToolObservation) -> frozenset[int]:
+    raw = observation.metadata.get("redacted_lines", ())
+    if not isinstance(raw, list | tuple):
+        return frozenset()
+    return frozenset(item for item in raw if isinstance(item, int) and item >= 1)
+
+
+def _citation_intersects_redaction(observation: ToolObservation, citation: SourceCitation) -> bool:
+    redacted = _redacted_lines(observation)
+    return any(citation.start_line <= line <= citation.end_line for line in redacted)
+
+
+def _canonical_request_path(raw_path: str) -> str:
+    normalized = raw_path.replace("\\", "/")
+    parts = tuple(part for part in PurePosixPath(normalized).parts if part not in ("", "."))
+    return "/".join(parts) or "."
+
+
+def _optional_scope_text(value: object) -> str | None:
+    return value if isinstance(value, str) else None
+
+
 def _is_evidence(observation: ToolObservation) -> bool:
     """Only a real, non-refusal ``read_file`` observation with content is citable.
 
@@ -203,13 +225,28 @@ def _is_evidence(observation: ToolObservation) -> bool:
         return False
     if not observation.content_hash:
         return False
-    # A blank or entirely-redacted window carries no citable evidence.
-    return any(_line_body(line).strip() for line in observation.lines)
+    # A blank or entirely-redacted window carries no citable evidence. A whole
+    # line touched by a redaction span is non-citable even when safe text remains
+    # beside the marker, because the omitted bytes may change its meaning.
+    redacted = _redacted_lines(observation)
+    for offset, numbered in enumerate(observation.lines):
+        line_number = observation.start_line + offset
+        if line_number not in redacted and _line_body(numbered).strip():
+            return True
+    return False
 
 
 def _validate_citations(answer: AgentAnswer, catalog: tuple[ToolObservation, ...]) -> str | None:
     """Return an error string if any citation is unsupported, else None."""
 
+    if not answer.summary.strip():
+        return "final answer summary is empty"
+    if not answer.findings or any(not finding.strip() for finding in answer.findings):
+        return "final answer must contain non-empty findings"
+    if not answer.next_actions or any(not action.strip() for action in answer.next_actions):
+        return "final answer must contain non-empty recommended next actions"
+    if len(answer.findings) != len(answer.citations):
+        return "each finding must have one positionally corresponding citation"
     # Refusals, empty results, and binary observations are not citable evidence.
     by_id = {obs.observation_id: obs for obs in catalog if _is_evidence(obs)}
     if not answer.citations:
@@ -226,12 +263,57 @@ def _validate_citations(answer: AgentAnswer, catalog: tuple[ToolObservation, ...
         max_line = observation.start_line + len(observation.lines) - 1
         if citation.start_line < observation.start_line or citation.end_line > max_line:
             return "citation line range is outside the returned observation"
+        if _citation_intersects_redaction(observation, citation):
+            return "citation intersects a redacted source line"
         # The cited lines themselves must contain real (non-blank) content.
         lo = citation.start_line - observation.start_line
         hi = citation.end_line - observation.start_line + 1
         if not any(_line_body(line).strip() for line in observation.lines[lo:hi]):
             return "citation resolves only to blank or redacted content"
     return None
+
+
+def _has_unresolved_negative_uncertainty(
+    answer: AgentAnswer, catalog: tuple[ToolObservation, ...]
+) -> bool:
+    """Whether current evidence can support the answer's negative conclusion.
+
+    Catalog tools establish the explored scope, so only their latest result for
+    the same request matters: a complete retry supersedes an earlier omission.
+    Read windows are localized evidence rather than whole-repository coverage;
+    truncation alone is acceptable when the cited lines are visible, but the
+    latest read of a cited path may not be refused, redacted, or incomplete.
+    """
+
+    latest_pointers: dict[tuple[object, ...], ToolObservation] = {}
+    for observation in catalog:
+        if observation.tool == "list_files":
+            scope: tuple[object, ...] = (
+                observation.tool,
+                observation.path,
+                _optional_scope_text(observation.metadata.get("glob")),
+                bool(observation.metadata.get("recursive")),
+            )
+            latest_pointers[scope] = observation
+        elif observation.tool == "search_text":
+            scope = (
+                observation.tool,
+                _optional_scope_text(observation.metadata.get("query")),
+                _optional_scope_text(observation.metadata.get("glob")),
+            )
+            latest_pointers[scope] = observation
+    if any(obs.incomplete or obs.truncated for obs in latest_pointers.values()):
+        return True
+
+    cited_paths = {citation.path for citation in answer.citations}
+    latest_reads: dict[str, ToolObservation] = {}
+    for observation in catalog:
+        if observation.tool == "read_file" and observation.path in cited_paths:
+            latest_reads[observation.path] = observation
+    return any(
+        observation.incomplete or bool(observation.metadata.get("refused"))
+        for observation in latest_reads.values()
+    )
 
 
 class InvestigationLoop:
@@ -342,25 +424,6 @@ class InvestigationLoop:
             decisions += 1
 
             if isinstance(decision, AgentAnswer):
-                uncertain_catalog = any(
-                    observation.incomplete or observation.truncated for observation in catalog
-                )
-                if not decision.complete or (not decision.issue_present and uncertain_catalog):
-                    return self._finish(
-                        run_id,
-                        InvestigationVerdict.INCOMPLETE,
-                        StopReason.INCOMPLETE_EVIDENCE,
-                        decision,
-                        catalog,
-                        decisions,
-                        tool_calls,
-                        physical,
-                        error=(
-                            "final answer declared itself incomplete"
-                            if not decision.complete
-                            else "an incomplete observation cannot support a negative conclusion"
-                        ),
-                    )
                 citation_error = _validate_citations(decision, tuple(catalog))
                 if citation_error is not None:
                     return self._finish(
@@ -373,6 +436,26 @@ class InvestigationLoop:
                         tool_calls,
                         physical,
                         error=citation_error,
+                    )
+                unresolved_uncertainty = (
+                    not decision.issue_present
+                    and _has_unresolved_negative_uncertainty(decision, tuple(catalog))
+                )
+                if not decision.complete or unresolved_uncertainty:
+                    return self._finish(
+                        run_id,
+                        InvestigationVerdict.INCOMPLETE,
+                        StopReason.INCOMPLETE_EVIDENCE,
+                        decision,
+                        catalog,
+                        decisions,
+                        tool_calls,
+                        physical,
+                        error=(
+                            "final answer declared itself incomplete"
+                            if not decision.complete
+                            else "unresolved evidence omissions cannot support a negative conclusion"
+                        ),
                     )
                 return self._finish(
                     run_id,
@@ -462,12 +545,25 @@ class InvestigationLoop:
                 observation = ToolObservation(
                     observation_id=f"obs_error_{tool_calls}",
                     tool=decision.tool,
-                    path=decision.path,
+                    path=(
+                        "."
+                        if decision.tool == "search_text"
+                        else _canonical_request_path(decision.path)
+                    ),
                     content_hash="",
                     text=f"[refused] {message}",
                     truncated=True,
                     incomplete=True,
-                    metadata={"refused": True},
+                    metadata={
+                        "refused": True,
+                        "query": decision.query,
+                        "glob": decision.glob,
+                        "recursive": (
+                            decision.tool == "list_files"
+                            and decision.glob is not None
+                            and "**" in decision.glob
+                        ),
+                    },
                 )
             # A strict-decode refusal surfaced during a search also forces INCOMPLETE.
             if observation.metadata.get("decode_refused"):

@@ -11,6 +11,7 @@ from inverse_agent.fs_tools import ToolObservation
 from inverse_agent.investigation import AgentAnswer, ToolCall
 from inverse_agent.investigation_model import (
     ModelInvestigationPlanner,
+    _parse_decision,
     _render_catalog,
 )
 from inverse_agent.planner import (
@@ -215,6 +216,26 @@ def test_parse_final_answer_preserves_explicit_incomplete() -> None:
     assert decision.complete is False
 
 
+def test_parse_final_answer_requires_complete_field() -> None:
+    payload = _base("final_answer", summary="partial", findings=["uncertain"])
+    del payload["complete"]
+    with pytest.raises(KeyError, match="complete"):
+        _parse_decision(payload)
+
+
+@pytest.mark.parametrize("field", ["complete", "condition_holds"])
+def test_parse_final_answer_requires_exact_boolean_fields(field: str) -> None:
+    missing = _base("final_answer", summary="done", findings=["grounded"])
+    del missing[field]
+    with pytest.raises(KeyError, match=field):
+        _parse_decision(missing)
+
+    wrong_type = _base("final_answer", summary="done", findings=["grounded"])
+    wrong_type[field] = "false"
+    with pytest.raises(TypeError, match="JSON booleans"):
+        _parse_decision(wrong_type)
+
+
 def test_large_read_is_fully_rendered_not_dropped() -> None:
     # A 200-line read (~ up to 12k chars) must be rendered in full and citable,
     # even alongside other observations - never dropped for lack of catalog room.
@@ -308,6 +329,24 @@ def test_render_marks_fully_shown_read_as_citable() -> None:
     assert ids == frozenset({"obs_full"})
 
 
+def test_render_marks_redacted_lines_non_citable() -> None:
+    obs = ToolObservation(
+        observation_id="obs_redacted",
+        tool="read_file",
+        path="config.py",
+        content_hash="h",
+        text="safe\n[REDACTED_SECRET]",
+        lines=("1: safe", "2: [REDACTED_SECRET]"),
+        start_line=1,
+        incomplete=True,
+        redacted=True,
+        metadata={"redacted_lines": (2,)},
+    )
+    text, ids = _render_catalog((obs,))
+    assert "2: [REDACTED_SECRET] [NON-CITABLE: REDACTED LINE]" in text
+    assert ids == frozenset({"obs_redacted"})
+
+
 def test_repair_only_binds_to_rendered_observation() -> None:
     # A read observation exists but was NOT rendered (not in rendered_ids); a
     # citation that mis-ids it must not be repaired to it.
@@ -332,6 +371,30 @@ def test_repair_only_binds_to_rendered_observation() -> None:
     )
     repaired = _repair_citations(answer, (obs,), frozenset())
     # Not rebound, because obs_hidden was not rendered to the model.
+    assert repaired.citations[0].observation_id == "wrong-id"
+
+
+def test_repair_does_not_bind_to_redacted_line() -> None:
+    from inverse_agent.investigation import AgentAnswer as _Answer
+    from inverse_agent.investigation import SourceCitation as _Cite
+    from inverse_agent.investigation_model import _repair_citations
+
+    obs = ToolObservation(
+        observation_id="obs_redacted",
+        tool="read_file",
+        path="config.py",
+        content_hash="h",
+        text="safe\n[REDACTED_SECRET]",
+        lines=("1: safe", "2: [REDACTED_SECRET]"),
+        metadata={"redacted_lines": (2,)},
+    )
+    answer = _Answer(
+        summary="s",
+        findings=("f",),
+        next_actions=(),
+        citations=(_Cite("wrong-id", "config.py", 2, 2),),
+    )
+    repaired = _repair_citations(answer, (obs,), frozenset({"obs_redacted"}))
     assert repaired.citations[0].observation_id == "wrong-id"
 
 

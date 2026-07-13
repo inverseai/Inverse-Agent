@@ -97,7 +97,7 @@ def test_scorer_rejects_contrary_conclusion(tmp_path: Path) -> None:
         return AgentAnswer(
             summary="Looks fine.",
             findings=("No activity is exported.",),
-            next_actions=(),
+            next_actions=("Keep the manifest unchanged.",),
             citations=(SourceCitation(obs.observation_id, obs.path, line, line),),
             issue_present=False,
         )
@@ -123,7 +123,7 @@ def test_scorer_rejects_empty_findings(tmp_path: Path) -> None:
 
     passed, reason = _run_with_answer(case, tmp_path, empty)
     assert not passed
-    assert "empty" in reason
+    assert "unsupported_citation" in reason
 
 
 def test_scorer_accepts_correct_grounded_answer(tmp_path: Path) -> None:

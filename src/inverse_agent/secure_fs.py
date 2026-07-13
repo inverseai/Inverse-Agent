@@ -29,6 +29,10 @@ class SecureFsPolicyError(SecureFsError):
     """A link, reparse point, alias, or identity change was refused."""
 
 
+class SecureFsWorkspacePolicyError(SecureFsPolicyError):
+    """The retained workspace root was replaced or became unsafe."""
+
+
 class SecureFsDeadlineError(SecureFsError):
     """The bounded filesystem operation exceeded its deadline."""
 
@@ -59,6 +63,7 @@ class SecureListing:
     entries: tuple[SecureEntry, ...]
     visited: int
     refused: int
+    filtered: int
     truncated: bool
 
 
@@ -192,6 +197,7 @@ class SecureWorkspace:
             result: list[SecureEntry] = []
             visited = 0
             refused_count = 0
+            filtered_count = 0
             truncated = False
             try:
                 with os.scandir(descriptor) as scan:
@@ -226,12 +232,14 @@ class SecureWorkspace:
                             if stat.S_ISLNK(refused.st_mode) or not (
                                 stat.S_ISDIR(refused.st_mode) or stat.S_ISREG(refused.st_mode)
                             ):
+                                filtered_count += 1
                                 continue
                             refused_count += 1
                             continue
                         try:
                             entry = _posix_entry(child, name)
                             if not (entry.is_dir or entry.is_file):
+                                filtered_count += 1
                                 continue
                             result.append(entry)
                         finally:
@@ -241,7 +249,13 @@ class SecureWorkspace:
                 raise
             except OSError as exc:
                 raise SecureFsError("directory could not be listed") from exc
-            return SecureListing(tuple(result), visited, refused_count, truncated)
+            return SecureListing(
+                entries=tuple(result),
+                visited=visited,
+                refused=refused_count,
+                filtered=filtered_count,
+                truncated=truncated,
+            )
 
     @contextlib.contextmanager
     def _posix_target(
@@ -254,7 +268,7 @@ class SecureWorkspace:
         with _posix_root(self.workspace) as root:
             root_entry = _posix_entry(root, self.workspace.name)
             if root_entry.identity != self.root_identity:
-                raise SecureFsPolicyError("workspace root was replaced")
+                raise SecureFsWorkspacePolicyError("workspace root was replaced")
             current = root
             owned: list[int] = []
             try:
@@ -321,6 +335,7 @@ class SecureWorkspace:
             result: list[SecureEntry] = []
             visited = 0
             refused_count = 0
+            filtered_count = 0
             truncated = False
             for name, attributes in _windows_directory_names(directory, deadline=deadline):
                 _check_deadline(deadline)
@@ -329,7 +344,13 @@ class SecureWorkspace:
                     visited = maximum_visits
                     truncated = True
                     break
-                if name in {".", ".."} or attributes & _FILE_ATTRIBUTE_REPARSE_POINT:
+                if name is None:
+                    filtered_count += 1
+                    continue
+                if name in {".", ".."}:
+                    continue
+                if attributes & _FILE_ATTRIBUTE_REPARSE_POINT:
+                    filtered_count += 1
                     continue
                 expect_directory = bool(attributes & _FILE_ATTRIBUTE_DIRECTORY)
                 try:
@@ -343,9 +364,16 @@ class SecureWorkspace:
                     refused_count += 1
                     continue
                 if not (entry.is_dir or entry.is_file):
+                    filtered_count += 1
                     continue
                 result.append(entry)
-            return SecureListing(tuple(result), visited, refused_count, truncated)
+            return SecureListing(
+                entries=tuple(result),
+                visited=visited,
+                refused=refused_count,
+                filtered=filtered_count,
+                truncated=truncated,
+            )
 
     @contextlib.contextmanager
     def _windows_target(
@@ -358,7 +386,7 @@ class SecureWorkspace:
         with _windows_root(self.workspace) as root:
             root_entry = _windows_entry(root, self.workspace.name)
             if root_entry.identity != self.root_identity:
-                raise SecureFsPolicyError("workspace root was replaced")
+                raise SecureFsWorkspacePolicyError("workspace root was replaced")
             current = root
             owned: list[int] = []
             try:
@@ -410,6 +438,10 @@ def _posix_root(workspace: Path) -> Iterator[int]:
     try:
         descriptor = os.open(workspace, flags)
     except OSError as exc:
+        if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+            raise SecureFsWorkspacePolicyError(
+                "workspace root was replaced or became a symlink/reparse point"
+            ) from exc
         raise SecureFsError("workspace root is no longer accessible") from exc
     try:
         yield descriptor
@@ -543,9 +575,14 @@ def _windows_root(workspace: Path) -> Iterator[int]:
     if value == _INVALID_HANDLE_VALUE:
         raise SecureFsError("workspace root is no longer accessible")
     try:
-        entry = _windows_entry(value, workspace.name)
+        try:
+            entry = _windows_entry(value, workspace.name)
+        except SecureFsPolicyError as exc:
+            raise SecureFsWorkspacePolicyError(
+                "workspace root became a symlink or reparse point"
+            ) from exc
         if not entry.is_dir:
-            raise SecureFsPolicyError("workspace root is not a directory")
+            raise SecureFsWorkspacePolicyError("workspace root is not a directory")
         yield value
     finally:
         _close_windows(value)
@@ -696,11 +733,20 @@ def _windows_read(handle: int, *, maximum_bytes: int, deadline: float) -> bytes:
         remaining -= count.value
     data = b"".join(chunks)
     if len(data) > maximum_bytes:
-        raise SecureFsError("file exceeds the maximum readable size")
+        raise SecureFsTooLargeError("file exceeds the maximum readable size")
     return data
 
 
-def _windows_directory_names(handle: int, *, deadline: float) -> Iterator[tuple[str, int]]:
+def _decode_windows_directory_name(raw_name: bytes) -> str | None:
+    """Decode one NTFS name without aborting the surrounding directory scan."""
+
+    try:
+        return raw_name.decode("utf-16-le", errors="strict")
+    except UnicodeDecodeError:
+        return None
+
+
+def _windows_directory_names(handle: int, *, deadline: float) -> Iterator[tuple[str | None, int]]:
     kernel32, _ntdll = _windows_api()
     get_info = kernel32.GetFileInformationByHandleEx
     get_info.argtypes = [wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD]
@@ -725,10 +771,7 @@ def _windows_directory_names(handle: int, *, deadline: float) -> Iterator[tuple[
             )
             start = offset + _FILE_ID_BOTH_DIR_INFO.FileName.offset
             end = start + int(header.FileNameLength)
-            try:
-                name = buffer.raw[start:end].decode("utf-16-le", errors="strict")
-            except UnicodeDecodeError as exc:
-                raise SecureFsError("directory entry name is not valid Unicode") from exc
+            name = _decode_windows_directory_name(buffer.raw[start:end])
             yield name, int(header.FileAttributes)
             if header.NextEntryOffset == 0:
                 break
