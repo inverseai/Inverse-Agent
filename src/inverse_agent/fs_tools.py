@@ -21,7 +21,7 @@ import re
 import secrets
 import time
 from bisect import bisect_left
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from fnmatch import fnmatchcase
 from pathlib import Path, PurePosixPath
 
@@ -360,6 +360,11 @@ class WorkspaceReader:
         """Return a run-local opaque file identity that is never model-visible."""
 
         return self._identity_by_observation.get(observation_id)
+
+    def with_active_deadline(self, active_deadline: float) -> WorkspaceReader:
+        """Return the same run-bound reader with an extended active deadline."""
+
+        return replace(self, active_deadline=active_deadline)
 
     def _remember_identity(self, observation_id: str, identity: tuple[int, int]) -> None:
         raw = f"{self.secure.root_identity[0]}:{self.secure.root_identity[1]}:{identity[0]}:{identity[1]}"

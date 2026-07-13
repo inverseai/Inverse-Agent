@@ -30,14 +30,11 @@ class ToolResult:
 class ToolchainAdapter(Protocol):
     domain: Domain
 
-    def detect(self, root: Path) -> bool:
-        ...
+    def detect(self, root: Path) -> bool: ...
 
-    def profile(self, root: Path) -> WorkspaceProfile:
-        ...
+    def profile(self, root: Path) -> WorkspaceProfile: ...
 
-    def tools(self) -> list[Tool]:
-        ...
+    def tools(self) -> list[Tool]: ...
 
 
 class CommandAdapter:
@@ -50,6 +47,7 @@ class CommandAdapter:
         argv: list[str],
         *,
         approval_token: str | None = None,
+        approval_challenge_id: str | None = None,
     ) -> CommandResult:
         return runner.run(
             CommandRequest(
@@ -57,5 +55,6 @@ class CommandAdapter:
                 cwd=workspace,
                 domain=self.domain,
                 approval_token=approval_token,
+                approval_challenge_id=approval_challenge_id,
             )
         )

@@ -24,6 +24,7 @@ class ApprovalError(ValueError):
 @dataclass(frozen=True)
 class ApprovalClaims:
     approval_id: str
+    challenge_id: str
     action_digest: str
     rule: str
     workspace: str
@@ -106,14 +107,20 @@ class ApprovalAuthority:
         rule: CommandRule,
         argv: tuple[str, ...],
         approved_by: str,
+        challenge_id: str,
         ttl_seconds: int = 300,
         now: int | None = None,
     ) -> tuple[str, ApprovalClaims]:
         if ttl_seconds <= 0 or ttl_seconds > 3600:
             raise ValueError("approval ttl must be between 1 and 3600 seconds")
+        if len(challenge_id) != 32 or any(
+            character not in "0123456789abcdef" for character in challenge_id
+        ):
+            raise ValueError("approval challenge_id must be 32 lowercase hexadecimal characters")
         issued_at = int(time.time() if now is None else now)
         claims = ApprovalClaims(
             approval_id=token_hex(16),
+            challenge_id=challenge_id,
             action_digest=action_digest(
                 workspace=workspace,
                 domain=domain,
@@ -140,6 +147,7 @@ class ApprovalAuthority:
         domain: Domain,
         rule: CommandRule,
         argv: tuple[str, ...],
+        expected_challenge_id: str,
         now: int | None = None,
         consume: bool = True,
     ) -> ApprovalClaims:
@@ -158,6 +166,16 @@ class ApprovalAuthority:
         current_time = int(time.time() if now is None else now)
         if claims.expires_at <= current_time:
             raise ApprovalError("approval capability expired")
+        if len(claims.challenge_id) != 32 or any(
+            character not in "0123456789abcdef" for character in claims.challenge_id
+        ):
+            raise ApprovalError("approval capability has an invalid challenge identity")
+        if len(expected_challenge_id) != 32 or any(
+            character not in "0123456789abcdef" for character in expected_challenge_id
+        ):
+            raise ApprovalError("approval request has an invalid challenge identity")
+        if not hmac.compare_digest(claims.challenge_id, expected_challenge_id):
+            raise ApprovalError("approval capability does not match the current challenge")
         expected_digest = action_digest(
             workspace=workspace,
             domain=domain,

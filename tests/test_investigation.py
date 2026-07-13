@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import time
 from pathlib import Path
 
 import pytest
@@ -13,6 +14,7 @@ from inverse_agent.fs_tools import FsToolError, WorkspaceReader
 from inverse_agent.investigation import (
     AgentAnswer,
     AgentBudget,
+    CommandExecution,
     Decision,
     InvestigationLoop,
     InvestigationVerdict,
@@ -68,6 +70,13 @@ def test_loop_passes_with_valid_citation(
     assert report.verdict is InvestigationVerdict.PASS
     assert report.stop_reason is StopReason.FINISHED
     assert report.tool_calls_used == 1
+
+
+def test_default_budget_matches_live_production_contract() -> None:
+    budget = AgentBudget()
+    assert budget.max_decisions == 20
+    assert budget.max_tool_calls == 16
+    assert budget.max_physical_requests == 30
 
 
 def test_negative_answer_cannot_pass_after_incomplete_search(
@@ -579,6 +588,33 @@ def test_unsupported_citation_precedes_answer_incompleteness(
     )
     report = InvestigationLoop(planner=planner, trust=trust).run(
         run_id="r-invalid-incomplete",
+        goal="inspect app",
+        workspace=workspace,
+    )
+    assert report.verdict is InvestigationVerdict.INCOMPLETE
+    assert report.stop_reason is StopReason.UNSUPPORTED_CITATION
+
+
+def test_unsupported_citation_precedes_malformed_answer_structure(
+    trusted_workspace: tuple[Path, ScopedTrustStore],
+) -> None:
+    workspace, trust = trusted_workspace
+
+    def malformed_fabrication(catalog: tuple[ToolObservation, ...]) -> AgentAnswer:
+        del catalog
+        return AgentAnswer(
+            summary="",
+            findings=("fabricated",),
+            next_actions=("Gather valid evidence before concluding.",),
+            citations=(SourceCitation("obs_fabricated", "app.py", 1, 1),),
+        )
+
+    planner = ScriptedInvestigationPlanner(
+        steps=(ToolCall(tool="read_file", path="app.py"),),
+        build_answer=malformed_fabrication,
+    )
+    report = InvestigationLoop(planner=planner, trust=trust).run(
+        run_id="r-invalid-malformed",
         goal="inspect app",
         workspace=workspace,
     )
@@ -1151,7 +1187,10 @@ def test_strict_decode_refusal_is_incomplete(tmp_path: Path) -> None:
     assert report.stop_reason is StopReason.STRICT_DECODE_REFUSAL
 
 
-def test_source_read_revoked_mid_run_stops_reads(tmp_path: Path) -> None:
+def test_source_read_revoked_after_read_stops_next_model_decision(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     workspace = tmp_path / "ws"
     workspace.mkdir()
     (workspace / "a.py").write_text("x = 1\n", encoding="utf-8")
@@ -1159,22 +1198,39 @@ def test_source_read_revoked_mid_run_stops_reads(tmp_path: Path) -> None:
     trust = ScopedTrustStore(tmp_path / "att.sqlite")
     trust.grant(workspace, AttestationScope.SOURCE_READ, granted_by="tester")
 
-    class RevokeAfterFirst:
+    class RecordingPlanner:
         def __init__(self) -> None:
             self.calls = 0
+            self.catalogs: list[tuple[ToolObservation, ...]] = []
 
         def decide(self, *, goal: str, catalog: tuple[ToolObservation, ...]) -> Decision:
-            del goal, catalog
+            del goal
             self.calls += 1
+            self.catalogs.append(catalog)
             if self.calls == 1:
                 return ToolCall(tool="read_file", path="a.py")
-            trust.revoke(workspace, AttestationScope.SOURCE_READ)
             return ToolCall(tool="read_file", path="b.py")
 
-    loop = InvestigationLoop(planner=RevokeAfterFirst(), trust=trust)
+    original_has_scope = trust.has_scope
+    scope_checks = 0
+
+    def revoke_after_dispatch_check(path: Path, scope: AttestationScope) -> bool:
+        nonlocal scope_checks
+        scope_checks += 1
+        allowed = original_has_scope(path, scope)
+        if scope_checks == 3 and allowed:
+            trust.revoke(workspace, AttestationScope.SOURCE_READ)
+        return allowed
+
+    monkeypatch.setattr(trust, "has_scope", revoke_after_dispatch_check)
+    planner = RecordingPlanner()
+    loop = InvestigationLoop(planner=planner, trust=trust)
     report = loop.run(run_id="r1", goal="x", workspace=workspace)
     assert report.verdict is InvestigationVerdict.INCOMPLETE
     assert report.stop_reason is StopReason.NOT_ATTESTED
+    assert planner.calls == 1
+    assert planner.catalogs == [()]
+    assert [item.path for item in report.catalog] == ["a.py"]
 
 
 def test_budget_validation_rejects_inconsistent() -> None:
@@ -1222,7 +1278,11 @@ def test_budget_override_above_ceiling_rejected() -> None:
 
 def test_budget_validation_preserves_completion_escrow() -> None:
     with pytest.raises(ValueError, match="1024 tokens per decision"):
-        AgentBudget(max_decisions=12, max_completion_tokens=12_287).validate()
+        AgentBudget(
+            max_decisions=12,
+            max_tool_calls=10,
+            max_completion_tokens=12_287,
+        ).validate()
 
 
 def test_observation_byte_budget_stops_before_model_egress(
@@ -1450,3 +1510,256 @@ def test_citation_to_empty_search_is_rejected(tmp_path: Path) -> None:
     report = loop.run(run_id="r1", goal="x", workspace=workspace)
     assert report.verdict is InvestigationVerdict.INCOMPLETE
     assert report.stop_reason is StopReason.UNSUPPORTED_CITATION
+
+
+class _FakeCommandExecutor:
+    def __init__(self, *, mismatched: bool = False) -> None:
+        self.calls = 0
+        self.mismatched = mismatched
+
+    def execute(
+        self,
+        call: ToolCall,
+        *,
+        run_id: str,
+        active_deadline: float,
+    ) -> CommandExecution:
+        del run_id, active_deadline
+        self.calls += 1
+        command = call.command or ""
+        path = "command/wrong" if self.mismatched else f"command/{command}"
+        return CommandExecution(
+            observation=ToolObservation(
+                observation_id=f"obs_command_{self.calls}",
+                tool="run_command",
+                path=path,
+                content_hash="hash",
+                text="HEAD commit: abcdef",
+                lines=("1: HEAD commit: abcdef",),
+                metadata={
+                    "citable_command": True,
+                    "command_name": command,
+                    "evidence_identity": f"approved-command-identity-{self.calls}",
+                },
+            )
+        )
+
+
+def _cite_command(catalog: tuple[ToolObservation, ...]) -> AgentAnswer:
+    observation = catalog[0]
+    return AgentAnswer(
+        summary="HEAD was resolved.",
+        findings=("HEAD resolves to a commit.",),
+        next_actions=("Inspect the commit.",),
+        citations=(
+            SourceCitation(
+                observation.observation_id,
+                observation.path,
+                observation.start_line,
+                observation.start_line,
+            ),
+        ),
+    )
+
+
+def test_typed_command_evidence_requires_both_scopes_and_is_citable(tmp_path: Path) -> None:
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    trust = ScopedTrustStore(tmp_path / "att.sqlite")
+    trust.grant(workspace, AttestationScope.SOURCE_READ, granted_by="tester")
+    trust.grant(workspace, AttestationScope.CODE_EXECUTION, granted_by="tester")
+    executor = _FakeCommandExecutor()
+    planner = ScriptedInvestigationPlanner(
+        steps=(ToolCall(tool="run_command", command="generic.head_commit"),),
+        build_answer=_cite_command,
+    )
+    report = InvestigationLoop(
+        planner=planner,
+        trust=trust,
+        command_executor=executor,
+    ).run(run_id="command", goal="resolve HEAD", workspace=workspace)
+    assert report.verdict is InvestigationVerdict.PASS
+    assert executor.calls == 1
+    assert report.command_calls_used == 1
+
+
+def test_command_budget_stops_before_a_fifth_dispatch(tmp_path: Path) -> None:
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    trust = ScopedTrustStore(tmp_path / "att.sqlite")
+    trust.grant(workspace, AttestationScope.SOURCE_READ, granted_by="tester")
+    trust.grant(workspace, AttestationScope.CODE_EXECUTION, granted_by="tester")
+    executor = _FakeCommandExecutor()
+    planner = ScriptedInvestigationPlanner(
+        steps=tuple(
+            ToolCall(tool="run_command", command=f"generic.command_{index}") for index in range(5)
+        ),
+        build_answer=_cite_command,
+    )
+    report = InvestigationLoop(
+        planner=planner,
+        trust=trust,
+        command_executor=executor,
+        budget=AgentBudget(max_decisions=6, max_tool_calls=6, max_command_calls=4),
+    ).run(run_id="command-cap", goal="run five commands", workspace=workspace)
+
+    assert report.verdict is InvestigationVerdict.INCOMPLETE
+    assert report.stop_reason is StopReason.BUDGET_EXHAUSTED
+    assert report.command_calls_used == 4
+    assert report.tool_calls_used == 4
+    assert executor.calls == 4
+    assert "command-call" in report.error
+
+
+def test_failed_command_dispatches_consume_command_budget(tmp_path: Path) -> None:
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    trust = ScopedTrustStore(tmp_path / "att.sqlite")
+    trust.grant(workspace, AttestationScope.SOURCE_READ, granted_by="tester")
+    trust.grant(workspace, AttestationScope.CODE_EXECUTION, granted_by="tester")
+
+    class FailingExecutor:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def execute(
+            self,
+            call: ToolCall,
+            *,
+            run_id: str,
+            active_deadline: float,
+        ) -> CommandExecution:
+            del call, run_id, active_deadline
+            self.calls += 1
+            raise FsToolError("command dispatch failed")
+
+    executor = FailingExecutor()
+    planner = ScriptedInvestigationPlanner(
+        steps=tuple(
+            ToolCall(tool="run_command", command=f"generic.command_{index}") for index in range(5)
+        ),
+        build_answer=_cite_command,
+    )
+    report = InvestigationLoop(
+        planner=planner,
+        trust=trust,
+        command_executor=executor,
+        budget=AgentBudget(max_decisions=6, max_tool_calls=6, max_command_calls=4),
+    ).run(run_id="failed-command-cap", goal="attempt five commands", workspace=workspace)
+
+    assert report.verdict is InvestigationVerdict.INCOMPLETE
+    assert report.stop_reason is StopReason.BUDGET_EXHAUSTED
+    assert report.command_calls_used == 4
+    assert report.tool_calls_used == 4
+    assert executor.calls == 4
+    assert "command-call" in report.error
+
+
+def test_approval_wait_is_excluded_and_returned_observation_is_retained(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    trust = ScopedTrustStore(tmp_path / "att.sqlite")
+    trust.grant(workspace, AttestationScope.SOURCE_READ, granted_by="tester")
+    trust.grant(workspace, AttestationScope.CODE_EXECUTION, granted_by="tester")
+
+    class WaitingExecutor(_FakeCommandExecutor):
+        def execute(
+            self,
+            call: ToolCall,
+            *,
+            run_id: str,
+            active_deadline: float,
+        ) -> CommandExecution:
+            started = time.monotonic()
+            time.sleep(0.08)
+            result = super().execute(
+                call,
+                run_id=run_id,
+                active_deadline=active_deadline,
+            )
+            return CommandExecution(
+                observation=result.observation,
+                approval_wait_seconds=time.monotonic() - started,
+            )
+
+    planner = ScriptedInvestigationPlanner(
+        steps=(ToolCall(tool="run_command", command="generic.head_commit"),),
+        build_answer=_cite_command,
+    )
+    report = InvestigationLoop(
+        planner=planner,
+        trust=trust,
+        command_executor=WaitingExecutor(),
+        budget=AgentBudget(max_active_seconds=0.05),
+    ).run(run_id="approval-wait", goal="resolve HEAD", workspace=workspace)
+
+    assert report.verdict is InvestigationVerdict.PASS
+    assert len(report.catalog) == 1
+    assert report.command_calls_used == 1
+    assert report.active_seconds < 0.05
+
+
+def test_command_stops_before_dispatch_without_code_execution_scope(tmp_path: Path) -> None:
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    trust = ScopedTrustStore(tmp_path / "att.sqlite")
+    trust.grant(workspace, AttestationScope.SOURCE_READ, granted_by="tester")
+    executor = _FakeCommandExecutor()
+    planner = ScriptedInvestigationPlanner(
+        steps=(ToolCall(tool="run_command", command="generic.head_commit"),),
+        build_answer=_cite_command,
+    )
+    report = InvestigationLoop(
+        planner=planner,
+        trust=trust,
+        command_executor=executor,
+    ).run(run_id="command", goal="resolve HEAD", workspace=workspace)
+    assert report.stop_reason is StopReason.NOT_ATTESTED
+    assert executor.calls == 0
+
+
+def test_command_executor_cannot_spoof_another_tool_observation(tmp_path: Path) -> None:
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    trust = ScopedTrustStore(tmp_path / "att.sqlite")
+    trust.grant(workspace, AttestationScope.SOURCE_READ, granted_by="tester")
+    trust.grant(workspace, AttestationScope.CODE_EXECUTION, granted_by="tester")
+    planner = ScriptedInvestigationPlanner(
+        steps=(ToolCall(tool="run_command", command="generic.head_commit"),),
+        build_answer=_cite_command,
+    )
+    report = InvestigationLoop(
+        planner=planner,
+        trust=trust,
+        command_executor=_FakeCommandExecutor(mismatched=True),
+    ).run(run_id="command", goal="resolve HEAD", workspace=workspace)
+    assert report.stop_reason is StopReason.POLICY_VIOLATION
+    assert report.catalog == ()
+
+
+def test_command_recovery_dependency_must_reference_failed_command(tmp_path: Path) -> None:
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    trust = ScopedTrustStore(tmp_path / "att.sqlite")
+    trust.grant(workspace, AttestationScope.SOURCE_READ, granted_by="tester")
+    trust.grant(workspace, AttestationScope.CODE_EXECUTION, granted_by="tester")
+    executor = _FakeCommandExecutor()
+    planner = ScriptedInvestigationPlanner(
+        steps=(
+            ToolCall(
+                tool="run_command",
+                command="generic.head_commit",
+                based_on_observation_id="obs_missing",
+            ),
+        ),
+        build_answer=_cite_command,
+    )
+    report = InvestigationLoop(
+        planner=planner,
+        trust=trust,
+        command_executor=executor,
+    ).run(run_id="command", goal="resolve HEAD", workspace=workspace)
+    assert report.stop_reason is StopReason.POLICY_VIOLATION
+    assert executor.calls == 0

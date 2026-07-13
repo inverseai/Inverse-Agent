@@ -11,6 +11,7 @@ of mechanically decidable conditions force an ``INCOMPLETE`` verdict.
 
 from __future__ import annotations
 
+import math
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -29,11 +30,13 @@ from inverse_agent.fs_tools import (
     canonical_glob_scope,
     glob_uses_recursive_listing,
 )
-from inverse_agent.planner import PlannerBudgetError
+from inverse_agent.planner import PlannerAttestationError, PlannerBudgetError
 
 __all__ = [
     "AgentAnswer",
     "AgentBudget",
+    "CommandExecutor",
+    "CommandExecution",
     "Decision",
     "InvestigationLoop",
     "ModelCallRecord",
@@ -72,6 +75,7 @@ class StopReason(StrEnum):
 # Hard ceilings that a per-run budget override may never exceed.
 MAX_DECISIONS_CEILING = 24
 MAX_TOOL_CALLS_CEILING = 20
+MAX_COMMAND_CALLS_CEILING = 4
 MAX_PHYSICAL_CEILING = 36
 MAX_COMPLETION_TOKENS_CEILING = 49_152
 MAX_OBSERVATION_BYTES_CEILING = 2 * 1024 * 1024
@@ -89,6 +93,8 @@ class ToolCall:
     glob: str | None = None
     start_line: int = 1
     max_lines: int = 200
+    command: str | None = None
+    based_on_observation_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -136,9 +142,10 @@ class ModelCallRecord:
 class AgentBudget:
     """Loop budgets. Decisions decompose as tool decisions plus answer/recovery."""
 
-    max_decisions: int = 12
-    max_tool_calls: int = 10
-    max_physical_requests: int = 18
+    max_decisions: int = 20
+    max_tool_calls: int = 16
+    max_command_calls: int = 4
+    max_physical_requests: int = 30
     max_completion_tokens: int = 24_576
     max_observation_bytes: int = 512 * 1024
     max_active_seconds: float = 600.0
@@ -150,6 +157,8 @@ class AgentBudget:
             raise ValueError(f"max_decisions must be between 1 and {MAX_DECISIONS_CEILING}")
         if not 1 <= self.max_tool_calls <= MAX_TOOL_CALLS_CEILING:
             raise ValueError(f"max_tool_calls must be between 1 and {MAX_TOOL_CALLS_CEILING}")
+        if not 0 <= self.max_command_calls <= MAX_COMMAND_CALLS_CEILING:
+            raise ValueError(f"max_command_calls must be between 0 and {MAX_COMMAND_CALLS_CEILING}")
         if not 1 <= self.max_physical_requests <= MAX_PHYSICAL_CEILING:
             raise ValueError(f"max_physical_requests must be between 1 and {MAX_PHYSICAL_CEILING}")
         minimum_completion_tokens = self.max_decisions * MIN_COMPLETION_TOKENS_PER_DECISION
@@ -186,6 +195,8 @@ def _call_signature(call: ToolCall) -> tuple[object, ...]:
         return ("list_files", call.path, call.glob)
     if call.tool == "search_text":
         return ("search_text", call.query, call.glob)
+    if call.tool == "run_command":
+        return ("run_command", call.command)
     # Unknown tools carry no dispatched arguments, so vary only by tool name;
     # otherwise a changing (ignored) path would evade no-progress detection.
     return (call.tool,)
@@ -205,6 +216,26 @@ class InvestigationPlanner(Protocol):
 
 
 @dataclass(frozen=True)
+class CommandExecution:
+    """A command observation plus human-approval time excluded from compute."""
+
+    observation: ToolObservation
+    approval_wait_seconds: float = 0.0
+
+
+class CommandExecutor(Protocol):
+    """Dispatch one frozen command tool and return a bounded observation."""
+
+    def execute(
+        self,
+        call: ToolCall,
+        *,
+        run_id: str,
+        active_deadline: float,
+    ) -> CommandExecution: ...
+
+
+@dataclass(frozen=True)
 class InvestigationReport:
     run_id: str
     verdict: InvestigationVerdict
@@ -214,6 +245,7 @@ class InvestigationReport:
     decisions_used: int
     tool_calls_used: int
     physical_requests_used: int
+    command_calls_used: int = 0
     completion_tokens_used: int = 0
     completion_tokens_charged: int = 0
     completion_tokens_requested: int = 0
@@ -267,7 +299,7 @@ def _optional_scope_text(value: object) -> str | None:
 
 
 def _is_evidence(observation: ToolObservation) -> bool:
-    """Only a real, non-refusal ``read_file`` observation with content is citable.
+    """Accept retained source reads and explicitly typed command evidence.
 
     Pointer results (``list_files`` / ``search_text``) locate files but are not
     citable evidence: their "lines" are directory entries or ``path:line: match``
@@ -277,11 +309,16 @@ def _is_evidence(observation: ToolObservation) -> bool:
     from a file it actually read.
     """
 
-    if observation.tool != "read_file":
+    citable_command = observation.tool == "run_command" and bool(
+        observation.metadata.get("citable_command")
+    )
+    if observation.tool != "read_file" and not citable_command:
         return False
     if observation.metadata.get("refused"):
         return False
     if not observation.content_hash:
+        return False
+    if citable_command and (observation.incomplete or observation.truncated):
         return False
     # A blank or entirely-redacted window carries no citable evidence. A whole
     # line touched by a redaction span is non-citable even when safe text remains
@@ -319,6 +356,7 @@ def _validate_citations(
     catalog: tuple[ToolObservation, ...],
     *,
     identity_for: Callable[[str], str | None],
+    enforce_distinct: bool = True,
 ) -> str | None:
     """Return an error string if any citation is unsupported, else None."""
 
@@ -349,7 +387,7 @@ def _validate_citations(
             return "citation evidence identity is unavailable"
         source_key: tuple[object, ...] = ("file", identity)
         range_key = (source_key, citation.start_line, citation.end_line)
-        if range_key in physical_ranges:
+        if enforce_distinct and range_key in physical_ranges:
             return "each finding must use a distinct physical citation range"
         physical_ranges.add(range_key)
     return None
@@ -438,12 +476,16 @@ class InvestigationLoop:
         planner: InvestigationPlanner,
         trust: ScopedTrustStore,
         budget: AgentBudget | None = None,
+        command_executor: CommandExecutor | None = None,
     ) -> None:
         self.planner = planner
         self.trust = trust
         self.budget = budget or AgentBudget()
+        self.command_executor = command_executor
         self.budget.validate()
         self._started_at: float | None = None
+        self._paused_seconds = 0.0
+        self._command_calls_used = 0
         self._observation_bytes_used = 0
         # If the planner makes real client requests, bound its total to the
         # physical-request budget so retries cannot exceed it, and count actual
@@ -484,13 +526,15 @@ class InvestigationLoop:
     def _active_seconds(self) -> float:
         if self._started_at is None:
             return 0.0
-        return max(0.0, time.monotonic() - self._started_at)
+        return max(0.0, time.monotonic() - self._started_at - self._paused_seconds)
 
     def _active_budget_exhausted(self) -> bool:
         return self._active_seconds() >= self.budget.max_active_seconds
 
     def run(self, *, run_id: str, goal: str, workspace: Path) -> InvestigationReport:
         self._started_at = time.monotonic()
+        self._paused_seconds = 0.0
+        self._command_calls_used = 0
         self._observation_bytes_used = 0
         active_deadline = self._started_at + self.budget.max_active_seconds
         if hasattr(self.planner, "active_deadline"):
@@ -508,10 +552,27 @@ class InvestigationLoop:
                 0,
                 error="workspace is not attested for source_read",
             )
+        if hasattr(self.planner, "source_read_guard"):
+            self.planner.source_read_guard = lambda: self.trust.has_scope(
+                resolved, AttestationScope.SOURCE_READ
+            )
         reader = WorkspaceReader.open(resolved, active_deadline=active_deadline)
         catalog: list[ToolObservation] = []
+
+        def evidence_identity(observation_id: str) -> str | None:
+            source_identity = reader.evidence_identity(observation_id)
+            if source_identity is not None:
+                return source_identity
+            for observed in catalog:
+                if observed.observation_id != observation_id:
+                    continue
+                identity = observed.metadata.get("evidence_identity")
+                return identity if isinstance(identity, str) and identity else None
+            return None
+
         decisions = 0
         tool_calls = 0
+        command_calls = 0
         physical = 0
         seen_calls: set[tuple[object, ...]] = set()
         no_progress_repeats = 0
@@ -540,6 +601,18 @@ class InvestigationLoop:
                     tool_calls,
                     physical,
                 )
+            if not self.trust.has_scope(resolved, AttestationScope.SOURCE_READ):
+                return self._finish(
+                    run_id,
+                    InvestigationVerdict.INCOMPLETE,
+                    StopReason.NOT_ATTESTED,
+                    None,
+                    catalog,
+                    decisions,
+                    tool_calls,
+                    physical,
+                    error="source_read was revoked before the next model decision",
+                )
             # Stop before another decision if the planner has already made as many
             # real client requests as the physical budget allows. ``physical``
             # tracks actual requests (from the planner when it exposes a counter),
@@ -560,11 +633,24 @@ class InvestigationLoop:
                 decision = self.planner.decide(goal=goal, catalog=tuple(catalog))
             except Exception as exc:  # planner/model protocol failure
                 physical = self._physical_count(decisions + 1)
+                attestation_stop = isinstance(exc, PlannerAttestationError)
                 budget_stop = isinstance(exc, PlannerBudgetError)
                 return self._finish(
                     run_id,
-                    InvestigationVerdict.INCOMPLETE if budget_stop else InvestigationVerdict.FAILED,
-                    StopReason.BUDGET_EXHAUSTED if budget_stop else StopReason.PROTOCOL_FAILURE,
+                    (
+                        InvestigationVerdict.INCOMPLETE
+                        if attestation_stop or budget_stop
+                        else InvestigationVerdict.FAILED
+                    ),
+                    (
+                        StopReason.NOT_ATTESTED
+                        if attestation_stop
+                        else (
+                            StopReason.BUDGET_EXHAUSTED
+                            if budget_stop
+                            else StopReason.PROTOCOL_FAILURE
+                        )
+                    ),
                     None,
                     catalog,
                     decisions,
@@ -573,6 +659,11 @@ class InvestigationLoop:
                     error=str(exc),
                 )
             physical = self._physical_count(decisions + 1)
+            # A planner request that returned a decision consumed one logical
+            # decision even when the active deadline expired during that request.
+            # Count it before the deadline/type exits so the model call ledger and
+            # report cannot disagree on an otherwise compliant budget stop.
+            decisions += 1
             if self._active_budget_exhausted():
                 return self._finish(
                     run_id,
@@ -597,9 +688,29 @@ class InvestigationLoop:
                     physical,
                     error=f"planner returned an unsupported decision type: {type(decision)!r}",
                 )
-            decisions += 1
-
             if isinstance(decision, AgentAnswer):
+                # Invalid references remain security/integrity failures even when
+                # another answer field is malformed. Delay only the one-to-one
+                # distinct-range rule until after structural validation so an
+                # ordinary duplicate/mismatched finding remains a malformed answer.
+                citation_error = _validate_citations(
+                    decision,
+                    tuple(catalog),
+                    identity_for=evidence_identity,
+                    enforce_distinct=False,
+                )
+                if citation_error is not None:
+                    return self._finish(
+                        run_id,
+                        InvestigationVerdict.INCOMPLETE,
+                        StopReason.UNSUPPORTED_CITATION,
+                        decision,
+                        catalog,
+                        decisions,
+                        tool_calls,
+                        physical,
+                        error=citation_error,
+                    )
                 structure_error = _validate_answer_structure(decision)
                 if structure_error is not None:
                     return self._finish(
@@ -616,7 +727,7 @@ class InvestigationLoop:
                 citation_error = _validate_citations(
                     decision,
                     tuple(catalog),
-                    identity_for=reader.evidence_identity,
+                    identity_for=evidence_identity,
                 )
                 if citation_error is not None:
                     return self._finish(
@@ -635,7 +746,7 @@ class InvestigationLoop:
                     and _has_unresolved_negative_uncertainty(
                         decision,
                         tuple(catalog),
-                        identity_for=reader.evidence_identity,
+                        identity_for=evidence_identity,
                     )
                 )
                 if not decision.complete or unresolved_uncertainty:
@@ -677,6 +788,18 @@ class InvestigationLoop:
                     tool_calls,
                     physical,
                 )
+            if decision.tool == "run_command" and command_calls >= self.budget.max_command_calls:
+                return self._finish(
+                    run_id,
+                    InvestigationVerdict.INCOMPLETE,
+                    StopReason.BUDGET_EXHAUSTED,
+                    None,
+                    catalog,
+                    decisions,
+                    tool_calls,
+                    physical,
+                    error="command-call budget exhausted",
+                )
             signature = _call_signature(decision)
             if signature in seen_calls:
                 no_progress_repeats += 1
@@ -709,8 +832,82 @@ class InvestigationLoop:
                     physical,
                     error="source_read was revoked during the investigation",
                 )
+            if decision.tool == "run_command" and not self.trust.has_scope(
+                resolved, AttestationScope.CODE_EXECUTION
+            ):
+                return self._finish(
+                    run_id,
+                    InvestigationVerdict.INCOMPLETE,
+                    StopReason.NOT_ATTESTED,
+                    None,
+                    catalog,
+                    decisions,
+                    tool_calls,
+                    physical,
+                    error="code_execution is not attested for this workspace",
+                )
             try:
-                observation = _dispatch(reader, decision)
+                if decision.tool == "run_command":
+                    if self.command_executor is None:
+                        raise PolicyViolationError("command tools are unavailable in this run")
+                    if decision.based_on_observation_id is not None:
+                        dependency = next(
+                            (
+                                item
+                                for item in catalog
+                                if item.observation_id == decision.based_on_observation_id
+                            ),
+                            None,
+                        )
+                        if (
+                            dependency is None
+                            or dependency.tool != "run_command"
+                            or dependency.metadata.get("status") != "failed"
+                        ):
+                            raise PolicyViolationError(
+                                "command recovery must reference an earlier failed command observation"
+                            )
+                    # Charge an attempted dispatch before crossing into the executor.
+                    # Transport and policy failures still consume command capacity.
+                    command_calls += 1
+                    self._command_calls_used = command_calls
+                    command_started = time.monotonic()
+                    execution = self.command_executor.execute(
+                        decision,
+                        run_id=run_id,
+                        active_deadline=active_deadline,
+                    )
+                    command_elapsed = max(0.0, time.monotonic() - command_started)
+                    if not isinstance(execution, CommandExecution):
+                        raise PolicyViolationError(
+                            "command executor returned an unsupported execution result"
+                        )
+                    approval_wait = execution.approval_wait_seconds
+                    if (
+                        not math.isfinite(approval_wait)
+                        or approval_wait < 0
+                        or approval_wait > command_elapsed + 0.001
+                    ):
+                        raise PolicyViolationError(
+                            "command executor returned invalid approval-wait accounting"
+                        )
+                    self._paused_seconds += approval_wait
+                    active_deadline += approval_wait
+                    reader = reader.with_active_deadline(active_deadline)
+                    if hasattr(self.planner, "active_deadline"):
+                        self.planner.active_deadline = active_deadline
+                    observation = execution.observation
+                    expected_command_path = f"command/{decision.command or ''}"
+                    if (
+                        observation.tool != "run_command"
+                        or observation.path != expected_command_path
+                        or observation.metadata.get("command_name") != decision.command
+                    ):
+                        raise PolicyViolationError(
+                            "command executor returned an observation outside the requested tool"
+                        )
+                else:
+                    observation = _dispatch(reader, decision)
             except StrictDecodeError as exc:
                 return self._finish(
                     run_id,
@@ -775,18 +972,6 @@ class InvestigationLoop:
                     physical,
                     error="search encountered a file that failed strict UTF-8 decoding",
                 )
-            if self._active_budget_exhausted():
-                return self._finish(
-                    run_id,
-                    InvestigationVerdict.INCOMPLETE,
-                    StopReason.BUDGET_EXHAUSTED,
-                    None,
-                    catalog,
-                    decisions,
-                    tool_calls,
-                    physical,
-                    error="active-time budget exhausted",
-                )
             observation_bytes = len(observation.text.encode("utf-8"))
             if self._observation_bytes_used + observation_bytes > self.budget.max_observation_bytes:
                 return self._finish(
@@ -802,6 +987,18 @@ class InvestigationLoop:
                 )
             self._observation_bytes_used += observation_bytes
             catalog.append(observation)
+            if self._active_budget_exhausted():
+                return self._finish(
+                    run_id,
+                    InvestigationVerdict.INCOMPLETE,
+                    StopReason.BUDGET_EXHAUSTED,
+                    None,
+                    catalog,
+                    decisions,
+                    tool_calls,
+                    physical,
+                    error="active-time budget exhausted",
+                )
 
     def _finish(
         self,
@@ -825,6 +1022,7 @@ class InvestigationLoop:
             decisions_used=decisions,
             tool_calls_used=tool_calls,
             physical_requests_used=physical,
+            command_calls_used=getattr(self, "_command_calls_used", 0),
             completion_tokens_used=self._completion_reported(),
             completion_tokens_charged=self._completion_charged(),
             completion_tokens_requested=self._completion_requested(),

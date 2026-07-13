@@ -9,6 +9,7 @@ import sys
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from secrets import token_hex
 from typing import Any, BinaryIO
 
 if sys.platform == "win32":
@@ -147,11 +148,15 @@ class RunStore:
             ),
             None,
         )
+        pending_approval = self._normalize_pending_approval(
+            result.pending_approval,
+            current,
+        )
         updated = RunRecord(
             **{
                 **asdict(current),
                 "status": result.trace.status.value,
-                "pending_approval": result.pending_approval,
+                "pending_approval": pending_approval,
                 "trace_path": trace_path,
                 "error": error_action,
                 "updated_at": time.time(),
@@ -184,6 +189,35 @@ class RunStore:
             )
         return self.require(run_id)
 
+    @staticmethod
+    def _normalize_pending_approval(
+        pending: dict[str, Any] | None,
+        current: RunRecord,
+    ) -> dict[str, Any] | None:
+        if pending is None:
+            return None
+        normalized = dict(pending)
+        challenge_id = normalized.get("challenge_id")
+        valid_challenge = (
+            isinstance(challenge_id, str)
+            and len(challenge_id) == 32
+            and all(character in "0123456789abcdef" for character in challenge_id)
+        )
+        if not valid_challenge:
+            previous = current.pending_approval or {}
+            previous_id = previous.get("challenge_id")
+            same_action = previous.get("action_digest") == normalized.get("action_digest")
+            valid_previous = (
+                isinstance(previous_id, str)
+                and len(previous_id) == 32
+                and all(character in "0123456789abcdef" for character in previous_id)
+            )
+            normalized["challenge_id"] = (
+                previous_id if same_action and valid_previous else token_hex(16)
+            )
+        normalized.setdefault("action_ordinal", current.completed_actions)
+        return normalized
+
     def claim_start(self, run_id: str) -> RunRecord | None:
         with sqlite3.connect(self.path, timeout=30, isolation_level=None) as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -210,7 +244,12 @@ class RunStore:
             connection.commit()
         return self.require(run_id)
 
-    def claim_pending(self, run_id: str, expected_action_digest: str) -> RunRecord:
+    def claim_pending(
+        self,
+        run_id: str,
+        expected_action_digest: str,
+        expected_challenge_id: str,
+    ) -> RunRecord:
         with sqlite3.connect(self.path, timeout=30, isolation_level=None) as connection:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute("SELECT * FROM runs WHERE run_id=?", (run_id,)).fetchone()
@@ -223,6 +262,10 @@ class RunStore:
                 raise ValueError("run is not waiting for approval")
             actual_digest = (record.pending_approval or {}).get("action_digest")
             if actual_digest != expected_action_digest:
+                connection.rollback()
+                raise ValueError("approval challenge is stale or does not match")
+            actual_challenge_id = (record.pending_approval or {}).get("challenge_id")
+            if actual_challenge_id != expected_challenge_id:
                 connection.rollback()
                 raise ValueError("approval challenge is stale or does not match")
             cursor = connection.execute(
@@ -512,8 +555,13 @@ class AgentService:
         *,
         approved_by: str,
         expected_action_digest: str,
+        expected_challenge_id: str,
     ) -> RunRecord:
-        record = self.runs.claim_pending(run_id, expected_action_digest)
+        record = self.runs.claim_pending(
+            run_id,
+            expected_action_digest,
+            expected_challenge_id,
+        )
         try:
             if not record.pending_approval:
                 raise ValueError("pending approval record is missing")
@@ -537,10 +585,16 @@ class AgentService:
                 rule=rule,
                 argv=argv,
                 approved_by=approved_by,
+                challenge_id=str(challenge["challenge_id"]),
             )
             return self.runs.update_from_result(
                 run_id,
-                self.workflow.resume(run_id, token),
+                self.workflow.resume(
+                    run_id,
+                    token,
+                    expected_action_digest,
+                    expected_challenge_id,
+                ),
                 expected_status=RunStatus.APPROVING.value,
             )
         except Exception as exc:
@@ -558,11 +612,16 @@ class AgentService:
         *,
         declined_by: str,
         expected_action_digest: str,
+        expected_challenge_id: str,
     ) -> RunRecord:
         identity = redact_text(declined_by.strip()).text
         if not identity:
             raise ValueError("declined_by is required")
-        self.runs.claim_pending(run_id, expected_action_digest)
+        self.runs.claim_pending(
+            run_id,
+            expected_action_digest,
+            expected_challenge_id,
+        )
         return self.runs.mark_refused(
             run_id,
             f"declined by {identity}",
@@ -631,15 +690,11 @@ class AgentService:
             if not isinstance(metadata, dict):
                 metadata = {}
             action: dict[str, Any] = {
-                "name": _safe_preview_text(raw_action.get("name", ""))[
-                    :TRACE_PREVIEW_FIELD_CHARS
-                ],
+                "name": _safe_preview_text(raw_action.get("name", ""))[:TRACE_PREVIEW_FIELD_CHARS],
                 "status": _safe_preview_text(metadata.get("status", ""))[
                     :TRACE_PREVIEW_FIELD_CHARS
                 ],
-                "rule": _safe_preview_text(metadata.get("rule", ""))[
-                    :TRACE_PREVIEW_FIELD_CHARS
-                ],
+                "rule": _safe_preview_text(metadata.get("rule", ""))[:TRACE_PREVIEW_FIELD_CHARS],
                 "reason": _safe_preview_text(metadata.get("reason", ""))[
                     :TRACE_PREVIEW_FIELD_CHARS
                 ],

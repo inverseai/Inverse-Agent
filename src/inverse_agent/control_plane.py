@@ -16,7 +16,7 @@ from inverse_agent.eval import json_default
 from inverse_agent.models import AutonomyLevel, Domain
 from inverse_agent.service import AgentService, RunRecord
 
-API_VERSION = "2026-07-10.v1"
+API_VERSION = "2026-07-13.v2"
 UI_ASSETS = {
     "app.css": "text/css",
     "app.js": "text/javascript",
@@ -50,6 +50,7 @@ class WorkspaceTrustCreate(BaseModel):
 
 class ApprovalCreate(BaseModel):
     action_digest: str = Field(min_length=64, max_length=64)
+    challenge_id: str = Field(min_length=32, max_length=32, pattern=r"^[0-9a-f]{32}$")
 
 
 def create_app(
@@ -61,7 +62,9 @@ def create_app(
 ) -> Any:
     if not api_token:
         raise ValueError("control-plane API token is required")
-    if not approver_tokens or any(not token or not identity for token, identity in approver_tokens.items()):
+    if not approver_tokens or any(
+        not token or not identity for token, identity in approver_tokens.items()
+    ):
         raise ValueError("at least one approver token and identity are required")
     if api_token in approver_tokens:
         raise ValueError("operator and approver tokens must be distinct")
@@ -74,7 +77,7 @@ def create_app(
 
     app = FastAPI(
         title="Inverse-Agent Control Plane",
-        version="1.0.0",
+        version=API_VERSION,
         docs_url=None,
         redoc_url=None,
         openapi_url=None,
@@ -118,7 +121,7 @@ def create_app(
 
     @app.get("/health")
     def health() -> dict[str, str]:
-        return {"status": "ok"}
+        return {"status": "ok", "api_version": API_VERSION}
 
     @app.get("/runtime", dependencies=[Depends(require_auth)])
     def runtime() -> dict[str, Any]:
@@ -234,6 +237,7 @@ def create_app(
                     run_id,
                     approved_by=approver,
                     expected_action_digest=body.action_digest,
+                    expected_challenge_id=body.challenge_id,
                 )
             )
         except ValueError as exc:
@@ -252,6 +256,7 @@ def create_app(
                     run_id,
                     declined_by=approver,
                     expected_action_digest=body.action_digest,
+                    expected_challenge_id=body.challenge_id,
                 )
             )
         except ValueError as exc:

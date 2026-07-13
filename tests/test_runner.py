@@ -62,6 +62,7 @@ def _approved_request(
         rule=rule,
         argv=challenge.argv,
         approved_by="tester",
+        challenge_id="1" * 32,
         now=now,
         ttl_seconds=ttl_seconds,
     )
@@ -70,6 +71,7 @@ def _approved_request(
         cwd=request.cwd,
         domain=request.domain,
         approval_token=token,
+        approval_challenge_id="1" * 32,
         timeout_seconds=request.timeout_seconds,
     )
 
@@ -194,6 +196,7 @@ def test_approval_cannot_cross_command_scope(tmp_path: Path) -> None:
         tmp_path,
         Domain.GENERIC,
         approval_token=approved_one.approval_token,
+        approval_challenge_id=approved_one.approval_challenge_id,
     )
     result = runner.run(two)
     assert result.status == RunStatus.REFUSED
@@ -211,6 +214,7 @@ def test_approval_replay_is_refused_after_authority_restart(tmp_path: Path) -> N
         rule=rule,
         argv=argv,
         approved_by="tester",
+        challenge_id="2" * 32,
     )
     first.verify(
         token,
@@ -218,6 +222,7 @@ def test_approval_replay_is_refused_after_authority_restart(tmp_path: Path) -> N
         domain=Domain.GENERIC,
         rule=rule,
         argv=argv,
+        expected_challenge_id="2" * 32,
     )
     restarted = ApprovalAuthority(SECRET, SqliteApprovalReplayStore(replay_path))
     with pytest.raises(ApprovalError, match="already consumed"):
@@ -227,7 +232,43 @@ def test_approval_replay_is_refused_after_authority_restart(tmp_path: Path) -> N
             domain=Domain.GENERIC,
             rule=rule,
             argv=argv,
+            expected_challenge_id="2" * 32,
         )
+
+
+def test_approval_capability_is_bound_to_current_challenge(tmp_path: Path) -> None:
+    rule = CommandRule("probe", ("python", "probe.py"), Domain.GENERIC, requires_approval=True)
+    argv = (str(Path(sys.executable).resolve()), "probe.py")
+    authority = ApprovalAuthority(SECRET)
+    token, _claims = authority.issue(
+        workspace=tmp_path,
+        domain=Domain.GENERIC,
+        rule=rule,
+        argv=argv,
+        approved_by="tester",
+        challenge_id="a" * 32,
+    )
+
+    with pytest.raises(ApprovalError, match="current challenge"):
+        authority.verify(
+            token,
+            workspace=tmp_path,
+            domain=Domain.GENERIC,
+            rule=rule,
+            argv=argv,
+            expected_challenge_id="b" * 32,
+            consume=False,
+        )
+
+    claims = authority.verify(
+        token,
+        workspace=tmp_path,
+        domain=Domain.GENERIC,
+        rule=rule,
+        argv=argv,
+        expected_challenge_id="a" * 32,
+    )
+    assert claims.challenge_id == "a" * 32
 
 
 def test_expired_approval_is_refused(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

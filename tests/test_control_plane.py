@@ -70,13 +70,18 @@ def test_every_endpoint_except_health_requires_auth(tmp_path: Path) -> None:
         assert client.get("/").status_code == 200
         assert client.get("/assets/app.css").status_code == 200
         assert client.get("/assets/app.js").status_code == 200
-        assert client.get("/health").status_code == 200
+        health = client.get("/health")
+        assert health.status_code == 200
+        assert health.json() == {"status": "ok", "api_version": "2026-07-13.v2"}
         assert client.get("/docs").status_code == 404
         assert client.get("/redoc").status_code == 404
         assert client.get("/openapi.json").status_code == 404
         assert client.get("/profile", params={"path": str(FIXTURES)}).status_code == 401
         assert client.get("/runtime").status_code == 401
-        assert client.get("/workspaces/trust-status", params={"path": str(FIXTURES)}).status_code == 401
+        assert (
+            client.get("/workspaces/trust-status", params={"path": str(FIXTURES)}).status_code
+            == 401
+        )
         assert client.get("/runs").status_code == 401
         assert client.post("/runs", json={}).status_code == 401
         assert client.post("/workspaces/trust", json={}).status_code == 401
@@ -110,12 +115,15 @@ def test_operator_token_cannot_use_approver_endpoints(tmp_path: Path) -> None:
         approval = client.post(
             "/runs/unknown/approvals",
             headers=HEADERS,
-            json={"action_digest": "0" * 64},
+            json={
+                "action_digest": "0" * 64,
+                "challenge_id": "0" * 32,
+            },
         )
         decline = client.post(
             "/runs/unknown/decline",
             headers=HEADERS,
-            json={"action_digest": "0" * 64},
+            json={"action_digest": "0" * 64, "challenge_id": "0" * 32},
         )
         approver_session = client.get("/approver/session", headers=HEADERS)
         assert trust.status_code == 401
@@ -159,20 +167,27 @@ def test_control_plane_end_to_end_approval_flow(tmp_path: Path) -> None:
         stale = client.post(
             f"/runs/{run_id}/approvals",
             headers=APPROVER_HEADERS,
-            json={"action_digest": "0" * 64},
+            json={
+                "action_digest": "0" * 64,
+                "challenge_id": waiting.json()["pending_approval"]["challenge_id"],
+            },
         )
         assert stale.status_code == 409
         waiting_again = client.post(
             f"/runs/{run_id}/approvals",
             headers=APPROVER_HEADERS,
-            json={"action_digest": waiting.json()["pending_approval"]["action_digest"]},
+            json={
+                "action_digest": waiting.json()["pending_approval"]["action_digest"],
+                "challenge_id": waiting.json()["pending_approval"]["challenge_id"],
+            },
         )
         assert waiting_again.json()["status"] == RunStatus.WAITING_FOR_APPROVAL.value
         final = client.post(
             f"/runs/{run_id}/approvals",
             headers=APPROVER_HEADERS,
             json={
-                "action_digest": waiting_again.json()["pending_approval"]["action_digest"]
+                "action_digest": waiting_again.json()["pending_approval"]["action_digest"],
+                "challenge_id": waiting_again.json()["pending_approval"]["challenge_id"],
             },
         )
         assert final.json()["status"] == RunStatus.SUCCEEDED.value
@@ -227,9 +242,9 @@ def test_ui_assets_and_security_headers_are_strict(tmp_path: Path) -> None:
             assert response.headers["cross-origin-resource-policy"] == "same-origin"
             assert "unsafe-inline" not in response.headers["content-security-policy"]
             assert "unsafe-eval" not in response.headers["content-security-policy"]
-            assert "require-trusted-types-for 'script'" in response.headers[
-                "content-security-policy"
-            ]
+            assert (
+                "require-trusted-types-for 'script'" in response.headers["content-security-policy"]
+            )
             assert "access-control-allow-origin" not in response.headers
             assert "set-cookie" not in response.headers
 
@@ -270,6 +285,7 @@ def test_runtime_trust_and_approver_read_models_are_separated(tmp_path: Path) ->
         client = _client(service)
         runtime = client.get("/runtime", headers=HEADERS)
         assert runtime.status_code == 200
+        assert runtime.json()["api_version"] == "2026-07-13.v2"
         assert runtime.json()["planner"] == {
             "kind": "openai-compatible",
             "model": "test-model",
@@ -325,20 +341,29 @@ def test_decline_is_digest_bound_and_terminal(tmp_path: Path) -> None:
         stale = client.post(
             f"/runs/{created['run_id']}/decline",
             headers=APPROVER_HEADERS,
-            json={"action_digest": "0" * 64},
+            json={
+                "action_digest": "0" * 64,
+                "challenge_id": waiting["pending_approval"]["challenge_id"],
+            },
         )
         assert stale.status_code == 409
         declined = client.post(
             f"/runs/{created['run_id']}/decline",
             headers=APPROVER_HEADERS,
-            json={"action_digest": waiting["pending_approval"]["action_digest"]},
+            json={
+                "action_digest": waiting["pending_approval"]["action_digest"],
+                "challenge_id": waiting["pending_approval"]["challenge_id"],
+            },
         )
         assert declined.json()["status"] == RunStatus.REFUSED.value
         assert declined.json()["error"] == "declined by human@example.test"
         replay = client.post(
             f"/runs/{created['run_id']}/approvals",
             headers=APPROVER_HEADERS,
-            json={"action_digest": waiting["pending_approval"]["action_digest"]},
+            json={
+                "action_digest": waiting["pending_approval"]["action_digest"],
+                "challenge_id": waiting["pending_approval"]["challenge_id"],
+            },
         )
         assert replay.status_code == 409
     finally:

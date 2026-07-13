@@ -70,7 +70,8 @@ A waiting run exits with code `2` and prints its approval challenge. Approve the
 uv run inverse-agent approve RUN_ID `
   --workspace-root D:\work `
   --approved-by engineer@example.com `
-  --action-digest ACTION_DIGEST_FROM_CHALLENGE
+  --action-digest ACTION_DIGEST_FROM_CHALLENGE `
+  --challenge-id CHALLENGE_ID_FROM_CHALLENGE
 ```
 
 ## Control Plane And MCP

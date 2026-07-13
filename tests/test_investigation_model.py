@@ -27,6 +27,7 @@ from inverse_agent.investigation_model import (
 )
 from inverse_agent.planner import (
     ModelResponseMetadata,
+    PlannerAttestationError,
     PlannerBudgetError,
     PlannerProtocolError,
     PlannerTransportError,
@@ -47,6 +48,8 @@ class FakeClient:
         self.calls = 0
         self.max_tokens_requested: list[int] = []
         self.prompts: list[str] = []
+        self.system_prompts: list[str] = []
+        self.schemas: list[Mapping[str, Any]] = []
         self.timeouts_requested: list[float | None] = []
         self.last_response_metadata: ModelResponseMetadata | None = None
 
@@ -63,6 +66,8 @@ class FakeClient:
         self.calls += 1
         self.max_tokens_requested.append(max_tokens)
         self.prompts.append(prompt)
+        self.system_prompts.append(system)
+        self.schemas.append(schema)
         self.timeouts_requested.append(timeout_seconds)
         self.last_response_metadata = None
         item = self._responses.pop(0)
@@ -79,6 +84,7 @@ def _base(action: str, **overrides: Any) -> dict[str, Any]:
         "path": "",
         "query": "",
         "glob": "",
+        "based_on_observation_id": "",
         "start_line": 1,
         "max_lines": 200,
         "summary": "",
@@ -111,6 +117,56 @@ def test_parse_search_maps_empty_glob_to_none() -> None:
     assert decision.tool == "search_text"
     assert decision.query == "needle"
     assert decision.glob is None
+
+
+def test_command_action_exists_only_for_explicitly_available_tools() -> None:
+    read_client = FakeClient([_base("list_files", path=".")])
+    ModelInvestigationPlanner(client=read_client).decide(goal="x", catalog=())
+    read_actions = read_client.schemas[0]["properties"]["action"]["enum"]
+    assert "run_command" not in read_actions
+
+    command_client = FakeClient([_base("run_command", path="generic.head_commit")])
+    decision = ModelInvestigationPlanner(
+        client=command_client,
+        allowed_commands=("generic.head_commit",),
+    ).decide(goal="x", catalog=())
+    assert isinstance(decision, ToolCall)
+    assert decision.tool == "run_command"
+    assert decision.command == "generic.head_commit"
+    command_actions = command_client.schemas[0]["properties"]["action"]["enum"]
+    assert "run_command" in command_actions
+    assert "fresh human approval" in command_client.system_prompts[0]
+
+
+def test_command_recovery_preserves_failed_observation_dependency() -> None:
+    client = FakeClient(
+        [
+            _base(
+                "run_command",
+                path="generic.head_commit",
+                based_on_observation_id="[obs_parent_failed]",
+            )
+        ]
+    )
+    decision = ModelInvestigationPlanner(
+        client=client,
+        allowed_commands=("generic.head_commit",),
+    ).decide(goal="recover", catalog=())
+    assert isinstance(decision, ToolCall)
+    assert decision.based_on_observation_id == "obs_parent_failed"
+
+
+def test_model_cannot_select_an_unavailable_command() -> None:
+    client = FakeClient(
+        [
+            _base("run_command", path="generic.head_commit"),
+            _base("run_command", path="generic.head_commit"),
+        ]
+    )
+    planner = ModelInvestigationPlanner(client=client)
+    with pytest.raises(ValueError, match="unavailable"):
+        planner.decide(goal="x", catalog=())
+    assert planner.schema_retries == 1
 
 
 def test_parse_final_answer_with_citation() -> None:
@@ -208,6 +264,20 @@ def test_transport_and_schema_retries_are_separate() -> None:
         "success",
     ]
     assert all(call.logical_decision == 1 for call in planner.model_calls)
+
+
+def test_source_revocation_stops_transport_retry_before_second_request() -> None:
+    client = FakeClient([PlannerTransportError("net"), _base("list_files", path=".")])
+    planner = ModelInvestigationPlanner(client=client)
+    guard_results = iter((True, False))
+    planner.source_read_guard = lambda: next(guard_results)
+
+    with pytest.raises(PlannerAttestationError, match="source_read"):
+        planner.decide(goal="x", catalog=())
+
+    assert client.calls == 1
+    assert planner.requests_made == 1
+    assert planner.transport_retries == 0
 
 
 def test_total_request_budget_bounds_calls() -> None:

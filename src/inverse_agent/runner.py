@@ -27,6 +27,7 @@ class CommandRequest:
     cwd: Path
     domain: Domain
     approval_token: str | None = None
+    approval_challenge_id: str | None = None
     timeout_seconds: int | None = None
 
 
@@ -305,6 +306,10 @@ class LocalRunner:
                 raise PolicyViolation(
                     f"approval capability required for {rule.name}: {rule.reason}"
                 )
+            if not request.approval_challenge_id:
+                raise PolicyViolation(
+                    f"approval challenge identity required for {rule.name}: {rule.reason}"
+                )
             if self.approval_authority is None:
                 raise PolicyViolation("runner has no approval authority configured")
             try:
@@ -314,6 +319,7 @@ class LocalRunner:
                     domain=request.domain,
                     rule=rule,
                     argv=resolved_argv,
+                    expected_challenge_id=request.approval_challenge_id,
                     consume=consume_approval,
                 )
             except ApprovalError as exc:

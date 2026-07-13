@@ -31,11 +31,25 @@ def test_deterministic_path_passes_and_writes_output(tmp_path: Path) -> None:
     summary = json.loads(out.read_text(encoding="utf-8"))
     assert summary["planner"] == "deterministic"
     assert summary["gate_passed"] is True
+    assert summary["integrity_failures"] == []
     assert summary["model_provenance"] is None
     first = summary["variants"][0]
     assert first["physical_requests_used"] >= 1
     assert first["completion_tokens_charged"] == 0
     assert first["model_calls"] == []
+    assert first["integrity_failures"] == []
+    git_variant = next(
+        item for item in summary["variants"] if item["case"] == "git_approval_replanning"
+    )
+    assert [item["status"] for item in git_variant["command_audit"]] == [
+        "failed",
+        "succeeded",
+    ]
+
+
+def test_explicit_empty_model_cannot_fall_back_to_scripted_gate() -> None:
+    with pytest.raises(ValueError, match="non-empty identifier"):
+        benchmark_investigation_command(_args(model=""))
 
 
 def test_remote_endpoint_without_dual_optin_is_rejected(

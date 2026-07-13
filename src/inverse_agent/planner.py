@@ -23,6 +23,8 @@ from inverse_agent.redaction import redact_text
 
 MAX_MODEL_RESPONSE_BYTES = 1024 * 1024
 MAX_MODEL_COMPLETION_TOKENS = 4096
+MAX_SUCCESSFUL_RESPONSE_MODEL_HISTORY = 1024
+MAX_OBSERVED_RESPONSE_MODELS = 64
 MODEL_RESPONSE_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/@:+-]{0,255}")
 PLAN_RESPONSE_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -49,6 +51,10 @@ class PlannerProtocolError(PlannerError):
 
 class PlannerBudgetError(PlannerError):
     """Raised before a model call would exceed a configured run budget."""
+
+
+class PlannerAttestationError(PlannerError):
+    """Raised before source is sent after its workspace attestation is revoked."""
 
 
 @dataclass(frozen=True)
@@ -139,8 +145,12 @@ class OpenAICompatibleClient:
         self.api_key = api_key
         self.timeout_seconds = timeout_seconds
         self._observed_response_models: set[str] = set()
+        self._observed_response_models_overflowed = False
+        self._response_model_mismatch_observed = False
         self._successful_response_count = 0
         self._attributed_response_count = 0
+        self._successful_response_models: list[str | None] = []
+        self._successful_response_history_start = 0
         self._last_response_metadata: ModelResponseMetadata | None = None
         self._observation_lock = Lock()
 
@@ -148,6 +158,16 @@ class OpenAICompatibleClient:
     def observed_response_models(self) -> tuple[str, ...]:
         with self._observation_lock:
             return tuple(sorted(self._observed_response_models))
+
+    @property
+    def observed_response_models_overflowed(self) -> bool:
+        with self._observation_lock:
+            return self._observed_response_models_overflowed
+
+    @property
+    def response_model_mismatch_observed(self) -> bool:
+        with self._observation_lock:
+            return self._response_model_mismatch_observed
 
     @property
     def successful_response_count(self) -> int:
@@ -158,6 +178,34 @@ class OpenAICompatibleClient:
     def attributed_response_count(self) -> int:
         with self._observation_lock:
             return self._attributed_response_count
+
+    @property
+    def successful_response_models(self) -> tuple[str | None, ...]:
+        """Retained tail of reported models for successful response envelopes."""
+
+        with self._observation_lock:
+            return tuple(self._successful_response_models)
+
+    def successful_response_models_since(
+        self, successful_response_count: int
+    ) -> tuple[str | None, ...] | None:
+        """Return provenance after an absolute cursor, or None if it was evicted."""
+
+        if (
+            isinstance(successful_response_count, bool)
+            or not isinstance(successful_response_count, int)
+            or successful_response_count < 0
+        ):
+            raise ValueError("successful response cursor must be a non-negative integer")
+        with self._observation_lock:
+            if not (
+                self._successful_response_history_start
+                <= successful_response_count
+                <= self._successful_response_count
+            ):
+                return None
+            offset = successful_response_count - self._successful_response_history_start
+            return tuple(self._successful_response_models[offset:])
 
     @property
     def last_response_metadata(self) -> ModelResponseMetadata | None:
@@ -286,6 +334,10 @@ class OpenAICompatibleClient:
                     completion_tokens=completion_tokens,
                     total_tokens=total_tokens,
                 )
+            # Record every validated response envelope before parsing its
+            # decision content. A malformed decision can be retried, but its
+            # endpoint attribution must remain visible to the capability gate.
+            self._record_successful_response(reported_model)
             choices = payload["choices"]
             content = choices[0]["message"]["content"]
             if not isinstance(content, str):
@@ -301,12 +353,29 @@ class OpenAICompatibleClient:
             raise PlannerProtocolError(
                 "model response does not match the requested JSON schema"
             ) from exc
+        return parsed
+
+    def _record_successful_response(self, reported_model: str | None) -> None:
         with self._observation_lock:
             self._successful_response_count += 1
+            self._successful_response_models.append(reported_model)
+            overflow = len(self._successful_response_models) - MAX_SUCCESSFUL_RESPONSE_MODEL_HISTORY
+            if overflow > 0:
+                del self._successful_response_models[:overflow]
+            self._successful_response_history_start = self._successful_response_count - len(
+                self._successful_response_models
+            )
             if reported_model is not None:
-                self._observed_response_models.add(reported_model)
+                if reported_model != self.model:
+                    self._response_model_mismatch_observed = True
+                if (
+                    reported_model in self._observed_response_models
+                    or len(self._observed_response_models) < MAX_OBSERVED_RESPONSE_MODELS
+                ):
+                    self._observed_response_models.add(reported_model)
+                else:
+                    self._observed_response_models_overflowed = True
                 self._attributed_response_count += 1
-        return parsed
 
     @staticmethod
     def _usage_count(usage: dict[str, Any], name: str) -> int:

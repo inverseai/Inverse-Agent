@@ -6,6 +6,7 @@ import sqlite3
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+from secrets import token_hex
 from typing import Any, TypedDict, cast
 
 from langchain_core.runnables import RunnableConfig
@@ -28,7 +29,13 @@ from inverse_agent.models import (
 from inverse_agent.planner import DeterministicPlanner, Planner
 from inverse_agent.policies import default_policy
 from inverse_agent.redaction import redact_text
-from inverse_agent.runner import ApprovalNotRequired, CommandRequest, LocalRunner, PolicyViolation
+from inverse_agent.runner import (
+    ApprovalChallenge,
+    ApprovalNotRequired,
+    CommandRequest,
+    LocalRunner,
+    PolicyViolation,
+)
 
 
 class AgentState(TypedDict, total=False):
@@ -98,10 +105,30 @@ class DurableAgentWorkflow:
         state = cast(AgentState, self.graph.invoke(initial, self._config(spec.run_id)))
         return self._result_from_state(state)
 
-    def resume(self, run_id: str, approval_token: str) -> WorkflowResult:
+    def resume(
+        self,
+        run_id: str,
+        approval_token: str,
+        expected_action_digest: str,
+        expected_challenge_id: str,
+    ) -> WorkflowResult:
+        pending = self.current(run_id).pending_approval
+        if pending is None or pending.get("action_digest") != expected_action_digest:
+            raise ValueError("approval challenge is stale or does not match")
+        checkpoint_challenge_id = pending.get("challenge_id")
+        if checkpoint_challenge_id is not None and checkpoint_challenge_id != expected_challenge_id:
+            raise ValueError("approval challenge is stale or does not match")
         state = cast(
             AgentState,
-            self.graph.invoke(Command(resume=approval_token), self._config(run_id)),
+            self.graph.invoke(
+                Command(
+                    resume={
+                        "approval_token": approval_token,
+                        "challenge_id": expected_challenge_id,
+                    }
+                ),
+                self._config(run_id),
+            ),
         )
         return self._result_from_state(state)
 
@@ -204,12 +231,19 @@ class DurableAgentWorkflow:
         request = CommandRequest(argv=argv, cwd=workspace, domain=domain)
         try:
             challenge = runner.approval_challenge(request)
-            token = interrupt({"kind": "command_approval", **asdict(challenge)})
+            resume_value = interrupt(self._approval_interrupt_payload(challenge, index))
+            if (
+                not isinstance(resume_value, dict)
+                or not isinstance(resume_value.get("approval_token"), str)
+                or not isinstance(resume_value.get("challenge_id"), str)
+            ):
+                raise PolicyViolation("approval resume payload is malformed")
             request = CommandRequest(
                 argv=argv,
                 cwd=workspace,
                 domain=domain,
-                approval_token=str(token),
+                approval_token=resume_value["approval_token"],
+                approval_challenge_id=resume_value["challenge_id"],
             )
         except ApprovalNotRequired:
             pass
@@ -236,6 +270,18 @@ class DurableAgentWorkflow:
             "actions": actions,
             "action_index": index + 1,
             "status": RunStatus.RUNNING.value,
+        }
+
+    @staticmethod
+    def _approval_interrupt_payload(
+        challenge: ApprovalChallenge,
+        action_ordinal: int,
+    ) -> dict[str, Any]:
+        return {
+            "kind": "command_approval",
+            "challenge_id": token_hex(16),
+            "action_ordinal": action_ordinal,
+            **asdict(challenge),
         }
 
     def _finalize_node(self, state: AgentState) -> AgentState:

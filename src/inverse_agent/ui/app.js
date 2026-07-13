@@ -583,6 +583,7 @@ async function resolveApproval(action) {
     return;
   }
   const digest = run.pending_approval.action_digest;
+  const challengeId = run.pending_approval.challenge_id;
   const runId = run.run_id;
   clearPoll();
   const epoch = ++state.navigationEpoch;
@@ -592,7 +593,7 @@ async function resolveApproval(action) {
   try {
     const resolved = await request(`/runs/${encodeURIComponent(runId)}/${action}`, {
       method: "POST",
-      body: {action_digest: digest}
+      body: {action_digest: digest, challenge_id: challengeId}
     });
     await refreshRuns();
     if (selectionMatches(runId, epoch)) {

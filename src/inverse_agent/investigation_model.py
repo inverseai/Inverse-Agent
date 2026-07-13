@@ -14,7 +14,7 @@ from __future__ import annotations
 import json
 import math
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
 from typing import Any, Protocol
 
@@ -38,6 +38,7 @@ from inverse_agent.investigation import (
 from inverse_agent.planner import (
     MAX_MODEL_COMPLETION_TOKENS,
     ModelResponseMetadata,
+    PlannerAttestationError,
     PlannerBudgetError,
     PlannerError,
     PlannerProtocolError,
@@ -68,6 +69,7 @@ DECISION_SCHEMA: dict[str, Any] = {
         "path": {"type": "string"},
         "query": {"type": "string"},
         "glob": {"type": "string"},
+        "based_on_observation_id": {"type": "string"},
         "start_line": {"type": "integer", "minimum": 1},
         "max_lines": {"type": "integer", "minimum": 1, "maximum": 200},
         "summary": {"type": "string"},
@@ -95,6 +97,7 @@ DECISION_SCHEMA: dict[str, Any] = {
         "path",
         "query",
         "glob",
+        "based_on_observation_id",
         "start_line",
         "max_lines",
         "summary",
@@ -118,7 +121,8 @@ _SYSTEM_PROMPT = (
     "Never invent a path: only use a path that appears in an observation or that "
     "you have already read. If a read_file observation already shows the answer, "
     "send final_answer now - do not repeat a call.\n"
-    "Citations: cite a read_file observation only. Copy its observation_id exactly "
+    "Citations: cite a read_file or explicitly CITABLE command observation only. "
+    "Copy its observation_id exactly "
     "from the id= field, use its path, and set start_line/end_line to the numbers "
     "shown before the colon (a line '12: foo' is line 12). Every finding needs a "
     "distinct citation range to a line you actually saw; combine findings when "
@@ -138,6 +142,31 @@ _SYSTEM_PROMPT = (
     "actions.\n"
     'Fill unused fields with "" or [].'
 )
+
+_COMMAND_PROMPT_APPENDIX = (
+    "\nThis run also permits run_command. Set path to one exact name from "
+    "available_commands. Every command requires a fresh human approval. A failed "
+    "command is an observation: diagnose it and replan instead of repeating it. "
+    "When selecting a different command to recover from a failed command, set "
+    "based_on_observation_id to that failed command's exact observation ID; "
+    "otherwise set it to an empty string."
+)
+
+
+def _schema_for_commands(allowed_commands: tuple[str, ...]) -> dict[str, Any]:
+    if not allowed_commands:
+        return DECISION_SCHEMA
+    action = dict(DECISION_SCHEMA["properties"]["action"])
+    action["enum"] = [
+        "read_file",
+        "list_files",
+        "search_text",
+        "run_command",
+        "final_answer",
+    ]
+    properties = dict(DECISION_SCHEMA["properties"])
+    properties["action"] = action
+    return {**DECISION_SCHEMA, "properties": properties}
 
 
 class SupportsStructuredJson(Protocol):
@@ -172,7 +201,7 @@ def _render_block(obs: ToolObservation) -> tuple[str, bool]:
         citable = "not citable (binary)"
     elif obs.tool == "read_file" and not has_citable_line:
         citable = "not citable (blank or redacted)"
-    elif obs.tool == "read_file":
+    elif obs.tool == "read_file" or obs.metadata.get("citable_command"):
         citable = "CITABLE - cite this observation_id with its N: line numbers"
     else:
         citable = "pointer only - read_file a listed path to cite it"
@@ -191,7 +220,11 @@ def _render_block(obs: ToolObservation) -> tuple[str, bool]:
     # A read_file observation is already bounded (<=200 lines / ~3k tokens), so
     # show ALL of its lines: the model may only cite content it was actually shown.
     # Pointer results (list/search) stay capped.
-    limit = len(obs.lines) if obs.tool == "read_file" else CATALOG_LINES_PER_OBS
+    limit = (
+        len(obs.lines)
+        if obs.tool == "read_file" or obs.metadata.get("citable_command")
+        else CATALOG_LINES_PER_OBS
+    )
     shown = obs.lines[:limit]
     fully_rendered = limit >= len(obs.lines)
     rendered_lines = []
@@ -204,7 +237,11 @@ def _render_block(obs: ToolObservation) -> tuple[str, bool]:
             f"negative conclusion.\n{body}"
         )
     is_citable_read = (
-        obs.tool == "read_file" and bool(obs.content_hash) and fully_rendered and has_citable_line
+        (obs.tool == "read_file" or bool(obs.metadata.get("citable_command")))
+        and bool(obs.content_hash)
+        and fully_rendered
+        and has_citable_line
+        and (obs.tool == "read_file" or (not obs.incomplete and not obs.truncated))
     )
     return f"{header}\n{body}", is_citable_read
 
@@ -365,7 +402,9 @@ def _repair_citations(
     reads = [
         obs
         for obs in catalog
-        if obs.tool == "read_file" and obs.content_hash and obs.observation_id in rendered_ids
+        if (obs.tool == "read_file" or obs.metadata.get("citable_command"))
+        and obs.content_hash
+        and obs.observation_id in rendered_ids
     ]
     by_id = {obs.observation_id: obs for obs in reads}
 
@@ -465,6 +504,18 @@ def parse_decision(payload: Mapping[str, Any]) -> Decision:
             start_line=max(1, int(payload.get("start_line") or 1)),
             max_lines=min(200, max(1, int(payload.get("max_lines") or 200))),
         )
+    if action == "run_command":
+        command = str(payload.get("path") or "").strip()
+        if not command:
+            raise ValueError("run_command requires an available command name in path")
+        raw_dependency = _coerce_optional(payload.get("based_on_observation_id"))
+        return ToolCall(
+            tool="run_command",
+            command=command,
+            based_on_observation_id=(
+                _normalize_id(raw_dependency) if raw_dependency is not None else None
+            ),
+        )
     raise ValueError(f"model returned an unsupported action: {action!r}")
 
 
@@ -481,6 +532,7 @@ class ModelInvestigationPlanner:
 
     client: SupportsStructuredJson
     goal_hint: str = ""
+    allowed_commands: tuple[str, ...] = ()
     max_transport_retries: int = 1
     max_schema_retries: int = 1
     max_auto_reads: int = 3
@@ -500,11 +552,16 @@ class ModelInvestigationPlanner:
     transport_retries: int = field(default=0, init=False)
     schema_retries: int = field(default=0, init=False)
     active_deadline: float | None = field(default=None, init=False)
+    source_read_guard: Callable[[], bool] | None = field(default=None, init=False, repr=False)
     _turn: int = field(default=0, init=False)
     _auto_reads: int = field(default=0, init=False)
     _nudges: int = field(default=0, init=False)
 
     def __post_init__(self) -> None:
+        if len(set(self.allowed_commands)) != len(self.allowed_commands) or any(
+            not command or len(command) > 120 for command in self.allowed_commands
+        ):
+            raise ValueError("allowed_commands must contain unique non-empty names")
         if not 0 <= self.max_transport_retries <= 1:
             raise ValueError("max_transport_retries must be 0 or 1")
         if not 0 <= self.max_schema_retries <= 1:
@@ -556,7 +613,11 @@ class ModelInvestigationPlanner:
 
         if self._nudges >= self.max_nudges:
             return None
-        reads = [obs for obs in catalog if obs.tool == "read_file" and obs.content_hash]
+        reads = [
+            obs
+            for obs in catalog
+            if (obs.tool == "read_file" or obs.metadata.get("citable_command")) and obs.content_hash
+        ]
         for citation in answer.citations:
             for obs in reads:
                 if obs.path != citation.path:
@@ -585,7 +646,9 @@ class ModelInvestigationPlanner:
             return None
         covered: dict[str, list[tuple[int, int]]] = {}
         for obs in catalog:
-            if obs.tool == "read_file" and obs.content_hash:
+            if (
+                obs.tool == "read_file" or obs.metadata.get("citable_command")
+            ) and obs.content_hash:
                 last = obs.start_line + len(obs.lines) - 1
                 covered.setdefault(obs.path, []).append((obs.start_line, last))
         for citation in answer.citations:
@@ -606,10 +669,16 @@ class ModelInvestigationPlanner:
             raise PlannerBudgetError("model completion-token budget exhausted")
         return allowance
 
+    def _system_prompt(self) -> str:
+        return _SYSTEM_PROMPT + (_COMMAND_PROMPT_APPENDIX if self.allowed_commands else "")
+
+    def _decision_schema(self) -> dict[str, Any]:
+        return _schema_for_commands(self.allowed_commands)
+
     def _prompt_token_bound(self, prompt: str) -> int:
         encoded_bytes = (
-            len(_SYSTEM_PROMPT.encode("utf-8"))
-            + len(json.dumps(DECISION_SCHEMA, ensure_ascii=True).encode("utf-8"))
+            len(self._system_prompt().encode("utf-8"))
+            + len(json.dumps(self._decision_schema(), ensure_ascii=True).encode("utf-8"))
             + len(prompt.encode("utf-8"))
         )
         estimated = math.ceil(encoded_bytes / self.estimator_bytes_per_token)
@@ -635,11 +704,13 @@ class ModelInvestigationPlanner:
             {
                 "goal": goal,
                 "hint": self.goal_hint,
+                "available_commands": list(self.allowed_commands),
                 "turn": self._turn,
                 "observations": observations,
                 "instructions": (
                     "Return one action. If you have enough evidence, return "
-                    "final_answer with citations; otherwise read or search."
+                    "final_answer with citations; otherwise read, search, or select one "
+                    "available command."
                 ),
             },
             ensure_ascii=True,
@@ -669,6 +740,8 @@ class ModelInvestigationPlanner:
         return charged, metadata.prompt_tokens, reported_completion, metadata.model
 
     def _request(self, prompt: str) -> dict[str, Any]:
+        if self.source_read_guard is not None and not self.source_read_guard():
+            raise PlannerAttestationError("source_read was revoked before model request")
         if self.requests_made >= self.max_total_requests:
             raise PlannerBudgetError("model request budget exhausted")
         timeout_seconds: float | None = None
@@ -686,10 +759,10 @@ class ModelInvestigationPlanner:
         started_at = time.monotonic()
         try:
             payload = self.client.complete_structured_json(
-                system=_SYSTEM_PROMPT,
+                system=self._system_prompt(),
                 prompt=prompt,
                 schema_name="investigation_decision",
-                schema=DECISION_SCHEMA,
+                schema=self._decision_schema(),
                 max_tokens=allowance,
                 timeout_seconds=timeout_seconds,
             )
@@ -784,6 +857,14 @@ class ModelInvestigationPlanner:
                 pending_failure = None
                 payload_received = True
                 decision = parse_decision(payload)
+                if (
+                    isinstance(decision, ToolCall)
+                    and decision.tool == "run_command"
+                    and decision.command not in self.allowed_commands
+                ):
+                    raise ValueError("model selected a command that is unavailable in this run")
+            except PlannerAttestationError:
+                raise
             except PlannerTransportError as exc:
                 if self.requests_made > requests_before:
                     record_executed_retry(pending_retry)

@@ -41,6 +41,8 @@ PACKAGED_BENCHMARK = (
 
 class FakeReviewClient:
     observed_response_models = ("benchmark-model",)
+    observed_response_models_overflowed = False
+    response_model_mismatch_observed = False
     successful_response_count = 1
     attributed_response_count = 1
 
@@ -162,6 +164,8 @@ def test_benchmark_cli_fails_when_endpoint_reported_model_does_not_match(
 ) -> None:
     class Client:
         observed_response_models = ("different-model",)
+        observed_response_models_overflowed = False
+        response_model_mismatch_observed = True
         successful_response_count = 1
         attributed_response_count = 1
 
@@ -210,6 +214,8 @@ def test_benchmark_cli_fails_when_any_successful_response_lacks_model_attributio
 ) -> None:
     class Client:
         observed_response_models = ("benchmark-model",)
+        observed_response_models_overflowed = False
+        response_model_mismatch_observed = False
         successful_response_count = 3
         attributed_response_count = 2
 

@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+import inverse_agent.planner as planner_module
 from inverse_agent.cli import main
 from inverse_agent.model_config import PlannerConfig, resolve_planner
 from inverse_agent.planner import (
@@ -359,6 +360,9 @@ def test_openai_compatible_client_retains_usage_on_protocol_failure() -> None:
     assert metadata.model == "endpoint-model"
     assert metadata.prompt_tokens == 100
     assert metadata.completion_tokens == 7
+    assert client.successful_response_count == 1
+    assert client.attributed_response_count == 1
+    assert client.successful_response_models == ("endpoint-model",)
 
 
 @pytest.mark.parametrize(
@@ -407,6 +411,33 @@ def test_openai_compatible_client_counts_success_without_reported_model() -> Non
     assert client.observed_response_models == ()
     assert client.successful_response_count == 1
     assert client.attributed_response_count == 0
+
+
+def test_openai_compatible_client_bounds_response_model_history(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(planner_module, "MAX_SUCCESSFUL_RESPONSE_MODEL_HISTORY", 3)
+    monkeypatch.setattr(planner_module, "MAX_OBSERVED_RESPONSE_MODELS", 2)
+    client = OpenAICompatibleClient(
+        base_url="http://127.0.0.1:1234/v1",
+        model="requested-model",
+    )
+
+    for index in range(5):
+        client._record_successful_response(f"reported-model-{index}")
+
+    assert client.successful_response_count == 5
+    assert client.successful_response_models == (
+        "reported-model-2",
+        "reported-model-3",
+        "reported-model-4",
+    )
+    assert client.successful_response_models_since(0) is None
+    assert client.successful_response_models_since(2) == client.successful_response_models
+    assert client.successful_response_models_since(4) == ("reported-model-4",)
+    assert client.observed_response_models == ("reported-model-0", "reported-model-1")
+    assert client.observed_response_models_overflowed
+    assert client.response_model_mismatch_observed
 
 
 @pytest.mark.parametrize(

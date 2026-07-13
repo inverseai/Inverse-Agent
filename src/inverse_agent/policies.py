@@ -23,6 +23,8 @@ GIT_SAFE_PREFIX = (
 )
 GIT_STATUS_ARGV = (*GIT_SAFE_PREFIX, "status", "--short", "--branch", "--untracked-files=no")
 GIT_LS_FILES_ARGV = (*GIT_SAFE_PREFIX, "ls-files")
+GIT_HEAD_COMMIT_ARGV = (*GIT_SAFE_PREFIX, "rev-parse", "--verify", "HEAD^{commit}")
+GIT_PARENT_COMMIT_ARGV = (*GIT_SAFE_PREFIX, "rev-parse", "--verify", "HEAD^1^{commit}")
 
 
 def default_policy(workspace_root: Path) -> RunnerPolicy:
@@ -60,6 +62,20 @@ def default_policy(workspace_root: Path) -> RunnerPolicy:
         CommandRule(
             "git-ls-files",
             GIT_LS_FILES_ARGV,
+            Domain.GENERIC,
+            requires_approval=True,
+            reason="Git inspection executes an operator-selected system binary",
+        ),
+        CommandRule(
+            "git-head-commit",
+            GIT_HEAD_COMMIT_ARGV,
+            Domain.GENERIC,
+            requires_approval=True,
+            reason="Git inspection executes an operator-selected system binary",
+        ),
+        CommandRule(
+            "git-parent-commit",
+            GIT_PARENT_COMMIT_ARGV,
             Domain.GENERIC,
             requires_approval=True,
             reason="Git inspection executes an operator-selected system binary",

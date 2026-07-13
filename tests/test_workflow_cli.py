@@ -13,8 +13,10 @@ import pytest
 
 from inverse_agent.cli import approve_command, main
 from inverse_agent.models import AutonomyLevel, Domain, RunStatus
-from inverse_agent.planner import DeterministicPlanner, Planner
+from inverse_agent.planner import DeterministicPlanner, ExecutionPlan, PlannedAction, Planner
+from inverse_agent.runner import ApprovalChallenge
 from inverse_agent.service import AgentService, RunRecord, RunStore
+from inverse_agent.workflow import DurableAgentWorkflow
 
 FIXTURES = Path(__file__).parent / "fixtures"
 SECRET = b"test-workflow-secret-that-is-at-least-32-bytes"
@@ -39,6 +41,7 @@ def _approve(service: AgentService, record, approved_by: str):
         record.run_id,
         approved_by=approved_by,
         expected_action_digest=record.pending_approval["action_digest"],
+        expected_challenge_id=record.pending_approval["challenge_id"],
     )
 
 
@@ -74,6 +77,7 @@ def test_approve_command_returns_failure_for_failed_run(
         run_id=record.run_id,
         approved_by="tester",
         action_digest="digest",
+        challenge_id="0" * 32,
     )
 
     assert approve_command(args) == 1
@@ -105,6 +109,45 @@ def test_django_workflow_pauses_for_each_action_then_succeeds(tmp_path: Path) ->
     assert payload["status"] == "succeeded"
     assert len(payload["approvals"]) == 2
     assert payload["planner_fingerprint"] == "deterministic"
+
+
+def test_delayed_approval_cannot_authorize_an_identical_next_action(tmp_path: Path) -> None:
+    class RepeatedActionPlanner:
+        def plan(self, **_kwargs: object) -> ExecutionPlan:
+            return ExecutionPlan(
+                (PlannedAction("django.check"), PlannedAction("django.check")),
+                "repeat one action to exercise challenge identity",
+            )
+
+    service = _service(tmp_path / "state", planner=RepeatedActionPlanner())
+    try:
+        service.trust_workspace(FIXTURES / "django_project", trusted_by="tester")
+        created = service.create_run(
+            goal="Run the same check twice",
+            workspace=FIXTURES / "django_project",
+            domain=Domain.DJANGO,
+        )
+        first = service.start(created.run_id)
+        first_digest = first.pending_approval["action_digest"]
+        first_challenge = first.pending_approval["challenge_id"]
+        second = _approve(service, first, "tester")
+
+        assert second.pending_approval["action_digest"] == first_digest
+        assert second.pending_approval["challenge_id"] != first_challenge
+        with pytest.raises(ValueError, match="stale or does not match"):
+            service.approve_and_resume(
+                created.run_id,
+                approved_by="tester",
+                expected_action_digest=first_digest,
+                expected_challenge_id=first_challenge,
+            )
+        still_waiting = service.get(created.run_id)
+        assert still_waiting.status == RunStatus.WAITING_FOR_APPROVAL.value
+        final = _approve(service, still_waiting, "tester")
+        assert final.status == RunStatus.SUCCEEDED.value
+        assert final.completed_actions == 2
+    finally:
+        service.close()
 
 
 def test_goal_is_redacted_before_persistence_and_trace_output(tmp_path: Path) -> None:
@@ -247,6 +290,7 @@ def test_workflow_resumes_after_service_restart(tmp_path: Path) -> None:
     first_service.runs.claim_pending(
         created.run_id,
         waiting.pending_approval["action_digest"],
+        waiting.pending_approval["challenge_id"],
     )
     first_service.close()
     assert waiting.status == RunStatus.WAITING_FOR_APPROVAL.value
@@ -259,6 +303,62 @@ def test_workflow_resumes_after_service_restart(tmp_path: Path) -> None:
     finally:
         resumed_service.close()
     assert resumed.status == RunStatus.WAITING_FOR_APPROVAL.value
+    assert resumed.pending_approval["rule"] == "django-test"
+
+
+def test_legacy_checkpoint_without_challenge_id_resumes_after_upgrade(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_dir = tmp_path / "state"
+
+    def legacy_payload(
+        challenge: ApprovalChallenge,
+        _action_ordinal: int,
+    ) -> dict[str, object]:
+        return {
+            "action_digest": challenge.action_digest,
+            "rule": challenge.rule,
+            "argv": challenge.argv,
+            "workspace": challenge.workspace,
+            "domain": challenge.domain,
+            "reason": challenge.reason,
+        }
+
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            DurableAgentWorkflow,
+            "_approval_interrupt_payload",
+            staticmethod(legacy_payload),
+        )
+        legacy_service = _service(state_dir)
+        try:
+            legacy_service.trust_workspace(FIXTURES / "django_project", trusted_by="tester")
+            created = legacy_service.create_run(
+                goal="Resume a pre-challenge-id checkpoint",
+                workspace=FIXTURES / "django_project",
+                domain=Domain.DJANGO,
+            )
+            waiting = legacy_service.start(created.run_id)
+            checkpoint_pending = legacy_service.workflow.current(created.run_id).pending_approval
+            assert checkpoint_pending is not None
+            assert "challenge_id" not in checkpoint_pending
+            assert waiting.pending_approval is not None
+            projected_challenge_id = waiting.pending_approval["challenge_id"]
+        finally:
+            legacy_service.close()
+
+    upgraded_service = _service(state_dir)
+    try:
+        recovered = upgraded_service.get(created.run_id)
+        assert recovered.pending_approval is not None
+        assert recovered.pending_approval["challenge_id"] == projected_challenge_id
+        resumed = _approve(upgraded_service, recovered, "tester")
+    finally:
+        upgraded_service.close()
+
+    assert resumed.status == RunStatus.WAITING_FOR_APPROVAL.value
+    assert resumed.pending_approval is not None
     assert resumed.pending_approval["rule"] == "django-test"
 
 
@@ -593,6 +693,7 @@ def test_concurrent_stale_approvals_cannot_advance_two_actions(tmp_path: Path) -
         )
         waiting = service.start(created.run_id)
         digest = waiting.pending_approval["action_digest"]
+        challenge_id = waiting.pending_approval["challenge_id"]
 
         def approve() -> str:
             try:
@@ -600,6 +701,7 @@ def test_concurrent_stale_approvals_cannot_advance_two_actions(tmp_path: Path) -
                     created.run_id,
                     approved_by="tester",
                     expected_action_digest=digest,
+                    expected_challenge_id=challenge_id,
                 )
                 return "accepted"
             except ValueError:

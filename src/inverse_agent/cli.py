@@ -78,6 +78,7 @@ def approve_command(args: argparse.Namespace) -> int:
             args.run_id,
             approved_by=args.approved_by,
             expected_action_digest=args.action_digest,
+            expected_challenge_id=args.challenge_id,
         )
         print(json.dumps(asdict(record), default=json_default, indent=2))
         if record.status == RunStatus.WAITING_FOR_APPROVAL.value:
@@ -203,6 +204,8 @@ def benchmark_review_command(args: argparse.Namespace) -> int:
         attributed_responses = resolution.client.attributed_response_count
         endpoint_model_consistent = (
             reported_models == (requested_model,)
+            and not resolution.client.observed_response_models_overflowed
+            and not resolution.client.response_model_mismatch_observed
             and successful_responses > 0
             and attributed_responses == successful_responses
         )
@@ -336,6 +339,7 @@ def build_parser() -> argparse.ArgumentParser:
     approve.add_argument("run_id")
     approve.add_argument("--approved-by", required=True)
     approve.add_argument("--action-digest", required=True)
+    approve.add_argument("--challenge-id", required=True)
     approve.add_argument("--workspace-root", required=True)
     approve.add_argument("--state-dir", default=default_state_dir())
     _add_model_arguments(approve)
@@ -392,7 +396,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     benchmark_investigation = sub.add_parser(
         "benchmark-investigation",
-        help="Run the seven-domain read-only investigation acceptance gate",
+        help="Run the seven-case semantic investigation acceptance gate",
     )
     benchmark_investigation.add_argument("--output")
     benchmark_investigation.add_argument(
@@ -440,7 +444,16 @@ def benchmark_investigation_command(args: argparse.Namespace) -> int:
     cases = default_cases()
     endpoint_model_consistent = True
     provenance: dict[str, object] | None = None
-    if args.model:
+    model_requested = args.model is not None
+    if model_requested:
+        if (
+            not isinstance(args.model, str)
+            or not args.model.strip()
+            or args.model != args.model.strip()
+        ):
+            raise ValueError(
+                "--model must be a non-empty identifier without surrounding whitespace"
+            )
         import os
 
         from inverse_agent.investigation_model import ModelInvestigationPlanner
@@ -497,26 +510,38 @@ def benchmark_investigation_command(args: argparse.Namespace) -> int:
         from inverse_agent.investigation import AgentBudget
 
         def factory(case: BenchmarkCase, goal: str) -> ModelInvestigationPlanner:
+            del goal
             return ModelInvestigationPlanner(
                 client=client,
                 context_tokens=context_tokens,
                 estimator_bytes_per_token=estimator_bytes_per_token,
+                goal_hint=case.model_hint,
+                allowed_commands=case.command_tools,
             )
 
-        # A local 20B model needs more exploration budget than the tight default
-        # to locate evidence across files and recover from a wrong first guess.
-        budget = AgentBudget(max_decisions=20, max_tool_calls=16, max_physical_requests=30)
-        result = run_benchmark_with_planner(cases, factory, budget=budget)
+        # The gate uses the same calibrated contract as production investigations.
+        budget = AgentBudget()
+        result = run_benchmark_with_planner(
+            cases,
+            factory,
+            budget=budget,
+            expected_model=args.model,
+            model_client=client,
+        )
         # Every successful response must be attributed to exactly the requested
         # model; a substituted or unattributed model is gate-fatal.
         endpoint_model_consistent = (
             client.observed_response_models == (args.model,)
+            and not client.observed_response_models_overflowed
+            and not client.response_model_mismatch_observed
             and client.successful_response_count > 0
             and client.attributed_response_count == client.successful_response_count
         )
         provenance = {
             "requested_model": args.model,
             "reported_models": list(client.observed_response_models),
+            "reported_models_overflowed": client.observed_response_models_overflowed,
+            "model_mismatch_observed": client.response_model_mismatch_observed,
             "successful_responses": client.successful_response_count,
             "attributed_responses": client.attributed_response_count,
             "endpoint_model_consistent": endpoint_model_consistent,
@@ -527,12 +552,13 @@ def benchmark_investigation_command(args: argparse.Namespace) -> int:
         result = run_benchmark(cases)
     gate_passed = result.gate_passed and endpoint_model_consistent
     summary = {
-        "planner": "model" if args.model else "deterministic",
+        "planner": "model" if model_requested else "deterministic",
         "cases_passed": result.cases_passed,
         "total_cases": result.total_cases,
         "variants_passed": result.variants_passed,
         "total_variants": result.total_variants,
         "gate_passed": gate_passed,
+        "integrity_failures": list(result.integrity_failures),
         "model_provenance": provenance,
         "variants": [
             {
@@ -540,8 +566,10 @@ def benchmark_investigation_command(args: argparse.Namespace) -> int:
                 "passed": variant.passed,
                 "verdict": variant.verdict,
                 "reason": variant.reason,
+                "integrity_failures": list(variant.integrity_failures),
                 "decisions_used": variant.decisions_used,
                 "tool_calls_used": variant.tool_calls_used,
+                "command_calls_used": variant.command_calls_used,
                 "physical_requests_used": variant.physical_requests_used,
                 "completion_tokens_used": variant.completion_tokens_used,
                 "completion_tokens_charged": variant.completion_tokens_charged,
@@ -551,6 +579,12 @@ def benchmark_investigation_command(args: argparse.Namespace) -> int:
                 "transport_retries": variant.transport_retries,
                 "schema_retries": variant.schema_retries,
                 "model_calls": [asdict(call) for call in variant.model_calls],
+                "model_endpoint_audit": (
+                    asdict(variant.model_endpoint_audit)
+                    if variant.model_endpoint_audit is not None
+                    else None
+                ),
+                "command_audit": [asdict(item) for item in variant.command_audit],
             }
             for variant in result.variants
         ],

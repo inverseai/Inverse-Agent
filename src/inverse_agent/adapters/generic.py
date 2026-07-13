@@ -7,7 +7,12 @@ from pathlib import Path
 from inverse_agent.adapters.base import CommandAdapter, Tool
 from inverse_agent.environments import discover_system_executable
 from inverse_agent.models import Domain, WorkspaceProfile
-from inverse_agent.policies import GIT_LS_FILES_ARGV, GIT_STATUS_ARGV
+from inverse_agent.policies import (
+    GIT_HEAD_COMMIT_ARGV,
+    GIT_LS_FILES_ARGV,
+    GIT_PARENT_COMMIT_ARGV,
+    GIT_STATUS_ARGV,
+)
 
 
 class GenericGitAdapter(CommandAdapter):
@@ -24,6 +29,8 @@ class GenericGitAdapter(CommandAdapter):
             commands = {
                 "status": [str(git), *GIT_STATUS_ARGV[1:]],
                 "tracked_files": [str(git), *GIT_LS_FILES_ARGV[1:]],
+                "head_commit": [str(git), *GIT_HEAD_COMMIT_ARGV[1:]],
+                "parent_commit": [str(git), *GIT_PARENT_COMMIT_ARGV[1:]],
             }
         else:
             unavailable["git"] = "Git executable not found"
@@ -47,6 +54,18 @@ class GenericGitAdapter(CommandAdapter):
             Tool(
                 "generic.tracked_files",
                 "List files tracked by Git",
+                "approval-required",
+                self.domain,
+            ),
+            Tool(
+                "generic.head_commit",
+                "Resolve the current HEAD commit",
+                "approval-required",
+                self.domain,
+            ),
+            Tool(
+                "generic.parent_commit",
+                "Resolve HEAD's first parent when one exists",
                 "approval-required",
                 self.domain,
             ),

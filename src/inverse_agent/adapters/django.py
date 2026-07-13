@@ -60,6 +60,7 @@ class DjangoAdapter(CommandAdapter):
         root: Path,
         *,
         approval_token: str | None = None,
+        approval_challenge_id: str | None = None,
     ) -> ToolResult:
         profile = self.profile(root)
         result = self.run_command(
@@ -67,6 +68,7 @@ class DjangoAdapter(CommandAdapter):
             root,
             profile.commands["check"],
             approval_token=approval_token,
+            approval_challenge_id=approval_challenge_id,
         )
         return ToolResult(
             name="django.check",
@@ -81,6 +83,7 @@ class DjangoAdapter(CommandAdapter):
         root: Path,
         *,
         approval_token: str | None = None,
+        approval_challenge_id: str | None = None,
     ) -> ToolResult:
         profile = self.profile(root)
         result = self.run_command(
@@ -88,6 +91,7 @@ class DjangoAdapter(CommandAdapter):
             root,
             profile.commands["test"],
             approval_token=approval_token,
+            approval_challenge_id=approval_challenge_id,
         )
         return ToolResult(
             name="django.test",

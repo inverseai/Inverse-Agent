@@ -8,7 +8,12 @@ from inverse_agent.adapters.ios import IosAdapter
 from inverse_agent.adapters.pytorch import PyTorchAdapter
 from inverse_agent.adapters.registry import detect_workspace
 from inverse_agent.models import Domain
-from inverse_agent.policies import GIT_STATUS_ARGV, default_policy
+from inverse_agent.policies import (
+    GIT_HEAD_COMMIT_ARGV,
+    GIT_PARENT_COMMIT_ARGV,
+    GIT_STATUS_ARGV,
+    default_policy,
+)
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -70,10 +75,17 @@ def test_generic_git_adapter_registers_hardened_read_tools(tmp_path: Path) -> No
 
     assert adapter.detect(tmp_path)
     assert Domain.GENERIC in profile.domains
-    assert set(profile.commands) == {"status", "tracked_files"}
+    assert set(profile.commands) == {
+        "status",
+        "tracked_files",
+        "head_commit",
+        "parent_commit",
+    }
     assert Path(profile.commands["status"][0]).is_absolute()
     assert profile.commands["status"][1:] == list(GIT_STATUS_ARGV[1:])
     assert "--no-optional-locks" in profile.commands["status"]
+    assert profile.commands["head_commit"][1:] == list(GIT_HEAD_COMMIT_ARGV[1:])
+    assert profile.commands["parent_commit"][1:] == list(GIT_PARENT_COMMIT_ARGV[1:])
     assert {tool.safety for tool in adapter.tools()} == {"approval-required"}
     git_rules = [
         rule for rule in default_policy(tmp_path).allowed_commands if rule.name.startswith("git-")
