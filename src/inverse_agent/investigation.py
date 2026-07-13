@@ -21,6 +21,7 @@ from inverse_agent.attestations import AttestationScope, ScopedTrustStore
 from inverse_agent.fs_tools import (
     FsToolError,
     PolicyViolationError,
+    RequestValidationError,
     StrictDecodeError,
     ToolObservation,
     WorkspaceReader,
@@ -39,6 +40,8 @@ __all__ = [
     "StopReason",
     "ToolCall",
     "ToolObservation",
+    "citation_intersects_redaction",
+    "line_body",
 ]
 
 
@@ -51,6 +54,7 @@ class InvestigationVerdict(StrEnum):
 class StopReason(StrEnum):
     FINISHED = "finished"
     BUDGET_EXHAUSTED = "budget_exhausted"
+    MALFORMED_ANSWER = "malformed_answer"
     UNSUPPORTED_CITATION = "unsupported_citation"
     STRICT_DECODE_REFUSAL = "strict_decode_refusal"
     INCOMPLETE_EVIDENCE = "incomplete_evidence"
@@ -174,12 +178,12 @@ def _dispatch(reader: WorkspaceReader, call: ToolCall) -> ToolObservation:
         return reader.list_files(call.path, glob=call.glob)
     if call.tool == "search_text":
         if call.query is None:
-            raise FsToolError("search_text requires a query")
+            raise RequestValidationError("search_text requires a query")
         return reader.search_text(call.query, glob=call.glob)
-    raise FsToolError(f"unknown tool: {call.tool}")
+    raise RequestValidationError(f"unknown tool: {call.tool}")
 
 
-def _line_body(numbered: str) -> str:
+def line_body(numbered: str) -> str:
     """Strip the ``N: `` prefix a read/list observation prepends to each line."""
 
     _, _, body = numbered.partition(": ")
@@ -193,7 +197,7 @@ def _redacted_lines(observation: ToolObservation) -> frozenset[int]:
     return frozenset(item for item in raw if isinstance(item, int) and item >= 1)
 
 
-def _citation_intersects_redaction(observation: ToolObservation, citation: SourceCitation) -> bool:
+def citation_intersects_redaction(observation: ToolObservation, citation: SourceCitation) -> bool:
     redacted = _redacted_lines(observation)
     return any(citation.start_line <= line <= citation.end_line for line in redacted)
 
@@ -231,14 +235,12 @@ def _is_evidence(observation: ToolObservation) -> bool:
     redacted = _redacted_lines(observation)
     for offset, numbered in enumerate(observation.lines):
         line_number = observation.start_line + offset
-        if line_number not in redacted and _line_body(numbered).strip():
+        if line_number not in redacted and line_body(numbered).strip():
             return True
     return False
 
 
-def _validate_citations(answer: AgentAnswer, catalog: tuple[ToolObservation, ...]) -> str | None:
-    """Return an error string if any citation is unsupported, else None."""
-
+def _validate_answer_structure(answer: AgentAnswer) -> str | None:
     if not answer.summary.strip():
         return "final answer summary is empty"
     if not answer.findings or any(not finding.strip() for finding in answer.findings):
@@ -247,10 +249,28 @@ def _validate_citations(answer: AgentAnswer, catalog: tuple[ToolObservation, ...
         return "final answer must contain non-empty recommended next actions"
     if len(answer.findings) != len(answer.citations):
         return "each finding must have one positionally corresponding citation"
-    # Refusals, empty results, and binary observations are not citable evidence.
-    by_id = {obs.observation_id: obs for obs in catalog if _is_evidence(obs)}
     if not answer.citations:
         return "final answer contains no citations"
+    citation_keys = {
+        (_canonical_request_path(citation.path), citation.start_line, citation.end_line)
+        for citation in answer.citations
+    }
+    if len(citation_keys) != len(answer.citations):
+        return "each finding must use a distinct citation range"
+    return None
+
+
+def _validate_citations(
+    answer: AgentAnswer,
+    catalog: tuple[ToolObservation, ...],
+    *,
+    identity_for: Callable[[str], str | None],
+) -> str | None:
+    """Return an error string if any citation is unsupported, else None."""
+
+    # Refusals, empty results, and binary observations are not citable evidence.
+    by_id = {obs.observation_id: obs for obs in catalog if _is_evidence(obs)}
+    physical_ranges: set[tuple[tuple[object, ...], int, int]] = set()
     for citation in answer.citations:
         observation = by_id.get(citation.observation_id)
         if observation is None:
@@ -263,18 +283,29 @@ def _validate_citations(answer: AgentAnswer, catalog: tuple[ToolObservation, ...
         max_line = observation.start_line + len(observation.lines) - 1
         if citation.start_line < observation.start_line or citation.end_line > max_line:
             return "citation line range is outside the returned observation"
-        if _citation_intersects_redaction(observation, citation):
+        if citation_intersects_redaction(observation, citation):
             return "citation intersects a redacted source line"
         # The cited lines themselves must contain real (non-blank) content.
         lo = citation.start_line - observation.start_line
         hi = citation.end_line - observation.start_line + 1
-        if not any(_line_body(line).strip() for line in observation.lines[lo:hi]):
+        if not any(line_body(line).strip() for line in observation.lines[lo:hi]):
             return "citation resolves only to blank or redacted content"
+        identity = identity_for(observation.observation_id)
+        source_key: tuple[object, ...]
+        if identity is not None:
+            source_key = ("file", identity)
+        else:
+            source_key = ("path", _canonical_request_path(observation.path))
+        range_key = (source_key, citation.start_line, citation.end_line)
+        if range_key in physical_ranges:
+            return "each finding must use a distinct physical citation range"
+        physical_ranges.add(range_key)
     return None
 
 
 def _has_unresolved_negative_uncertainty(
-    answer: AgentAnswer, catalog: tuple[ToolObservation, ...]
+    answer: AgentAnswer,
+    catalog: tuple[ToolObservation, ...],
 ) -> bool:
     """Whether current evidence can support the answer's negative conclusion.
 
@@ -287,6 +318,8 @@ def _has_unresolved_negative_uncertainty(
 
     latest_pointers: dict[tuple[object, ...], ToolObservation] = {}
     for observation in catalog:
+        if observation.metadata.get("request_invalid"):
+            continue
         if observation.tool == "list_files":
             scope: tuple[object, ...] = (
                 observation.tool,
@@ -305,15 +338,29 @@ def _has_unresolved_negative_uncertainty(
     if any(obs.incomplete or obs.truncated for obs in latest_pointers.values()):
         return True
 
-    cited_paths = {citation.path for citation in answer.citations}
-    latest_reads: dict[str, ToolObservation] = {}
-    for observation in catalog:
-        if observation.tool == "read_file" and observation.path in cited_paths:
-            latest_reads[observation.path] = observation
-    return any(
-        observation.incomplete or bool(observation.metadata.get("refused"))
-        for observation in latest_reads.values()
-    )
+    by_id = {observation.observation_id: observation for observation in catalog}
+    cited_observations: list[ToolObservation] = []
+    for citation in answer.citations:
+        cited_observation = by_id.get(citation.observation_id)
+        if cited_observation is not None:
+            cited_observations.append(cited_observation)
+    for cited in cited_observations:
+        cited_path = _canonical_request_path(cited.path)
+        folded_path = cited_path.casefold()
+        latest_variants: dict[str, ToolObservation] = {}
+        for observation in catalog:
+            if observation.tool != "read_file" or observation.metadata.get("request_invalid"):
+                continue
+            observed_path = _canonical_request_path(observation.path)
+            if observed_path.casefold() != folded_path:
+                continue
+            latest_variants[observed_path] = observation
+        if any(
+            observation.incomplete or bool(observation.metadata.get("refused"))
+            for observation in latest_variants.values()
+        ):
+            return True
+    return False
 
 
 class InvestigationLoop:
@@ -424,7 +471,24 @@ class InvestigationLoop:
             decisions += 1
 
             if isinstance(decision, AgentAnswer):
-                citation_error = _validate_citations(decision, tuple(catalog))
+                structure_error = _validate_answer_structure(decision)
+                if structure_error is not None:
+                    return self._finish(
+                        run_id,
+                        InvestigationVerdict.INCOMPLETE,
+                        StopReason.MALFORMED_ANSWER,
+                        decision,
+                        catalog,
+                        decisions,
+                        tool_calls,
+                        physical,
+                        error=structure_error,
+                    )
+                citation_error = _validate_citations(
+                    decision,
+                    tuple(catalog),
+                    identity_for=reader.evidence_identity,
+                )
                 if citation_error is not None:
                     return self._finish(
                         run_id,
@@ -439,7 +503,10 @@ class InvestigationLoop:
                     )
                 unresolved_uncertainty = (
                     not decision.issue_present
-                    and _has_unresolved_negative_uncertainty(decision, tuple(catalog))
+                    and _has_unresolved_negative_uncertainty(
+                        decision,
+                        tuple(catalog),
+                    )
                 )
                 if not decision.complete or unresolved_uncertainty:
                     return self._finish(
@@ -556,6 +623,7 @@ class InvestigationLoop:
                     incomplete=True,
                     metadata={
                         "refused": True,
+                        "request_invalid": isinstance(exc, RequestValidationError),
                         "query": decision.query,
                         "glob": decision.glob,
                         "recursive": (

@@ -20,8 +20,10 @@ from inverse_agent.fs_tools import (
 from inverse_agent.secure_fs import (
     SecureEntry,
     SecureFsPolicyError,
+    SecureFsTooLargeError,
     SecureFsWorkspacePolicyError,
     SecureListing,
+    SecureWorkspace,
     _decode_windows_directory_name,
 )
 
@@ -44,6 +46,23 @@ def test_read_file_returns_numbered_lines(workspace: Path) -> None:
     assert obs.lines[0] == "1: line one"
     assert obs.content_hash
     assert not obs.incomplete
+    assert "file_identity" not in obs.metadata
+    assert reader.evidence_identity(obs.observation_id)
+
+
+def test_evidence_identity_is_private_and_reader_keyed(workspace: Path) -> None:
+    first_reader = WorkspaceReader.open(workspace)
+    second_reader = WorkspaceReader.open(workspace)
+    first = first_reader.read_file("src/app.py")
+    second = second_reader.read_file("src/app.py")
+
+    assert "file_identity" not in first.metadata
+    assert "evidence_identity" not in first.metadata
+    assert first_reader.evidence_identity(first.observation_id)
+    assert second_reader.evidence_identity(second.observation_id)
+    assert first_reader.evidence_identity(first.observation_id) != second_reader.evidence_identity(
+        second.observation_id
+    )
 
 
 def test_read_file_rejects_absolute_path(workspace: Path) -> None:
@@ -163,9 +182,83 @@ def test_invalid_utf16_directory_name_is_skippable() -> None:
     assert _decode_windows_directory_name(b"\x00\xd8") is None
 
 
+def test_windows_read_growth_past_cap_is_too_large(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ctypes
+
+    import inverse_agent.secure_fs as secure_fs
+
+    class FakeReadFile:
+        argtypes: object = None
+        restype: object = None
+
+        def __init__(self, data: bytes) -> None:
+            self.data = data
+
+        def __call__(
+            self,
+            handle: object,
+            buffer: object,
+            size: int,
+            count_pointer: object,
+            overlapped: object,
+        ) -> int:
+            del handle, overlapped
+            chunk = self.data[:size]
+            self.data = self.data[len(chunk) :]
+            if chunk:
+                ctypes.memmove(buffer, chunk, len(chunk))
+            count_pointer._obj.value = len(chunk)  # type: ignore[attr-defined]
+            return 1
+
+    class FakeKernel32:
+        def __init__(self) -> None:
+            self.ReadFile = FakeReadFile(b"abcde")
+
+    monkeypatch.setattr(secure_fs, "_windows_api", lambda: (FakeKernel32(), object()))
+    with pytest.raises(SecureFsTooLargeError, match="maximum readable size"):
+        secure_fs._windows_read(1, maximum_bytes=4, deadline=float("inf"))
+
+
+def test_windows_listing_counts_undecodable_name_without_platform_api(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import contextlib
+
+    import inverse_agent.secure_fs as secure_fs
+
+    @contextlib.contextmanager
+    def fake_target(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        yield 1
+
+    monkeypatch.setattr(SecureWorkspace, "_windows_target", fake_target)
+    monkeypatch.setattr(
+        secure_fs,
+        "_windows_directory_names",
+        lambda *args, **kwargs: iter(((None, 0),)),
+    )
+    listing = SecureWorkspace(tmp_path, (1, 1))._list_windows(
+        (), maximum_visits=10, deadline=float("inf")
+    )
+    assert listing.entries == ()
+    assert listing.visited == 1
+    assert listing.filtered == 1
+    assert not listing.truncated
+
+
+def test_secure_listing_defaults_new_accounting_fields() -> None:
+    listing = SecureListing(entries=(), visited=0, refused=0)
+    assert listing.filtered == 0
+    assert listing.truncated is False
+
+
 def test_posix_root_non_directory_is_workspace_policy(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # This is intentionally platform-independent: os.open is replaced before
+    # _posix_root reaches the OS, and all POSIX flag lookups use getattr(..., 0).
     import inverse_agent.secure_fs as secure_fs
 
     def non_directory(*args: object, **kwargs: object) -> int:
@@ -579,6 +672,21 @@ def test_search_degrades_post_walk_policy_race_to_incomplete(
     assert observation.metadata["policy_race_refused"] == 1
 
 
+def test_search_keeps_workspace_root_policy_violation_gate_fatal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "raced.py").write_text("needle\n", encoding="utf-8")
+    reader = WorkspaceReader.open(tmp_path)
+
+    def refuse_workspace(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        raise SecureFsWorkspacePolicyError("workspace root was replaced")
+
+    monkeypatch.setattr(reader.secure, "read_bytes", refuse_workspace)
+    with pytest.raises(PolicyViolationError, match="workspace root was replaced"):
+        reader.search_text("needle")
+
+
 def test_read_file_past_eof_yields_no_citable_lines(tmp_path: Path) -> None:
     # Regression: a start past EOF must not manufacture a phantom line.
     (tmp_path / "small.py").write_text("a = 1\nb = 2\n", encoding="utf-8")
@@ -652,6 +760,37 @@ def test_flat_listing_omits_overlong_name_without_slicing(
         refused=0,
         filtered=0,
         truncated=False,
+    )
+
+    def fake_listing(*args: object, **kwargs: object) -> SecureListing:
+        del args, kwargs
+        return listing
+
+    monkeypatch.setattr(reader.secure, "list_directory", fake_listing)
+    observation = reader.list_files(".")
+    assert observation.lines == ()
+    assert observation.incomplete and observation.truncated
+    assert observation.metadata["filtered_entry_count"] == 1
+
+
+def test_flat_listing_counts_directory_suffix_in_path_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    reader = WorkspaceReader.open(tmp_path)
+    listing = SecureListing(
+        entries=(
+            SecureEntry(
+                name="a" * 512,
+                is_dir=True,
+                is_file=False,
+                size=0,
+                link_count=1,
+                identity=(1, 1),
+                change_token=(1, 1),
+            ),
+        ),
+        visited=1,
+        refused=0,
     )
 
     def fake_listing(*args: object, **kwargs: object) -> SecureListing:

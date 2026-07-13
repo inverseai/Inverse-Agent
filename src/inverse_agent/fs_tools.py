@@ -15,14 +15,16 @@ an earlier observation actually returned.
 from __future__ import annotations
 
 import hashlib
+import hmac
 import re
+import secrets
 import time
 from bisect import bisect_left
 from dataclasses import dataclass, field
 from fnmatch import fnmatch
 from pathlib import Path, PurePosixPath
 
-from inverse_agent.redaction import SECRET_PATTERNS, private_key_spans
+from inverse_agent.redaction import secret_spans
 from inverse_agent.secure_fs import (
     SecureFsDeadlineError,
     SecureFsError,
@@ -105,6 +107,10 @@ class PolicyViolationError(FsToolError):
     """
 
 
+class RequestValidationError(FsToolError):
+    """A model request has an invalid shape and can be corrected without new evidence."""
+
+
 class StrictDecodeError(FsToolError):
     """A file could not be strict-decoded as UTF-8 and was refused."""
 
@@ -146,7 +152,7 @@ def _require_utf8(value: str, label: str) -> None:
     try:
         value.encode("utf-8")
     except UnicodeEncodeError as exc:
-        raise FsToolError(f"{label} contains non-UTF-8 text") from exc
+        raise RequestValidationError(f"{label} contains non-UTF-8 text") from exc
 
 
 def _reject_component(name: str) -> None:
@@ -232,16 +238,11 @@ def _sanitize_line_preserving(
     # as either the username or scheme of a credential-bearing URL). Private
     # keys use a linear marker-aware scan so nested or malformed blocks cannot
     # hide an outer BEGIN marker and leak the remaining key tail.
-    spans = [(start, end) for start, end, _complete in private_key_spans(text)]
-    if time.monotonic() > deadline:
-        raise FsToolError("source sanitization exceeded its deadline")
-    for _name, pattern in SECRET_PATTERNS:
+    def check_deadline() -> None:
         if time.monotonic() > deadline:
             raise FsToolError("source sanitization exceeded its deadline")
-        for match in pattern.finditer(text):
-            spans.append(match.span())
-            if len(spans) % 128 == 0 and time.monotonic() > deadline:
-                raise FsToolError("source sanitization exceeded its deadline")
+
+    spans = [(secret.start, secret.end) for secret in secret_spans(text, check=check_deadline)]
     if not spans:
         return text, False, ()
 
@@ -290,6 +291,16 @@ class WorkspaceReader:
 
     workspace: Path
     secure: SecureWorkspace
+    _identity_key: bytes = field(
+        default_factory=lambda: secrets.token_bytes(32),
+        repr=False,
+        compare=False,
+    )
+    _identity_by_observation: dict[str, str] = field(
+        default_factory=dict,
+        repr=False,
+        compare=False,
+    )
 
     @classmethod
     def open(cls, workspace: Path) -> WorkspaceReader:
@@ -298,6 +309,16 @@ class WorkspaceReader:
         except SecureFsError as exc:
             raise _tool_error(exc) from exc
         return cls(secure.workspace, secure)
+
+    def evidence_identity(self, observation_id: str) -> str | None:
+        """Return a run-local opaque file identity that is never model-visible."""
+
+        return self._identity_by_observation.get(observation_id)
+
+    def _remember_identity(self, observation_id: str, identity: tuple[int, int]) -> None:
+        raw = f"{self.secure.root_identity[0]}:{self.secure.root_identity[1]}:{identity[0]}:{identity[1]}"
+        digest = hmac.new(self._identity_key, raw.encode("ascii"), hashlib.sha256).hexdigest()
+        self._identity_by_observation[observation_id] = digest
 
     @staticmethod
     def _deadline() -> float:
@@ -310,15 +331,17 @@ class WorkspaceReader:
         start_line: int = 1,
         max_lines: int = READ_MAX_LINES,
     ) -> ToolObservation:
-        if start_line < 1:
-            raise FsToolError("start_line must be >= 1")
-        if not 1 <= max_lines <= READ_MAX_LINES:
-            raise FsToolError(f"max_lines must be between 1 and {READ_MAX_LINES}")
+        # Security-sensitive path policy takes precedence over correctable
+        # request-shape errors when several arguments are invalid together.
         parts = _relative_parts(path)
         if not parts:
             raise PolicyViolationError("path must reference a file inside the workspace")
         relative = "/".join(parts)
         _reject_sensitive_name(relative.rsplit("/", 1)[-1])
+        if start_line < 1:
+            raise RequestValidationError("start_line must be >= 1")
+        if not 1 <= max_lines <= READ_MAX_LINES:
+            raise RequestValidationError(f"max_lines must be between 1 and {READ_MAX_LINES}")
         deadline = self._deadline()
         try:
             secure_read = self.secure.read_bytes(
@@ -332,7 +355,7 @@ class WorkspaceReader:
         entry = secure_read.entry
         if _looks_binary(data):
             empty_hash = hashlib.sha256(b"").hexdigest()
-            return ToolObservation(
+            observation = ToolObservation(
                 observation_id=_observation_id(
                     "read_file", relative, f"binary:{entry.size}:{start_line}:{max_lines}"
                 ),
@@ -341,8 +364,13 @@ class WorkspaceReader:
                 content_hash=empty_hash,
                 text="",
                 incomplete=False,
-                metadata={"binary": True, "size_bytes": entry.size},
+                metadata={
+                    "binary": True,
+                    "size_bytes": entry.size,
+                },
             )
+            self._remember_identity(observation.observation_id, entry.identity)
+            return observation
         decoded = _decode_strict(data)
         # Sanitize the WHOLE file before slicing so a window starting inside a
         # multi-line secret cannot leak the body, and redaction is line-preserving.
@@ -368,7 +396,7 @@ class WorkspaceReader:
             window = text.split("\n")
             truncated = True
         numbered = tuple(f"{start_line + offset}: {line}" for offset, line in enumerate(window))
-        return ToolObservation(
+        observation = ToolObservation(
             observation_id=_observation_id("read_file", relative, window_salt),
             tool="read_file",
             path=relative,
@@ -379,15 +407,17 @@ class WorkspaceReader:
             truncated=truncated,
             incomplete=redacted,
             redacted=redacted,
-            metadata={"total_lines": total_lines, "redacted_lines": redacted_lines},
+            metadata={
+                "total_lines": total_lines,
+                "redacted_lines": redacted_lines,
+            },
         )
+        self._remember_identity(observation.observation_id, entry.identity)
+        return observation
 
     def list_files(self, path: str = ".", *, glob: str | None = None) -> ToolObservation:
-        if glob is not None and len(glob) > GLOB_MAX_CHARS:
-            raise FsToolError("glob pattern exceeds the length limit")
-        if glob is not None:
-            _require_utf8(glob, "glob")
-        deadline = self._deadline()
+        # Resolve and enforce path policy before validating the optional glob,
+        # so a malformed glob cannot hide a simultaneous traversal attempt.
         if path in ("", "."):
             base_parts: tuple[str, ...] = ()
             relative = "."
@@ -396,6 +426,11 @@ class WorkspaceReader:
             if not base_parts:
                 raise PolicyViolationError("list path must reference a workspace directory")
             relative = "/".join(base_parts)
+        if glob is not None and len(glob) > GLOB_MAX_CHARS:
+            raise RequestValidationError("glob pattern exceeds the length limit")
+        if glob is not None:
+            _require_utf8(glob, "glob")
+        deadline = self._deadline()
         # A recursive glob (containing ``**``) returns a bounded file tree of
         # matching workspace-relative paths, so a model can discover nested files
         # in one call instead of drilling directory by directory.
@@ -428,7 +463,7 @@ class WorkspaceReader:
             except FsToolError:
                 filtered_count += 1
                 continue
-            if len(name) > PATH_MAX_CHARS:
+            if len(name) + (1 if entry.is_dir else 0) > PATH_MAX_CHARS:
                 filtered_count += 1
                 continue
             is_dir = entry.is_dir
@@ -529,10 +564,10 @@ class WorkspaceReader:
 
     def search_text(self, query: str, *, glob: str | None = None) -> ToolObservation:
         if not query or len(query) > QUERY_MAX_CHARS:
-            raise FsToolError("query is empty or exceeds the length limit")
+            raise RequestValidationError("query is empty or exceeds the length limit")
         _require_utf8(query, "query")
         if glob is not None and len(glob) > GLOB_MAX_CHARS:
-            raise FsToolError("glob pattern exceeds the length limit")
+            raise RequestValidationError("glob pattern exceeds the length limit")
         if glob is not None:
             _require_utf8(glob, "glob")
         deadline = self._deadline()

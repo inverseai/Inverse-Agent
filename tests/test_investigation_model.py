@@ -3,16 +3,24 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from pathlib import Path
 from typing import Any
 
 import pytest
 
+from inverse_agent.attestations import AttestationScope, ScopedTrustStore
 from inverse_agent.fs_tools import ToolObservation
-from inverse_agent.investigation import AgentAnswer, ToolCall
+from inverse_agent.investigation import (
+    AgentAnswer,
+    InvestigationLoop,
+    InvestigationVerdict,
+    StopReason,
+    ToolCall,
+)
 from inverse_agent.investigation_model import (
     ModelInvestigationPlanner,
-    _parse_decision,
     _render_catalog,
+    parse_decision,
 )
 from inverse_agent.planner import (
     PlannerError,
@@ -220,7 +228,7 @@ def test_parse_final_answer_requires_complete_field() -> None:
     payload = _base("final_answer", summary="partial", findings=["uncertain"])
     del payload["complete"]
     with pytest.raises(KeyError, match="complete"):
-        _parse_decision(payload)
+        parse_decision(payload)
 
 
 @pytest.mark.parametrize("field", ["complete", "condition_holds"])
@@ -228,12 +236,47 @@ def test_parse_final_answer_requires_exact_boolean_fields(field: str) -> None:
     missing = _base("final_answer", summary="done", findings=["grounded"])
     del missing[field]
     with pytest.raises(KeyError, match=field):
-        _parse_decision(missing)
+        parse_decision(missing)
 
     wrong_type = _base("final_answer", summary="done", findings=["grounded"])
     wrong_type[field] = "false"
     with pytest.raises(TypeError, match="JSON booleans"):
-        _parse_decision(wrong_type)
+        parse_decision(wrong_type)
+
+
+@pytest.mark.parametrize("failure", ["missing", "wrong_type"])
+def test_loop_maps_repeated_final_boolean_schema_failure_to_protocol_failure(
+    tmp_path: Path, failure: str
+) -> None:
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    trust = ScopedTrustStore(tmp_path / "att.sqlite")
+    trust.grant(workspace, AttestationScope.SOURCE_READ, granted_by="tester")
+    invalid = _base(
+        "final_answer",
+        summary="done",
+        findings=["grounded"],
+        next_actions=["verify"],
+    )
+    if failure == "missing":
+        del invalid["complete"]
+    else:
+        invalid["condition_holds"] = "false"
+    client = FakeClient([invalid.copy(), invalid.copy()])
+    planner = ModelInvestigationPlanner(
+        client=client,
+        max_auto_reads=0,
+        max_nudges=0,
+    )
+    report = InvestigationLoop(planner=planner, trust=trust).run(
+        run_id=f"r-schema-{failure}",
+        goal="inspect workspace",
+        workspace=workspace,
+    )
+    assert client.calls == 2
+    assert planner.schema_retries == 1
+    assert report.verdict is InvestigationVerdict.FAILED
+    assert report.stop_reason is StopReason.PROTOCOL_FAILURE
 
 
 def test_large_read_is_fully_rendered_not_dropped() -> None:

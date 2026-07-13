@@ -63,8 +63,8 @@ class SecureListing:
     entries: tuple[SecureEntry, ...]
     visited: int
     refused: int
-    filtered: int
-    truncated: bool
+    filtered: int = 0
+    truncated: bool = False
 
 
 def _check_deadline(deadline: float) -> None:

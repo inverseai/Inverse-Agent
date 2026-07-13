@@ -1,6 +1,6 @@
 import pytest
 
-from inverse_agent.redaction import redact_text
+from inverse_agent.redaction import private_key_spans, redact_text, secret_spans
 
 
 @pytest.mark.parametrize(
@@ -39,6 +39,32 @@ def test_redact_text_removes_truncated_private_key_block() -> None:
     result = redact_text(value)
     assert result.blocked
     assert "SENSITIVE_PARTIAL_BODY" not in result.text
+
+
+def test_secret_span_contract_includes_private_keys_and_credentials() -> None:
+    text = (
+        "-----BEGIN PRIVATE KEY-----\nKEY_BODY\n-----END PRIVATE KEY-----\n"
+        "password=supersecret123\n"
+    )
+    kinds = {span.kind for span in secret_spans(text)}
+    assert kinds == {"private-key-block", "key-value-secret"}
+
+
+def test_private_key_spans_accept_crlf_and_ascii_case_insensitive_markers() -> None:
+    text = (
+        "safe_before\r\n"
+        "-----begin private key-----\r\n"
+        "KEY_BODY\r\n"
+        "-----end private key-----\r\n"
+        "safe_after\r\n"
+    )
+    spans = private_key_spans(text)
+    assert len(spans) == 1
+    start, end, complete = spans[0]
+    assert complete is True
+    assert "KEY_BODY" in text[start:end]
+    assert "safe_before" not in text[start:end]
+    assert "safe_after" not in text[start:end]
 
 
 def test_redact_text_removes_nested_private_key_tail() -> None:

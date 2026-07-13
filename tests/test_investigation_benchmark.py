@@ -123,7 +123,7 @@ def test_scorer_rejects_empty_findings(tmp_path: Path) -> None:
 
     passed, reason = _run_with_answer(case, tmp_path, empty)
     assert not passed
-    assert "unsupported_citation" in reason
+    assert "malformed_answer" in reason
 
 
 def test_scorer_accepts_correct_grounded_answer(tmp_path: Path) -> None:

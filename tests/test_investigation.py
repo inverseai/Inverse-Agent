@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -18,7 +19,8 @@ from inverse_agent.investigation import (
     StopReason,
     ToolCall,
     ToolObservation,
-    _citation_intersects_redaction,
+    _has_unresolved_negative_uncertainty,
+    citation_intersects_redaction,
 )
 
 
@@ -310,6 +312,90 @@ def test_recursive_list_retry_uses_the_same_uncertainty_scope(
     assert report.verdict is InvestigationVerdict.PASS
 
 
+@pytest.mark.parametrize(
+    ("invalid_call", "corrected_call"),
+    [
+        (
+            ToolCall(tool="search_text", query="x" * 300),
+            ToolCall(tool="search_text", query="return 0"),
+        ),
+        (
+            ToolCall(tool="list_files", path=".", glob="x" * 200),
+            ToolCall(tool="list_files", path="."),
+        ),
+    ],
+)
+def test_request_invalid_pointer_does_not_poison_corrected_negative_answer(
+    trusted_workspace: tuple[Path, ScopedTrustStore],
+    invalid_call: ToolCall,
+    corrected_call: ToolCall,
+) -> None:
+    workspace, trust = trusted_workspace
+
+    class CorrectsRequest:
+        turn = 0
+
+        def decide(self, *, goal: str, catalog: tuple[ToolObservation, ...]) -> Decision:
+            del goal
+            self.turn += 1
+            if self.turn == 1:
+                return invalid_call
+            if self.turn == 2:
+                return corrected_call
+            if self.turn == 3:
+                return ToolCall(tool="read_file", path="app.py")
+            read = next(observation for observation in catalog if observation.tool == "read_file")
+            return AgentAnswer(
+                summary="app.py does not return zero",
+                findings=("the function returns 42",),
+                next_actions=("Keep the current return value.",),
+                citations=(SourceCitation(read.observation_id, read.path, 2, 2),),
+                issue_present=False,
+            )
+
+    report = InvestigationLoop(planner=CorrectsRequest(), trust=trust).run(
+        run_id="r-corrected-request",
+        goal="does app.py return zero",
+        workspace=workspace,
+    )
+    assert report.catalog[0].metadata["refused"] is True
+    assert report.catalog[0].metadata["request_invalid"] is True
+    assert report.verdict is InvestigationVerdict.PASS
+
+
+def test_request_invalid_read_does_not_supersede_valid_cited_read(
+    trusted_workspace: tuple[Path, ScopedTrustStore],
+) -> None:
+    workspace, trust = trusted_workspace
+
+    class InvalidReadAfterEvidence:
+        turn = 0
+
+        def decide(self, *, goal: str, catalog: tuple[ToolObservation, ...]) -> Decision:
+            del goal
+            self.turn += 1
+            if self.turn == 1:
+                return ToolCall(tool="read_file", path="app.py", max_lines=2)
+            if self.turn == 2:
+                return ToolCall(tool="read_file", path="app.py", max_lines=999)
+            valid = catalog[0]
+            return AgentAnswer(
+                summary="app.py does not return zero",
+                findings=("the function returns 42",),
+                next_actions=("Keep the current return value.",),
+                citations=(SourceCitation(valid.observation_id, valid.path, 2, 2),),
+                issue_present=False,
+            )
+
+    report = InvestigationLoop(planner=InvalidReadAfterEvidence(), trust=trust).run(
+        run_id="r-invalid-read-after-evidence",
+        goal="does app.py return zero",
+        workspace=workspace,
+    )
+    assert report.catalog[1].metadata["request_invalid"] is True
+    assert report.verdict is InvestigationVerdict.PASS
+
+
 def test_literal_none_glob_cannot_supersede_unfiltered_scope(
     trusted_workspace: tuple[Path, ScopedTrustStore],
 ) -> None:
@@ -401,7 +487,7 @@ def test_citation_to_search_pointer_is_rejected(
         return AgentAnswer(
             summary="claim",
             findings=("f",),
-            next_actions=(),
+            next_actions=("Read the source file before concluding.",),
             citations=(
                 SourceCitation(
                     observation_id=pointer.observation_id,
@@ -431,7 +517,7 @@ def test_unsupported_citation_forces_incomplete(
         return AgentAnswer(
             summary="claim",
             findings=("made up",),
-            next_actions=(),
+            next_actions=("Verify the claim against real evidence.",),
             citations=(
                 SourceCitation(
                     observation_id="obs_does_not_exist",
@@ -462,7 +548,7 @@ def test_unsupported_citation_precedes_answer_incompleteness(
         return AgentAnswer(
             summary="uncertain claim",
             findings=("fabricated",),
-            next_actions=(),
+            next_actions=("Gather valid evidence before concluding.",),
             citations=(
                 SourceCitation(
                     observation_id="obs_fabricated",
@@ -510,8 +596,234 @@ def test_each_finding_requires_a_corresponding_citation(
         goal="inspect app",
         workspace=workspace,
     )
-    assert report.stop_reason is StopReason.UNSUPPORTED_CITATION
+    assert report.stop_reason is StopReason.MALFORMED_ANSWER
     assert "each finding" in report.error
+
+
+def test_findings_cannot_reuse_one_citation_range(
+    trusted_workspace: tuple[Path, ScopedTrustStore],
+) -> None:
+    workspace, trust = trusted_workspace
+
+    def duplicate_citation(catalog: tuple[ToolObservation, ...]) -> AgentAnswer:
+        grounded = _cite_first_line(catalog)
+        citation = grounded.citations[0]
+        return AgentAnswer(
+            summary="two claims",
+            findings=("function exists", "function returns 42"),
+            next_actions=("Keep the implementation covered by tests.",),
+            citations=(citation, citation),
+        )
+
+    planner = ScriptedInvestigationPlanner(
+        steps=(ToolCall(tool="read_file", path="app.py"),),
+        build_answer=duplicate_citation,
+    )
+    report = InvestigationLoop(planner=planner, trust=trust).run(
+        run_id="r-duplicate-citation",
+        goal="inspect app",
+        workspace=workspace,
+    )
+    assert report.stop_reason is StopReason.MALFORMED_ANSWER
+    assert "distinct citation" in report.error
+
+
+def test_overlapping_read_ids_cannot_reuse_one_physical_citation_range(
+    trusted_workspace: tuple[Path, ScopedTrustStore],
+) -> None:
+    workspace, trust = trusted_workspace
+
+    def duplicate_range(catalog: tuple[ToolObservation, ...]) -> AgentAnswer:
+        first, second = catalog
+        assert first.observation_id != second.observation_id
+        return AgentAnswer(
+            summary="two claims",
+            findings=("function exists", "function returns 42"),
+            next_actions=("Keep the implementation covered by tests.",),
+            citations=(
+                SourceCitation(first.observation_id, first.path, 2, 2),
+                SourceCitation(second.observation_id, second.path, 2, 2),
+            ),
+        )
+
+    planner = ScriptedInvestigationPlanner(
+        steps=(
+            ToolCall(tool="read_file", path="app.py", start_line=1, max_lines=2),
+            ToolCall(tool="read_file", path="app.py", start_line=2, max_lines=1),
+        ),
+        build_answer=duplicate_range,
+    )
+    report = InvestigationLoop(planner=planner, trust=trust).run(
+        run_id="r-overlapping-citation",
+        goal="inspect app",
+        workspace=workspace,
+    )
+    assert report.stop_reason is StopReason.MALFORMED_ANSWER
+    assert "distinct citation" in report.error
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows case-alias regression")
+def test_windows_case_alias_cannot_reuse_one_physical_citation_range(tmp_path: Path) -> None:
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    (workspace / "Report.txt").write_text("same physical evidence\n", encoding="utf-8")
+    trust = ScopedTrustStore(tmp_path / "att.sqlite")
+    trust.grant(workspace, AttestationScope.SOURCE_READ, granted_by="tester")
+
+    def duplicate_range(catalog: tuple[ToolObservation, ...]) -> AgentAnswer:
+        first, second = catalog
+        assert first.path != second.path
+        assert "file_identity" not in first.metadata
+        return AgentAnswer(
+            summary="two claims",
+            findings=("the report exists", "the report has evidence"),
+            next_actions=("Keep the report under review.",),
+            citations=(
+                SourceCitation(first.observation_id, first.path, 1, 1),
+                SourceCitation(second.observation_id, second.path, 1, 1),
+            ),
+        )
+
+    planner = ScriptedInvestigationPlanner(
+        steps=(
+            ToolCall(tool="read_file", path="Report.txt"),
+            ToolCall(tool="read_file", path="REPORT.TXT"),
+        ),
+        build_answer=duplicate_range,
+    )
+    report = InvestigationLoop(planner=planner, trust=trust).run(
+        run_id="r-windows-case-alias",
+        goal="inspect report",
+        workspace=workspace,
+    )
+    assert report.stop_reason is StopReason.UNSUPPORTED_CITATION
+    assert "distinct physical citation" in report.error
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows case-alias regression")
+def test_windows_case_alias_refusal_supersedes_cited_read(tmp_path: Path) -> None:
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    source = workspace / "Report.txt"
+    source.write_text("no issue here\n", encoding="utf-8")
+    trust = ScopedTrustStore(tmp_path / "att.sqlite")
+    trust.grant(workspace, AttestationScope.SOURCE_READ, granted_by="tester")
+
+    class AliasThenRemovePlanner:
+        def decide(self, *, goal: str, catalog: tuple[ToolObservation, ...]) -> Decision:
+            del goal
+            if not catalog:
+                return ToolCall(tool="read_file", path="Report.txt")
+            if len(catalog) == 1:
+                source.unlink()
+                return ToolCall(tool="read_file", path="REPORT.TXT")
+            first = catalog[0]
+            return AgentAnswer(
+                summary="the issue is absent",
+                findings=("the report says no issue is present",),
+                next_actions=("Restore the source and repeat the investigation.",),
+                citations=(SourceCitation(first.observation_id, first.path, 1, 1),),
+                issue_present=False,
+            )
+
+    report = InvestigationLoop(planner=AliasThenRemovePlanner(), trust=trust).run(
+        run_id="r-windows-case-alias-refusal",
+        goal="check whether the issue is absent",
+        workspace=workspace,
+    )
+    assert report.stop_reason is StopReason.INCOMPLETE_EVIDENCE
+    assert "unresolved evidence omissions" in report.error
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows case-alias regression")
+def test_successful_case_alias_retry_supersedes_earlier_refusal(tmp_path: Path) -> None:
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    source = workspace / "Report.txt"
+    source.write_text("no issue here\n", encoding="utf-8")
+    trust = ScopedTrustStore(tmp_path / "att.sqlite")
+    trust.grant(workspace, AttestationScope.SOURCE_READ, granted_by="tester")
+
+    class RecoveringAliasPlanner:
+        def decide(self, *, goal: str, catalog: tuple[ToolObservation, ...]) -> Decision:
+            del goal
+            if not catalog:
+                return ToolCall(tool="read_file", path="Report.txt")
+            if len(catalog) == 1:
+                source.unlink()
+                return ToolCall(tool="read_file", path="REPORT.TXT")
+            if len(catalog) == 2:
+                source.write_text("no issue here\n", encoding="utf-8")
+                return ToolCall(tool="read_file", path="REPORT.TXT")
+            first = catalog[0]
+            return AgentAnswer(
+                summary="the issue is absent",
+                findings=("the report says no issue is present",),
+                next_actions=("Keep the report under observation.",),
+                citations=(SourceCitation(first.observation_id, first.path, 1, 1),),
+                issue_present=False,
+            )
+
+    report = InvestigationLoop(planner=RecoveringAliasPlanner(), trust=trust).run(
+        run_id="r-windows-case-alias-recovery",
+        goal="check whether the issue is absent",
+        workspace=workspace,
+    )
+    assert report.stop_reason is StopReason.FINISHED
+    assert report.verdict is InvestigationVerdict.PASS
+
+
+def test_unknown_case_variant_refusal_requires_exact_variant_retry() -> None:
+    cited = ToolObservation(
+        observation_id="obs-cited",
+        tool="read_file",
+        path="123/A.py",
+        content_hash="hash-a",
+        text="safe",
+        lines=("1: safe",),
+    )
+    refusal = ToolObservation(
+        observation_id="obs-refused",
+        tool="read_file",
+        path="123/a.py",
+        content_hash="",
+        text="[refused] unavailable",
+        truncated=True,
+        incomplete=True,
+        metadata={"refused": True},
+    )
+    cited_retry = ToolObservation(
+        observation_id="obs-cited-retry",
+        tool="read_file",
+        path="123/A.py",
+        content_hash="hash-a",
+        text="safe",
+        lines=("1: safe",),
+    )
+    variant_retry = ToolObservation(
+        observation_id="obs-variant-retry",
+        tool="read_file",
+        path="123/a.py",
+        content_hash="hash-b",
+        text="safe too",
+        lines=("1: safe too",),
+    )
+    answer = AgentAnswer(
+        summary="localized absence",
+        findings=("the cited file is safe",),
+        next_actions=("Keep both paths readable.",),
+        citations=(SourceCitation("obs-cited", "123/A.py", 1, 1),),
+        issue_present=False,
+    )
+
+    assert _has_unresolved_negative_uncertainty(
+        answer,
+        (cited, refusal, cited_retry),
+    )
+    assert not _has_unresolved_negative_uncertainty(
+        answer,
+        (cited, refusal, cited_retry, variant_retry),
+    )
 
 
 def test_empty_substantive_answer_is_rejected(
@@ -524,7 +836,7 @@ def test_empty_substantive_answer_is_rejected(
         return AgentAnswer(
             summary="",
             findings=grounded.findings,
-            next_actions=(),
+            next_actions=("Read the cited range.",),
             citations=grounded.citations,
         )
 
@@ -537,7 +849,7 @@ def test_empty_substantive_answer_is_rejected(
         goal="inspect app",
         workspace=workspace,
     )
-    assert report.stop_reason is StopReason.UNSUPPORTED_CITATION
+    assert report.stop_reason is StopReason.MALFORMED_ANSWER
     assert "summary is empty" in report.error
 
 
@@ -573,6 +885,40 @@ def test_citation_intersecting_redacted_line_is_rejected(tmp_path: Path) -> None
     assert "redacted" in report.error
 
 
+def test_negative_answer_is_blocked_by_redaction_outside_read_window(tmp_path: Path) -> None:
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    source = "safe = 1\n" + "\n".join(f"filler_{i} = {i}" for i in range(2, 220))
+    source += "\napi_key=sk_live_0123456789abcdef\n"
+    (workspace / "config.py").write_text(source, encoding="utf-8")
+    trust = ScopedTrustStore(tmp_path / "att.sqlite")
+    trust.grant(workspace, AttestationScope.SOURCE_READ, granted_by="tester")
+
+    def negative_answer(catalog: tuple[ToolObservation, ...]) -> AgentAnswer:
+        read = catalog[0]
+        assert read.incomplete and read.redacted
+        assert read.metadata["redacted_lines"] == ()
+        return AgentAnswer(
+            summary="the visible setting is safe",
+            findings=("line one sets safe to one",),
+            next_actions=("Inspect the omitted redacted content separately.",),
+            citations=(SourceCitation(read.observation_id, read.path, 1, 1),),
+            issue_present=False,
+        )
+
+    planner = ScriptedInvestigationPlanner(
+        steps=(ToolCall(tool="read_file", path="config.py", max_lines=1),),
+        build_answer=negative_answer,
+    )
+    report = InvestigationLoop(planner=planner, trust=trust).run(
+        run_id="r-redaction-outside-window",
+        goal="is config.py free of credentials",
+        workspace=workspace,
+    )
+    assert report.verdict is InvestigationVerdict.INCOMPLETE
+    assert report.stop_reason is StopReason.INCOMPLETE_EVIDENCE
+
+
 def test_huge_citation_range_redaction_check_is_bounded() -> None:
     observation = ToolObservation(
         observation_id="obs_mask",
@@ -589,7 +935,7 @@ def test_huge_citation_range_redaction_check_is_bounded() -> None:
         start_line=1,
         end_line=10**12,
     )
-    assert _citation_intersects_redaction(observation, citation)
+    assert citation_intersects_redaction(observation, citation)
 
 
 def test_citation_outside_returned_range_forces_incomplete(
@@ -602,7 +948,7 @@ def test_citation_outside_returned_range_forces_incomplete(
         return AgentAnswer(
             summary="claim",
             findings=("x",),
-            next_actions=(),
+            next_actions=("Read an existing source line.",),
             citations=(
                 SourceCitation(
                     observation_id=obs.observation_id,
@@ -776,7 +1122,7 @@ def test_read_file_past_eof_citation_is_rejected(tmp_path: Path) -> None:
         return AgentAnswer(
             summary="claim",
             findings=("x",),
-            next_actions=(),
+            next_actions=("Cite a substantive source line.",),
             citations=(
                 SourceCitation(
                     observation_id=obs.observation_id,
@@ -851,6 +1197,27 @@ def test_policy_violation_after_valid_read_still_fatal(tmp_path: Path) -> None:
     assert report.stop_reason is StopReason.POLICY_VIOLATION
 
 
+@pytest.mark.parametrize(
+    "call",
+    [
+        ToolCall(tool="read_file", path="../escape.py", start_line=0),
+        ToolCall(tool="list_files", path="../escape", glob="x" * 200),
+    ],
+)
+def test_path_policy_precedes_other_invalid_arguments(
+    trusted_workspace: tuple[Path, ScopedTrustStore], call: ToolCall
+) -> None:
+    workspace, trust = trusted_workspace
+    planner = ScriptedInvestigationPlanner(steps=(call,), build_answer=_cite_first_line)
+    report = InvestigationLoop(planner=planner, trust=trust).run(
+        run_id="r-mixed-invalid-policy",
+        goal="inspect workspace",
+        workspace=workspace,
+    )
+    assert report.stop_reason is StopReason.POLICY_VIOLATION
+    assert report.catalog == ()
+
+
 def test_citation_to_blank_line_is_rejected(tmp_path: Path) -> None:
     # A citation resolving only to a blank line is not real evidence.
     workspace = tmp_path / "ws"
@@ -864,7 +1231,7 @@ def test_citation_to_blank_line_is_rejected(tmp_path: Path) -> None:
         return AgentAnswer(
             summary="claim",
             findings=("x",),
-            next_actions=(),
+            next_actions=("Read a source file before citing it.",),
             citations=(
                 SourceCitation(
                     observation_id=obs.observation_id,
@@ -897,7 +1264,7 @@ def test_citation_to_empty_search_is_rejected(tmp_path: Path) -> None:
         return AgentAnswer(
             summary="claim",
             findings=("x",),
-            next_actions=(),
+            next_actions=("Read a source file before citing it.",),
             citations=(
                 SourceCitation(
                     observation_id=empty.observation_id,

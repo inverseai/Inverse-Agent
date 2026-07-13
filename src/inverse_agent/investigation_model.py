@@ -22,13 +22,16 @@ from inverse_agent.investigation import (
     SourceCitation,
     ToolCall,
     ToolObservation,
-    _citation_intersects_redaction,
+    citation_intersects_redaction,
+    line_body,
 )
 from inverse_agent.planner import (
     MAX_MODEL_COMPLETION_TOKENS,
     PlannerError,
     PlannerTransportError,
 )
+
+__all__ = ["ModelInvestigationPlanner", "SupportsStructuredJson", "parse_decision"]
 
 # Must comfortably exceed one full read (READ_MAX_TOKENS*CHARS_PER_TOKEN plus
 # per-line "N: " prefixes and the header) so a legal 200-line read is never
@@ -99,7 +102,8 @@ _SYSTEM_PROMPT = (
     "Citations: cite a read_file observation only. Copy its observation_id exactly "
     "from the id= field, use its path, and set start_line/end_line to the numbers "
     "shown before the colon (a line '12: foo' is line 12). Every finding needs a "
-    "citation to a line you actually saw.\n"
+    "distinct citation range to a line you actually saw; combine findings when "
+    "the same range would otherwise be repeated.\n"
     "In final_answer set condition_holds=true when the code confirms the "
     "condition or fact the goal asks about (e.g. the component IS exported, the "
     "entrypoint DOES exist, the bug IS present) and false only if the code shows "
@@ -139,7 +143,7 @@ def _render_block(obs: ToolObservation) -> tuple[str, bool]:
         else set()
     )
     has_citable_line = any(
-        obs.start_line + offset not in redacted_lines and line.partition(": ")[2].strip()
+        obs.start_line + offset not in redacted_lines and line_body(line).strip()
         for offset, line in enumerate(obs.lines)
     )
     if obs.metadata.get("refused"):
@@ -260,7 +264,7 @@ def _repair_citations(
         if (
             existing is not None
             and existing.path == citation.path
-            and not _citation_intersects_redaction(existing, citation)
+            and not citation_intersects_redaction(existing, citation)
         ):
             return citation
         for obs in reads:
@@ -274,7 +278,7 @@ def _repair_citations(
                 end_line=min(citation.end_line, last),
                 note=citation.note,
             )
-            if obs.start_line <= citation.start_line <= last and not _citation_intersects_redaction(
+            if obs.start_line <= citation.start_line <= last and not citation_intersects_redaction(
                 obs, repaired
             ):
                 return repaired
@@ -315,7 +319,7 @@ def _normalize_path(value: object) -> str:
     return text or "."
 
 
-def _parse_decision(payload: Mapping[str, Any]) -> Decision:
+def parse_decision(payload: Mapping[str, Any]) -> Decision:
     action = payload.get("action")
     if action == "final_answer":
         citations = tuple(
@@ -466,7 +470,7 @@ class ModelInvestigationPlanner:
         while True:
             try:
                 payload = self._request(prompt)
-                decision = _parse_decision(payload)
+                decision = parse_decision(payload)
             except PlannerTransportError:
                 if transport_used >= self.max_transport_retries:
                     raise

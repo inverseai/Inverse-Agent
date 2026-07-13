@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
+
+__all__ = ["RedactionResult", "SecretSpan", "private_key_spans", "redact_text", "secret_spans"]
 
 _PEM_TOKEN = re.compile(
     r"(?=(?P<token>-----(?P<kind>BEGIN|END) |-----))",
@@ -12,7 +15,7 @@ _PEM_TOKEN = re.compile(
 _PRIVATE_KEY_LABEL = re.compile(r"PRIVATE KEY", re.IGNORECASE | re.ASCII)
 _PEM_MARKER_CLOSE_LENGTH = 5
 
-SECRET_PATTERNS = (
+_SECRET_PATTERNS = (
     (
         "key-value-secret",
         re.compile(
@@ -43,7 +46,16 @@ class RedactionResult:
     matches: tuple[str, ...]
 
 
-def private_key_spans(text: str) -> tuple[tuple[int, int, bool], ...]:
+@dataclass(frozen=True)
+class SecretSpan:
+    kind: str
+    start: int
+    end: int
+
+
+def private_key_spans(
+    text: str, *, check: Callable[[], None] | None = None
+) -> tuple[tuple[int, int, bool], ...]:
     """Return conservative PEM spans as ``(start, end, complete)`` tuples.
 
     A regex that stops at the first END marker is unsafe for nested or malformed
@@ -52,6 +64,8 @@ def private_key_spans(text: str) -> tuple[tuple[int, int, bool], ...]:
     redacts through EOF whenever marker labels do not close in LIFO order.
     """
 
+    if check is not None:
+        check()
     spans: list[tuple[int, int, bool]] = []
     labels: list[str] = []
     span_start: int | None = None
@@ -88,7 +102,9 @@ def private_key_spans(text: str) -> tuple[tuple[int, int, bool], ...]:
             span_start = None
         return True
 
-    for token in _PEM_TOKEN.finditer(text):
+    for token_index, token in enumerate(_PEM_TOKEN.finditer(text), start=1):
+        if check is not None and token_index % 128 == 0:
+            check()
         token_start = token.start("token")
         token_end = token.end("token")
         if pending is not None:
@@ -129,34 +145,46 @@ def private_key_spans(text: str) -> tuple[tuple[int, int, bool], ...]:
                 return tuple(spans)
     if span_start is not None:
         spans.append((span_start, len(text), False))
+    if check is not None:
+        check()
     return tuple(spans)
 
 
-def redact_text(text: str) -> RedactionResult:
-    matches: list[str] = []
-    spans: list[tuple[int, int]] = []
-    key_spans = private_key_spans(text)
-    complete_keys = sum(1 for _start, _end, complete in key_spans if complete)
-    incomplete_keys = len(key_spans) - complete_keys
-    if complete_keys:
-        matches.append(f"private-key-block:{complete_keys}")
-    if incomplete_keys:
-        matches.append(f"private-key-prefix:{incomplete_keys}")
-    spans.extend((start, end) for start, end, _complete in key_spans)
+def secret_spans(text: str, *, check: Callable[[], None] | None = None) -> tuple[SecretSpan, ...]:
+    """Return every secret span found against the original, unmodified text."""
 
-    # All patterns inspect the original text. Sequential substitution can make
-    # a narrow inner match hide a wider enclosing secret, such as a provider
-    # token used as the username or scheme of a credential-bearing URL.
-    for name, pattern in SECRET_PATTERNS:
-        pattern_spans = [match.span() for match in pattern.finditer(text)]
-        count = len(pattern_spans)
-        if count:
-            matches.append(f"{name}:{count}")
-            spans.extend(pattern_spans)
-    if not spans:
+    found: list[SecretSpan] = []
+    for start, end, complete in private_key_spans(text, check=check):
+        found.append(
+            SecretSpan(
+                kind="private-key-block" if complete else "private-key-prefix",
+                start=start,
+                end=end,
+            )
+        )
+    for name, pattern in _SECRET_PATTERNS:
+        if check is not None:
+            check()
+        for match_index, match in enumerate(pattern.finditer(text), start=1):
+            found.append(SecretSpan(kind=name, start=match.start(), end=match.end()))
+            if check is not None and match_index % 128 == 0:
+                check()
+    if check is not None:
+        check()
+    return tuple(found)
+
+
+def redact_text(text: str) -> RedactionResult:
+    found = secret_spans(text)
+    if not found:
         return RedactionResult(text=text, blocked=False, matches=())
 
-    spans.sort()
+    counts: dict[str, int] = {}
+    for secret in found:
+        counts[secret.kind] = counts.get(secret.kind, 0) + 1
+    matches = tuple(f"{name}:{count}" for name, count in counts.items())
+    spans = sorted((secret.start, secret.end) for secret in found)
+
     merged: list[tuple[int, int]] = []
     for start, end in spans:
         if merged and start <= merged[-1][1]:
@@ -170,4 +198,4 @@ def redact_text(text: str) -> RedactionResult:
         pieces.append("[REDACTED_SECRET]")
         cursor = end
     pieces.append(text[cursor:])
-    return RedactionResult(text="".join(pieces), blocked=True, matches=tuple(matches))
+    return RedactionResult(text="".join(pieces), blocked=True, matches=matches)

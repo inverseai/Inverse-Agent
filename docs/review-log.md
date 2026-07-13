@@ -164,3 +164,15 @@ A fresh independent review (four parallel dimension reviewers → adversarial pe
 - **P3 nits:** removed an unused `workspace` parameter from `_relative_parts`. The sensitive-*named directory* enumeration gap (children still redacted), the window-vs-line marker granularity, the tautological attestation assertion, and the untested `run_benchmark_with_planner` orchestrator are recorded as low-severity follow-ups. One finding (goal variants leaking filenames) was a verified FALSE_POSITIVE.
 
 Fixes land as a follow-up commit on the same branch; full verification and the live gate were re-run to confirm no regression.
+
+## 2026-07-13 - v0.2 Filesystem and Evidence Remediation
+
+Public commit `b58d614` closed the first post-commit security findings. Its local gate passed 473 tests with 8 skips and 84.65% coverage, and the independent Codex reviewer initially returned PASS.
+
+Inverse-Agent then reviewed the exact public commit with local `inverse-gpt-oss-20b` at 32K context. It returned `INCOMPLETE`, with no supported findings: both its input and context were truncated and two model findings were discarded. This is retained as an honest self-review result, not converted into a pass.
+
+Claude CLI reviewed the literal public commit diff using requested `--model claude-fable-5 --effort ultracode`. The run took 1,714.2 seconds; JSON `modelUsage` contained `claude-fable-5` and auxiliary `claude-haiku-4-5-20251001`. It returned BLOCK with P2/P3 findings around invalid-request scope poisoning, strict answer/protocol behavior, secret-pattern contracts, citation structure, directory bounds, and missing adversarial tests. A 270.2-second exact-model clarification retracted the reported P0 cross-module/syntax claim and P1 command-line compatibility claim after checking the complete commit and the successful CLI invocation. Claude Code 2.1.206 accepts the requested hidden `ultracode` value although its help text advertises effort values only through `max`; `modelUsage` confirms resolved models, not the effective effort tier.
+
+The fix-forward remediation added request-invalid scope isolation, structure-before-citation validation, distinct physical citation ranges, strict boolean retry coverage, one public redaction-span contract, bounded adversarial PEM handling, path-policy precedence, conservative case-alias uncertainty, and private per-reader HMAC file identity. Follow-up independent Codex rounds found and closed Windows case-alias reuse, stale refusal recovery, raw filesystem-identity projection, and an unbounded case-semantics probe. The final design performs no filesystem case probe: alternate-case refusals remain uncertain until that exact lexical variant succeeds, while physical duplicate citations are rejected through a non-serialized keyed identity.
+
+Final independent Codex verdict: PASS with no P0-P3 findings. Final local verification: 495 tests passed, 8 platform skips, 85.18% coverage, Ruff clean, strict Mypy clean, changed-file formatting clean, and `git diff --check` clean. The fix-forward public commit still requires its own Inverse-Agent and exact Fable review gates.
