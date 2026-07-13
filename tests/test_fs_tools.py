@@ -377,6 +377,17 @@ def test_read_file_enforces_operation_deadline(
         reader.read_file("safe.txt")
 
 
+def test_reader_deadline_is_capped_by_run_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import inverse_agent.fs_tools as fs_tools
+
+    reader = WorkspaceReader.open(tmp_path, active_deadline=105.0)
+    monkeypatch.setattr(fs_tools.time, "monotonic", lambda: 100.0)
+
+    assert reader._deadline() == 105.0
+
+
 def test_recursive_list_and_search_propagate_deadline(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -464,6 +475,16 @@ def test_query_and_glob_reject_surrogate_text(tmp_path: Path) -> None:
         reader.search_text("\udcff")
     with pytest.raises(FsToolError, match="non-UTF-8"):
         reader.list_files(".", glob="*\udcff")
+
+
+@pytest.mark.parametrize(
+    "glob",
+    ("/src/*.py", "../*.py", "src/?a.py", "src/***.py", "src/a**b.py"),
+)
+def test_glob_rejects_non_relative_or_unsupported_syntax(tmp_path: Path, glob: str) -> None:
+    reader = WorkspaceReader.open(tmp_path)
+    with pytest.raises(RequestValidationError, match="glob pattern"):
+        reader.list_files(".", glob=glob)
 
 
 def test_read_file_redacts_multiline_private_key(tmp_path: Path) -> None:

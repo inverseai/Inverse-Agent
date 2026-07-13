@@ -8,13 +8,15 @@ from pathlib import Path
 
 import pytest
 
-from inverse_agent.cli import benchmark_investigation_command
+from inverse_agent.cli import benchmark_investigation_command, build_parser
 
 
 def _args(**overrides: object) -> argparse.Namespace:
     base: dict[str, object] = {
         "model": None,
         "model_base_url": None,
+        "model_context_tokens": None,
+        "model_estimator_bytes_per_token": None,
         "model_allow_remote": False,
         "output": None,
     }
@@ -30,6 +32,10 @@ def test_deterministic_path_passes_and_writes_output(tmp_path: Path) -> None:
     assert summary["planner"] == "deterministic"
     assert summary["gate_passed"] is True
     assert summary["model_provenance"] is None
+    first = summary["variants"][0]
+    assert first["physical_requests_used"] >= 1
+    assert first["completion_tokens_charged"] == 0
+    assert first["model_calls"] == []
 
 
 def test_remote_endpoint_without_dual_optin_is_rejected(
@@ -61,3 +67,58 @@ def test_remote_endpoint_env_only_is_rejected(
                 model_allow_remote=False,
             )
         )
+
+
+def test_model_context_environment_requires_calibration_point(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("INVERSE_AGENT_MODEL_CONTEXT_TOKENS", "20000")
+
+    with pytest.raises(ValueError, match="must be one of"):
+        benchmark_investigation_command(
+            _args(
+                model="some-model",
+                model_base_url="http://127.0.0.1:1234/v1",
+            )
+        )
+
+
+def test_model_run_requires_calibrated_token_estimator(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("INVERSE_AGENT_MODEL_ESTIMATOR_BYTES_PER_TOKEN", raising=False)
+
+    with pytest.raises(ValueError, match="requires a calibrated estimator"):
+        benchmark_investigation_command(
+            _args(
+                model="some-model",
+                model_base_url="http://127.0.0.1:1234/v1",
+                model_context_tokens=24_576,
+            )
+        )
+
+
+def test_model_run_requires_calibrated_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("INVERSE_AGENT_MODEL_CONTEXT_TOKENS", raising=False)
+
+    with pytest.raises(ValueError, match="requires a calibrated model context"):
+        benchmark_investigation_command(
+            _args(
+                model="some-model",
+                model_base_url="http://127.0.0.1:1234/v1",
+                model_estimator_bytes_per_token=2.0,
+            )
+        )
+
+
+def test_model_context_help_matches_required_live_contract(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    with pytest.raises(SystemExit, match="0"):
+        build_parser().parse_args(["benchmark-investigation", "--help"])
+
+    help_text = capsys.readouterr().out
+    assert "INVERSE_AGENT_MODEL_CONTEXT_TOKENS for model runs" in help_text
+    assert "or 16384" not in help_text

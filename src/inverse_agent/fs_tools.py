@@ -16,12 +16,13 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import json
 import re
 import secrets
 import time
 from bisect import bisect_left
 from dataclasses import dataclass, field
-from fnmatch import fnmatch
+from fnmatch import fnmatchcase
 from pathlib import Path, PurePosixPath
 
 from inverse_agent.redaction import secret_spans
@@ -34,8 +35,9 @@ from inverse_agent.secure_fs import (
     SecureWorkspace,
 )
 
-# Token-denominated bounds (a chars/token upper-bound heuristic keeps reads inside
-# a small local context window). Byte limits are defensive backstops.
+# Token-denominated bounds use the same JSON-encoded representation as prompt
+# accounting so escaped content cannot evade the model-visible read ceiling.
+# Byte limits are defensive backstops.
 CHARS_PER_TOKEN = 4
 READ_MAX_LINES = 200
 READ_MAX_TOKENS = 3_000
@@ -144,8 +146,8 @@ def _observation_id(tool: str, path: str, salt: str) -> str:
 
 
 def _estimate_tokens(text: str) -> int:
-    # Conservative upper bound: never undercount.
-    return (len(text) + CHARS_PER_TOKEN - 1) // CHARS_PER_TOKEN
+    encoded_bytes = len(json.dumps(text, ensure_ascii=True).encode("utf-8"))
+    return (encoded_bytes + CHARS_PER_TOKEN - 1) // CHARS_PER_TOKEN
 
 
 def _require_utf8(value: str, label: str) -> None:
@@ -201,6 +203,38 @@ def _relative_parts(raw_path: str, *, reject_sensitive_final: bool = False) -> t
         raise RequestValidationError("path exceeds the length limit")
     _require_utf8(raw_path, "path")
     return parts
+
+
+def _normalize_glob(pattern: str) -> str:
+    if not pattern or len(pattern) > GLOB_MAX_CHARS:
+        raise RequestValidationError("glob pattern is empty or exceeds the length limit")
+    _require_utf8(pattern, "glob")
+    normalized = canonical_glob_scope(pattern)
+    assert normalized is not None
+    if normalized.startswith("/") or (len(normalized) >= 2 and normalized[1] == ":"):
+        raise RequestValidationError("glob pattern must be workspace-relative")
+    if "\x00" in normalized or any(mark in normalized for mark in ("?", "[", "]")):
+        raise RequestValidationError("glob pattern contains unsupported syntax")
+    parts = normalized.split("/")
+    if any(part in {"", ".", ".."} or ("**" in part and part != "**") for part in parts):
+        raise RequestValidationError("glob pattern contains an invalid segment")
+    return normalized
+
+
+def canonical_glob_scope(glob: str | None) -> str | None:
+    """Return the slash-normalized spelling used in observation scopes."""
+
+    return None if glob is None else glob.replace("\\", "/")
+
+
+def glob_uses_recursive_listing(glob: str | None) -> bool:
+    """Mirror the list dispatcher for a normalized or raw relative glob."""
+
+    if glob is None:
+        return False
+    normalized = canonical_glob_scope(glob)
+    assert normalized is not None
+    return "/" in normalized or "**" in normalized
 
 
 def _looks_binary(data: bytes) -> bool:
@@ -297,6 +331,7 @@ class WorkspaceReader:
 
     workspace: Path
     secure: SecureWorkspace
+    active_deadline: float | None = field(default=None, repr=False, compare=False)
     _identity_key: bytes = field(
         default_factory=lambda: secrets.token_bytes(32),
         repr=False,
@@ -309,12 +344,17 @@ class WorkspaceReader:
     )
 
     @classmethod
-    def open(cls, workspace: Path) -> WorkspaceReader:
+    def open(
+        cls,
+        workspace: Path,
+        *,
+        active_deadline: float | None = None,
+    ) -> WorkspaceReader:
         try:
             secure = SecureWorkspace.open(workspace)
         except SecureFsError as exc:
             raise _tool_error(exc) from exc
-        return cls(secure.workspace, secure)
+        return cls(secure.workspace, secure, active_deadline=active_deadline)
 
     def evidence_identity(self, observation_id: str) -> str | None:
         """Return a run-local opaque file identity that is never model-visible."""
@@ -326,9 +366,11 @@ class WorkspaceReader:
         digest = hmac.new(self._identity_key, raw.encode("ascii"), hashlib.sha256).hexdigest()
         self._identity_by_observation[observation_id] = digest
 
-    @staticmethod
-    def _deadline() -> float:
-        return time.monotonic() + FS_OPERATION_TIMEOUT_SECONDS
+    def _deadline(self) -> float:
+        operation_deadline = time.monotonic() + FS_OPERATION_TIMEOUT_SECONDS
+        if self.active_deadline is None:
+            return operation_deadline
+        return min(operation_deadline, self.active_deadline)
 
     def read_file(
         self,
@@ -396,8 +438,9 @@ class WorkspaceReader:
             window = all_lines[start_line - 1 : start_line - 1 + max_lines]
         truncated = start_line > 1 or (start_line - 1 + max_lines) < total_lines
         text = "\n".join(window)
-        if len(text.encode("utf-8")) > READ_MAX_BYTES or _estimate_tokens(text) > READ_MAX_TOKENS:
-            text = _clip_to_byte_budget(text, READ_MAX_BYTES)
+        bounded_text = _clip_to_read_budget(text)
+        if bounded_text != text:
+            text = bounded_text
             window = text.split("\n")
             truncated = True
         numbered = tuple(f"{start_line + offset}: {line}" for offset, line in enumerate(window))
@@ -431,15 +474,14 @@ class WorkspaceReader:
             if not base_parts:
                 raise PolicyViolationError("list path must reference a workspace directory")
             relative = "/".join(base_parts)
-        if glob is not None and len(glob) > GLOB_MAX_CHARS:
-            raise RequestValidationError("glob pattern exceeds the length limit")
         if glob is not None:
-            _require_utf8(glob, "glob")
+            glob = _normalize_glob(glob)
         deadline = self._deadline()
         # A recursive glob (containing ``**``) returns a bounded file tree of
         # matching workspace-relative paths, so a model can discover nested files
         # in one call instead of drilling directory by directory.
-        if glob is not None and "**" in glob:
+        if glob_uses_recursive_listing(glob):
+            assert glob is not None
             return self._list_recursive(base_parts, relative, glob, deadline=deadline)
         # Scan lazily and bound the number of entries examined so a directory
         # with millions of children cannot be fully materialized before the
@@ -530,7 +572,12 @@ class WorkspaceReader:
                 cap_hit = True
                 break
             name = relative_file.rsplit("/", 1)[-1]
-            if not _glob_match(glob, name, relative_path=relative_file):
+            if base_parts:
+                prefix = f"{'/'.join(base_parts)}/"
+                relative_to_base = relative_file[len(prefix) :]
+            else:
+                relative_to_base = relative_file
+            if not _glob_match(glob, name, relative_path=relative_to_base):
                 continue
             try:
                 # Sensitive files are denied by name in recursive listings too.
@@ -571,10 +618,8 @@ class WorkspaceReader:
         if not query or len(query) > QUERY_MAX_CHARS:
             raise RequestValidationError("query is empty or exceeds the length limit")
         _require_utf8(query, "query")
-        if glob is not None and len(glob) > GLOB_MAX_CHARS:
-            raise RequestValidationError("glob pattern exceeds the length limit")
         if glob is not None:
-            _require_utf8(glob, "glob")
+            glob = _normalize_glob(glob)
         deadline = self._deadline()
         needle = query.lower()
         matches: list[str] = []
@@ -596,7 +641,7 @@ class WorkspaceReader:
                 scan_truncated = True
                 break
             name = relative.rsplit("/", 1)[-1]
-            if glob is not None and not _glob_match(glob, name):
+            if glob is not None and not _glob_match(glob, name, relative_path=relative):
                 continue
             try:
                 _reject_sensitive_name(name)
@@ -781,31 +826,36 @@ class WorkspaceReader:
 
 
 def _glob_match(pattern: str, name: str, *, relative_path: str | None = None) -> bool:
-    """Match a filename (or relative path) against a restricted glob.
-
-    ``list_files``/``search_text`` match a bare filename, but callers routinely
-    pass recursive patterns like ``**/*.py`` or ``src/**/*.xml``. A leading
-    ``**/`` is stripped so the tail applies to the filename, the original pattern
-    is tried, and when a ``relative_path`` is supplied an interior ``**`` is
-    matched against the full path via :func:`fnmatch` so directory-prefixed
-    recursive globs also work.
-    """
+    """Match a bounded glob against a filename or a base-relative path."""
 
     if not pattern:
         return True
-    candidates = {pattern}
-    stripped = pattern
-    while stripped.startswith("**/"):
-        stripped = stripped[3:]
-        candidates.add(stripped)
-    pure = PurePosixPath(name)
-    if any(pure.match(candidate) for candidate in candidates if candidate):
-        return True
-    if relative_path is not None and "**" in pattern:
-        # Translate ``**`` (any depth) to fnmatch's ``*`` against the full path.
-        translated = pattern.replace("**/", "*/").replace("**", "*")
-        if fnmatch(relative_path, translated) or fnmatch(relative_path, pattern.replace("**", "*")):
-            return True
+    use_relative = relative_path is not None and ("/" in pattern or "**" in pattern)
+    target = relative_path if use_relative else name
+    if target is None:
+        return False
+    pattern_parts = tuple(pattern.split("/"))
+    target_parts = tuple(target.split("/"))
+    pending = [(0, 0)]
+    visited: set[tuple[int, int]] = set()
+    while pending:
+        pattern_index, target_index = pending.pop()
+        state = (pattern_index, target_index)
+        if state in visited:
+            continue
+        visited.add(state)
+        if pattern_index == len(pattern_parts):
+            if target_index == len(target_parts):
+                return True
+            continue
+        segment = pattern_parts[pattern_index]
+        if segment == "**":
+            pending.append((pattern_index + 1, target_index))
+            if target_index < len(target_parts):
+                pending.append((pattern_index, target_index + 1))
+            continue
+        if target_index < len(target_parts) and fnmatchcase(target_parts[target_index], segment):
+            pending.append((pattern_index + 1, target_index + 1))
     return False
 
 
@@ -830,3 +880,20 @@ def _clip_to_byte_budget(text: str, budget: int) -> str:
     if len(encoded) <= budget:
         return text
     return encoded[:budget].decode("utf-8", errors="ignore")
+
+
+def _clip_to_read_budget(text: str) -> str:
+    """Bound model-visible text by raw bytes and JSON-aware token estimate."""
+
+    bounded = _clip_to_byte_budget(text, READ_MAX_BYTES)
+    if _estimate_tokens(bounded) <= READ_MAX_TOKENS:
+        return bounded
+    low = 0
+    high = len(bounded)
+    while low < high:
+        midpoint = (low + high + 1) // 2
+        if _estimate_tokens(bounded[:midpoint]) <= READ_MAX_TOKENS:
+            low = midpoint
+        else:
+            high = midpoint - 1
+    return bounded[:low]

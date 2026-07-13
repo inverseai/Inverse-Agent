@@ -25,6 +25,7 @@ from inverse_agent.investigation import (
     _validate_citations,
     citation_intersects_redaction,
 )
+from inverse_agent.planner import PlannerProtocolError
 
 
 @pytest.fixture
@@ -275,8 +276,10 @@ def test_later_complete_pointer_result_supersedes_earlier_uncertainty(
     assert report.verdict is InvestigationVerdict.PASS
 
 
+@pytest.mark.parametrize("glob", ("**/*.py", "src/*.py", "src\\*.py"))
 def test_recursive_list_retry_uses_the_same_uncertainty_scope(
     trusted_workspace: tuple[Path, ScopedTrustStore],
+    glob: str,
 ) -> None:
     workspace, trust = trusted_workspace
 
@@ -287,10 +290,10 @@ def test_recursive_list_retry_uses_the_same_uncertainty_scope(
             del goal
             self.turn += 1
             if self.turn == 1:
-                return ToolCall(tool="list_files", path="generated/.", glob="**/*.py")
+                return ToolCall(tool="list_files", path="generated/.", glob=glob)
             if self.turn == 2:
                 (workspace / "generated").mkdir()
-                return ToolCall(tool="list_files", path="generated/.", glob="**/*.py")
+                return ToolCall(tool="list_files", path="generated/.", glob=glob)
             if self.turn == 3:
                 return ToolCall(tool="read_file", path="app.py")
             read = next(observation for observation in catalog if observation.tool == "read_file")
@@ -303,13 +306,16 @@ def test_recursive_list_retry_uses_the_same_uncertainty_scope(
             )
 
     report = InvestigationLoop(planner=RecoversRecursiveList(), trust=trust).run(
-        run_id="r-recovered-recursive-list",
+        run_id=f"r-recovered-recursive-list-{glob}",
         goal="does app.py return zero",
         workspace=workspace,
     )
     listings = [observation for observation in report.catalog if observation.tool == "list_files"]
+    expected_glob = glob.replace("\\", "/")
+    assert listings[0].metadata["glob"] == expected_glob
     assert listings[0].metadata["recursive"] is True
     assert listings[0].incomplete and listings[0].truncated
+    assert listings[1].metadata["glob"] == expected_glob
     assert listings[1].metadata["recursive"] is True
     assert not listings[1].incomplete and not listings[1].truncated
     assert report.verdict is InvestigationVerdict.PASS
@@ -1105,6 +1111,26 @@ def test_planner_protocol_failure_is_failed(
     assert report.stop_reason is StopReason.PROTOCOL_FAILURE
 
 
+def test_protocol_error_text_cannot_masquerade_as_budget_exhaustion(
+    trusted_workspace: tuple[Path, ScopedTrustStore],
+) -> None:
+    workspace, trust = trusted_workspace
+
+    class Broken:
+        def decide(self, *, goal: str, catalog: tuple[ToolObservation, ...]) -> Decision:
+            del goal, catalog
+            raise PlannerProtocolError("budget exhausted while decoding response")
+
+    report = InvestigationLoop(planner=Broken(), trust=trust).run(
+        run_id="r-protocol-text",
+        goal="x",
+        workspace=workspace,
+    )
+
+    assert report.verdict is InvestigationVerdict.FAILED
+    assert report.stop_reason is StopReason.PROTOCOL_FAILURE
+
+
 def test_strict_decode_refusal_is_incomplete(tmp_path: Path) -> None:
     workspace = tmp_path / "ws"
     workspace.mkdir()
@@ -1192,6 +1218,61 @@ def test_physical_budget_counts_real_requests(
 def test_budget_override_above_ceiling_rejected() -> None:
     with pytest.raises(ValueError, match="max_decisions"):
         AgentBudget(max_decisions=999, max_tool_calls=5).validate()
+
+
+def test_budget_validation_preserves_completion_escrow() -> None:
+    with pytest.raises(ValueError, match="1024 tokens per decision"):
+        AgentBudget(max_decisions=12, max_completion_tokens=12_287).validate()
+
+
+def test_observation_byte_budget_stops_before_model_egress(
+    trusted_workspace: tuple[Path, ScopedTrustStore],
+) -> None:
+    workspace, trust = trusted_workspace
+    planner = ScriptedInvestigationPlanner(
+        steps=(ToolCall(tool="read_file", path="app.py"),),
+        build_answer=_cite_first_line,
+    )
+    loop = InvestigationLoop(
+        planner=planner,
+        trust=trust,
+        budget=AgentBudget(max_observation_bytes=1),
+    )
+
+    report = loop.run(run_id="r-observation-budget", goal="inspect", workspace=workspace)
+
+    assert report.verdict is InvestigationVerdict.INCOMPLETE
+    assert report.stop_reason is StopReason.BUDGET_EXHAUSTED
+    assert report.catalog == ()
+    assert report.observation_bytes_used == 0
+    assert "observation-byte" in report.error
+
+
+def test_active_time_budget_includes_model_work(
+    trusted_workspace: tuple[Path, ScopedTrustStore], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workspace, trust = trusted_workspace
+    # A clock origin of exactly zero is valid; it must not be confused with an
+    # uninitialized timer sentinel.
+    ticks = iter((0.0, 0.0, 1.0, 1.0))
+    monkeypatch.setattr(investigation_module.time, "monotonic", lambda: next(ticks))
+    planner = ScriptedInvestigationPlanner(
+        steps=(ToolCall(tool="read_file", path="app.py"),),
+        build_answer=_cite_first_line,
+    )
+    loop = InvestigationLoop(
+        planner=planner,
+        trust=trust,
+        budget=AgentBudget(max_active_seconds=0.5),
+    )
+
+    report = loop.run(run_id="r-time-budget", goal="inspect", workspace=workspace)
+
+    assert report.verdict is InvestigationVerdict.INCOMPLETE
+    assert report.stop_reason is StopReason.BUDGET_EXHAUSTED
+    assert report.tool_calls_used == 0
+    assert report.active_seconds == 1.0
+    assert "active-time" in report.error
 
 
 def test_read_file_past_eof_citation_is_rejected(tmp_path: Path) -> None:

@@ -304,6 +304,90 @@ def test_openai_compatible_client_accepts_a_bounded_custom_schema() -> None:
     }
 
 
+def test_openai_compatible_client_retains_validated_usage_metadata() -> None:
+    content = json.dumps({"actions": ["generic.inspect"], "rationale": "Inspect"})
+    body = json.dumps(
+        {
+            "model": "endpoint-model",
+            "usage": {
+                "prompt_tokens": 123,
+                "completion_tokens": 17,
+                "total_tokens": 140,
+            },
+            "choices": [{"message": {"content": content}}],
+        }
+    ).encode()
+    server, thread = _serve(body)
+    try:
+        host, port = server.server_address
+        client = OpenAICompatibleClient(base_url=f"http://{host}:{port}/v1", model="model")
+        client.complete_json(system="system", prompt="prompt")
+    finally:
+        _stop(server, thread)
+
+    metadata = client.last_response_metadata
+    assert metadata is not None
+    assert metadata.model == "endpoint-model"
+    assert metadata.prompt_tokens == 123
+    assert metadata.completion_tokens == 17
+    assert metadata.total_tokens == 140
+
+
+def test_openai_compatible_client_retains_usage_on_protocol_failure() -> None:
+    body = json.dumps(
+        {
+            "model": "endpoint-model",
+            "usage": {
+                "prompt_tokens": 100,
+                "completion_tokens": 7,
+                "total_tokens": 107,
+            },
+            "choices": [{"message": {"content": "not-json"}}],
+        }
+    ).encode()
+    server, thread = _serve(body)
+    try:
+        host, port = server.server_address
+        client = OpenAICompatibleClient(base_url=f"http://{host}:{port}/v1", model="model")
+        with pytest.raises(PlannerProtocolError, match="invalid response"):
+            client.complete_json(system="system", prompt="prompt")
+    finally:
+        _stop(server, thread)
+
+    metadata = client.last_response_metadata
+    assert metadata is not None
+    assert metadata.model == "endpoint-model"
+    assert metadata.prompt_tokens == 100
+    assert metadata.completion_tokens == 7
+
+
+@pytest.mark.parametrize(
+    "usage",
+    (
+        {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 99},
+        {"prompt_tokens": 1, "completion_tokens": -1, "total_tokens": 0},
+        {"prompt_tokens": True, "completion_tokens": 1, "total_tokens": 2},
+    ),
+)
+def test_openai_compatible_client_rejects_invalid_usage(usage: dict[str, object]) -> None:
+    content = json.dumps({"actions": ["generic.inspect"], "rationale": "Inspect"})
+    body = json.dumps(
+        {
+            "model": "endpoint-model",
+            "usage": usage,
+            "choices": [{"message": {"content": content}}],
+        }
+    ).encode()
+    server, thread = _serve(body)
+    try:
+        host, port = server.server_address
+        client = OpenAICompatibleClient(base_url=f"http://{host}:{port}/v1", model="model")
+        with pytest.raises(PlannerProtocolError, match="invalid response"):
+            client.complete_json(system="system", prompt="prompt")
+    finally:
+        _stop(server, thread)
+
+
 def test_openai_compatible_client_counts_success_without_reported_model() -> None:
     response_payload = {"actions": ["generic.inspect"], "rationale": "Inspect"}
     body = json.dumps(
@@ -410,6 +494,14 @@ def test_openai_compatible_client_rejects_invalid_custom_schema_controls() -> No
             prompt="prompt",
             schema_name="valid_name",
             schema={"type": "not-a-json-schema-type"},
+        )
+    with pytest.raises(ValueError, match="request timeout"):
+        client.complete_structured_json(
+            system="system",
+            prompt="prompt",
+            schema_name="valid_name",
+            schema={},
+            timeout_seconds=0,
         )
 
 

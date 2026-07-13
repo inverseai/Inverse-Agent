@@ -31,6 +31,7 @@ from inverse_agent.investigation import (
     InvestigationPlanner,
     InvestigationReport,
     InvestigationVerdict,
+    ModelCallRecord,
     ScriptedInvestigationPlanner,
     SourceCitation,
     ToolCall,
@@ -63,6 +64,17 @@ class VariantResult:
     passed: bool
     verdict: str
     reason: str
+    decisions_used: int
+    tool_calls_used: int
+    physical_requests_used: int
+    completion_tokens_used: int
+    completion_tokens_charged: int
+    completion_tokens_requested: int
+    observation_bytes_used: int
+    active_seconds: float
+    transport_retries: int
+    schema_retries: int
+    model_calls: tuple[ModelCallRecord, ...]
 
 
 @dataclass(frozen=True)
@@ -78,6 +90,34 @@ class BenchmarkResult:
         # Every case >= 2/3 variants AND aggregate >= 19/21.
         per_case_ok = self.cases_passed == self.total_cases
         return per_case_ok and self.variants_passed >= 19
+
+
+def _variant_result(
+    *,
+    case: BenchmarkCase,
+    goal: str,
+    passed: bool,
+    reason: str,
+    report: InvestigationReport,
+) -> VariantResult:
+    return VariantResult(
+        case=case.name,
+        variant=goal,
+        passed=passed,
+        verdict=report.verdict.value,
+        reason=reason,
+        decisions_used=report.decisions_used,
+        tool_calls_used=report.tool_calls_used,
+        physical_requests_used=report.physical_requests_used,
+        completion_tokens_used=report.completion_tokens_used,
+        completion_tokens_charged=report.completion_tokens_charged,
+        completion_tokens_requested=report.completion_tokens_requested,
+        observation_bytes_used=report.observation_bytes_used,
+        active_seconds=report.active_seconds,
+        transport_retries=report.transport_retries,
+        schema_retries=report.schema_retries,
+        model_calls=report.model_calls,
+    )
 
 
 def _marker_citation(catalog: tuple[ToolObservation, ...], marker: str) -> SourceCitation | None:
@@ -155,9 +195,7 @@ def _score_variant(
     return True, "ok"
 
 
-def _citation_hits_marker(
-    case: BenchmarkCase, answer: AgentAnswer, workspace: Path
-) -> bool:
+def _citation_hits_marker(case: BenchmarkCase, answer: AgentAnswer, workspace: Path) -> bool:
     """True if at least one citation resolves to a line containing the marker."""
 
     reader = WorkspaceReader.open(workspace)
@@ -227,12 +265,12 @@ def run_case_with_planner(
         report = loop.run(run_id=f"{case.name}-v{index}", goal=goal, workspace=workspace)
         passed, reason = _score_variant_model(case, report, workspace)
         results.append(
-            VariantResult(
-                case=case.name,
-                variant=goal,
+            _variant_result(
+                case=case,
+                goal=goal,
                 passed=passed,
-                verdict=report.verdict.value,
                 reason=reason,
+                report=report,
             )
         )
     return results
@@ -293,12 +331,12 @@ def run_case(case: BenchmarkCase, root: Path, trust: ScopedTrustStore) -> list[V
         )
         passed, reason = _score_variant(case, report, workspace)
         results.append(
-            VariantResult(
-                case=case.name,
-                variant=goal,
+            _variant_result(
+                case=case,
+                goal=goal,
                 passed=passed,
-                verdict=report.verdict.value,
                 reason=reason,
+                report=report,
             )
         )
     return results
@@ -357,7 +395,7 @@ def default_cases() -> tuple[BenchmarkCase, ...]:
                     "package com.example\n"
                     "class DeepLinkActivity {\n"
                     "  fun onCreate() {\n"
-                    "    webView.loadUrl(intent.getStringExtra(\"target\"))\n"
+                    '    webView.loadUrl(intent.getStringExtra("target"))\n'
                     "  }\n"
                     "}\n"
                 ),
@@ -395,9 +433,7 @@ def default_cases() -> tuple[BenchmarkCase, ...]:
                 "Find UI mutations on a background queue in the iOS app.",
                 "Check ProfileViewController for main-thread UI violations.",
             ),
-            steps=(
-                ToolCall(tool="read_file", path="App/ProfileViewController.swift"),
-            ),
+            steps=(ToolCall(tool="read_file", path="App/ProfileViewController.swift"),),
             required_concept="ProfileViewController.swift",
             marker="self.nameLabel.text = self.loadName()",
             concept_phrase="a UILabel is mutated on a global background queue",
@@ -413,19 +449,14 @@ def default_cases() -> tuple[BenchmarkCase, ...]:
                     "  return std::string_view(local);\n"
                     "}\n"
                 ),
-                "src/config.h": (
-                    "#pragma once\n"
-                    "std::string_view load();\n"
-                ),
+                "src/config.h": ("#pragma once\nstd::string_view load();\n"),
             },
             goal_variants=_variants(
                 "Does any C++ function return a dangling view?",
                 "Find lifetime bugs where a view outlives its storage.",
                 "Check config.cpp for a returned reference to a local.",
             ),
-            steps=(
-                ToolCall(tool="read_file", path="src/config.cpp"),
-            ),
+            steps=(ToolCall(tool="read_file", path="src/config.cpp"),),
             required_concept="config.cpp",
             marker="return std::string_view(local);",
             concept_phrase="load() returns a string_view over a local that is destroyed",
@@ -447,9 +478,7 @@ def default_cases() -> tuple[BenchmarkCase, ...]:
                     "  document.getElementById('out').innerHTML = term;\n"
                     "}\n"
                 ),
-                "templates/search.html": (
-                    "<html><body><div id='out'></div></body></html>\n"
-                ),
+                "templates/search.html": ("<html><body><div id='out'></div></body></html>\n"),
             },
             goal_variants=_variants(
                 "Is there a SQL injection in the Django search view?",
@@ -483,9 +512,7 @@ def default_cases() -> tuple[BenchmarkCase, ...]:
                 "Find a train/eval mode contract violation in PyTorch.",
                 "Check evaluate() for a missing model.eval() call.",
             ),
-            steps=(
-                ToolCall(tool="read_file", path="experiment.py"),
-            ),
+            steps=(ToolCall(tool="read_file", path="experiment.py"),),
             required_concept="experiment.py",
             marker="model.train()",
             concept_phrase="evaluate() calls model.train() instead of model.eval()",
@@ -494,13 +521,9 @@ def default_cases() -> tuple[BenchmarkCase, ...]:
             name="generic_architecture",
             domain="generic",
             files={
-                "README.md": (
-                    "# Service\n"
-                    "The gateway forwards requests to the billing worker.\n"
-                ),
+                "README.md": ("# Service\nThe gateway forwards requests to the billing worker.\n"),
                 "src/gateway.py": (
-                    "def handle(request):\n"
-                    "    return billing_worker.enqueue(request)\n"
+                    "def handle(request):\n    return billing_worker.enqueue(request)\n"
                 ),
                 "src/billing_worker.py": (
                     "def enqueue(request):\n"
@@ -537,9 +560,7 @@ def default_cases() -> tuple[BenchmarkCase, ...]:
                 "Find the backwards-incompatible change in the changelog.",
                 "Check the changelog for a removed endpoint.",
             ),
-            steps=(
-                ToolCall(tool="read_file", path="CHANGELOG.md"),
-            ),
+            steps=(ToolCall(tool="read_file", path="CHANGELOG.md"),),
             required_concept="CHANGELOG.md",
             marker="BREAKING: removed the legacy auth endpoint",
             concept_phrase="2.0.0 removed the legacy auth endpoint",

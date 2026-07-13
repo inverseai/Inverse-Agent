@@ -11,6 +11,7 @@ of mechanically decidable conditions force an ``INCOMPLETE`` verdict.
 
 from __future__ import annotations
 
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -25,13 +26,17 @@ from inverse_agent.fs_tools import (
     StrictDecodeError,
     ToolObservation,
     WorkspaceReader,
+    canonical_glob_scope,
+    glob_uses_recursive_listing,
 )
+from inverse_agent.planner import PlannerBudgetError
 
 __all__ = [
     "AgentAnswer",
     "AgentBudget",
     "Decision",
     "InvestigationLoop",
+    "ModelCallRecord",
     "InvestigationPlanner",
     "InvestigationReport",
     "InvestigationVerdict",
@@ -68,6 +73,10 @@ class StopReason(StrEnum):
 MAX_DECISIONS_CEILING = 24
 MAX_TOOL_CALLS_CEILING = 20
 MAX_PHYSICAL_CEILING = 36
+MAX_COMPLETION_TOKENS_CEILING = 49_152
+MAX_OBSERVATION_BYTES_CEILING = 2 * 1024 * 1024
+MAX_ACTIVE_SECONDS_CEILING = 3_600.0
+MIN_COMPLETION_TOKENS_PER_DECISION = 1_024
 
 
 @dataclass(frozen=True)
@@ -109,12 +118,30 @@ class AgentAnswer:
 
 
 @dataclass(frozen=True)
+class ModelCallRecord:
+    """One physical model request, including failures and conservative charging."""
+
+    request_index: int
+    logical_decision: int
+    requested_completion_tokens: int
+    charged_completion_tokens: int
+    reported_prompt_tokens: int | None
+    reported_completion_tokens: int | None
+    reported_model: str | None
+    latency_seconds: float
+    outcome: str
+
+
+@dataclass(frozen=True)
 class AgentBudget:
     """Loop budgets. Decisions decompose as tool decisions plus answer/recovery."""
 
     max_decisions: int = 12
     max_tool_calls: int = 10
     max_physical_requests: int = 18
+    max_completion_tokens: int = 24_576
+    max_observation_bytes: int = 512 * 1024
+    max_active_seconds: float = 600.0
 
     def validate(self) -> None:
         if self.max_tool_calls > self.max_decisions:
@@ -125,6 +152,25 @@ class AgentBudget:
             raise ValueError(f"max_tool_calls must be between 1 and {MAX_TOOL_CALLS_CEILING}")
         if not 1 <= self.max_physical_requests <= MAX_PHYSICAL_CEILING:
             raise ValueError(f"max_physical_requests must be between 1 and {MAX_PHYSICAL_CEILING}")
+        minimum_completion_tokens = self.max_decisions * MIN_COMPLETION_TOKENS_PER_DECISION
+        if (
+            not minimum_completion_tokens
+            <= self.max_completion_tokens
+            <= (MAX_COMPLETION_TOKENS_CEILING)
+        ):
+            raise ValueError(
+                "max_completion_tokens must preserve at least 1024 tokens per decision "
+                f"and not exceed {MAX_COMPLETION_TOKENS_CEILING}"
+            )
+        if not 1 <= self.max_observation_bytes <= MAX_OBSERVATION_BYTES_CEILING:
+            raise ValueError(
+                f"max_observation_bytes must be between 1 and {MAX_OBSERVATION_BYTES_CEILING}"
+            )
+        if not 0 < self.max_active_seconds <= MAX_ACTIVE_SECONDS_CEILING:
+            raise ValueError(
+                f"max_active_seconds must be greater than zero and at most "
+                f"{MAX_ACTIVE_SECONDS_CEILING:g}"
+            )
 
 
 def _call_signature(call: ToolCall) -> tuple[object, ...]:
@@ -168,6 +214,14 @@ class InvestigationReport:
     decisions_used: int
     tool_calls_used: int
     physical_requests_used: int
+    completion_tokens_used: int = 0
+    completion_tokens_charged: int = 0
+    completion_tokens_requested: int = 0
+    observation_bytes_used: int = 0
+    active_seconds: float = 0.0
+    transport_retries: int = 0
+    schema_retries: int = 0
+    model_calls: tuple[ModelCallRecord, ...] = ()
     error: str = ""
 
 
@@ -389,11 +443,17 @@ class InvestigationLoop:
         self.trust = trust
         self.budget = budget or AgentBudget()
         self.budget.validate()
+        self._started_at: float | None = None
+        self._observation_bytes_used = 0
         # If the planner makes real client requests, bound its total to the
         # physical-request budget so retries cannot exceed it, and count actual
         # requests rather than one-per-decision.
         if hasattr(planner, "max_total_requests"):
             planner.max_total_requests = self.budget.max_physical_requests
+        if hasattr(planner, "max_logical_decisions"):
+            planner.max_logical_decisions = self.budget.max_decisions
+        if hasattr(planner, "max_completion_tokens"):
+            planner.max_completion_tokens = self.budget.max_completion_tokens
 
     def _physical_count(self, fallback: int) -> int:
         """Actual client requests so far, from the planner when it tracks them."""
@@ -401,21 +461,54 @@ class InvestigationLoop:
         made = getattr(self.planner, "requests_made", None)
         return int(made) if isinstance(made, int) else fallback
 
+    def _completion_charged(self) -> int:
+        charged = getattr(self.planner, "completion_tokens_charged", None)
+        return int(charged) if isinstance(charged, int) else 0
+
+    def _completion_reported(self) -> int:
+        reported = getattr(self.planner, "completion_tokens_reported", None)
+        return int(reported) if isinstance(reported, int) else 0
+
+    def _completion_requested(self) -> int:
+        requested = getattr(self.planner, "completion_tokens_requested", None)
+        return int(requested) if isinstance(requested, int) else 0
+
+    def _model_calls(self) -> tuple[ModelCallRecord, ...]:
+        calls = getattr(self.planner, "model_calls", ())
+        if not isinstance(calls, list | tuple) or not all(
+            isinstance(call, ModelCallRecord) for call in calls
+        ):
+            return ()
+        return tuple(calls)
+
+    def _active_seconds(self) -> float:
+        if self._started_at is None:
+            return 0.0
+        return max(0.0, time.monotonic() - self._started_at)
+
+    def _active_budget_exhausted(self) -> bool:
+        return self._active_seconds() >= self.budget.max_active_seconds
+
     def run(self, *, run_id: str, goal: str, workspace: Path) -> InvestigationReport:
+        self._started_at = time.monotonic()
+        self._observation_bytes_used = 0
+        active_deadline = self._started_at + self.budget.max_active_seconds
+        if hasattr(self.planner, "active_deadline"):
+            self.planner.active_deadline = active_deadline
         resolved = workspace.resolve()
         if not self.trust.has_scope(resolved, AttestationScope.SOURCE_READ):
-            return InvestigationReport(
-                run_id=run_id,
-                verdict=InvestigationVerdict.INCOMPLETE,
-                stop_reason=StopReason.NOT_ATTESTED,
-                answer=None,
-                catalog=(),
-                decisions_used=0,
-                tool_calls_used=0,
-                physical_requests_used=0,
+            return self._finish(
+                run_id,
+                InvestigationVerdict.INCOMPLETE,
+                StopReason.NOT_ATTESTED,
+                None,
+                [],
+                0,
+                0,
+                0,
                 error="workspace is not attested for source_read",
             )
-        reader = WorkspaceReader.open(resolved)
+        reader = WorkspaceReader.open(resolved, active_deadline=active_deadline)
         catalog: list[ToolObservation] = []
         decisions = 0
         tool_calls = 0
@@ -424,6 +517,18 @@ class InvestigationLoop:
         no_progress_repeats = 0
 
         while True:
+            if self._active_budget_exhausted():
+                return self._finish(
+                    run_id,
+                    InvestigationVerdict.INCOMPLETE,
+                    StopReason.BUDGET_EXHAUSTED,
+                    None,
+                    catalog,
+                    decisions,
+                    tool_calls,
+                    physical,
+                    error="active-time budget exhausted",
+                )
             if decisions >= self.budget.max_decisions:
                 return self._finish(
                     run_id,
@@ -455,7 +560,7 @@ class InvestigationLoop:
                 decision = self.planner.decide(goal=goal, catalog=tuple(catalog))
             except Exception as exc:  # planner/model protocol failure
                 physical = self._physical_count(decisions + 1)
-                budget_stop = "request budget exhausted" in str(exc)
+                budget_stop = isinstance(exc, PlannerBudgetError)
                 return self._finish(
                     run_id,
                     InvestigationVerdict.INCOMPLETE if budget_stop else InvestigationVerdict.FAILED,
@@ -468,6 +573,18 @@ class InvestigationLoop:
                     error=str(exc),
                 )
             physical = self._physical_count(decisions + 1)
+            if self._active_budget_exhausted():
+                return self._finish(
+                    run_id,
+                    InvestigationVerdict.INCOMPLETE,
+                    StopReason.BUDGET_EXHAUSTED,
+                    None,
+                    catalog,
+                    decisions,
+                    tool_calls,
+                    physical,
+                    error="active-time budget exhausted",
+                )
             if not isinstance(decision, ToolCall | AgentAnswer):
                 return self._finish(
                     run_id,
@@ -638,11 +755,10 @@ class InvestigationLoop:
                         "refused": True,
                         "request_invalid": isinstance(exc, RequestValidationError),
                         "query": decision.query,
-                        "glob": decision.glob,
+                        "glob": canonical_glob_scope(decision.glob),
                         "recursive": (
                             decision.tool == "list_files"
-                            and decision.glob is not None
-                            and "**" in decision.glob
+                            and glob_uses_recursive_listing(decision.glob)
                         ),
                     },
                 )
@@ -659,10 +775,36 @@ class InvestigationLoop:
                     physical,
                     error="search encountered a file that failed strict UTF-8 decoding",
                 )
+            if self._active_budget_exhausted():
+                return self._finish(
+                    run_id,
+                    InvestigationVerdict.INCOMPLETE,
+                    StopReason.BUDGET_EXHAUSTED,
+                    None,
+                    catalog,
+                    decisions,
+                    tool_calls,
+                    physical,
+                    error="active-time budget exhausted",
+                )
+            observation_bytes = len(observation.text.encode("utf-8"))
+            if self._observation_bytes_used + observation_bytes > self.budget.max_observation_bytes:
+                return self._finish(
+                    run_id,
+                    InvestigationVerdict.INCOMPLETE,
+                    StopReason.BUDGET_EXHAUSTED,
+                    None,
+                    catalog,
+                    decisions,
+                    tool_calls,
+                    physical,
+                    error="observation-byte budget exhausted",
+                )
+            self._observation_bytes_used += observation_bytes
             catalog.append(observation)
 
-    @staticmethod
     def _finish(
+        self,
         run_id: str,
         verdict: InvestigationVerdict,
         stop_reason: StopReason,
@@ -683,6 +825,14 @@ class InvestigationLoop:
             decisions_used=decisions,
             tool_calls_used=tool_calls,
             physical_requests_used=physical,
+            completion_tokens_used=self._completion_reported(),
+            completion_tokens_charged=self._completion_charged(),
+            completion_tokens_requested=self._completion_requested(),
+            observation_bytes_used=self._observation_bytes_used,
+            active_seconds=self._active_seconds(),
+            transport_retries=int(getattr(self.planner, "transport_retries", 0)),
+            schema_retries=int(getattr(self.planner, "schema_retries", 0)),
+            model_calls=self._model_calls(),
             error=error,
         )
 

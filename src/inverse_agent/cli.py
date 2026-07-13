@@ -404,6 +404,23 @@ def build_parser() -> argparse.ArgumentParser:
         help="OpenAI-compatible endpoint (default http://127.0.0.1:1234/v1)",
     )
     benchmark_investigation.add_argument(
+        "--model-context-tokens",
+        type=int,
+        choices=(16_384, 24_576, 32_768, 49_152),
+        help=(
+            "Calibrated endpoint context capacity; provide the flag or "
+            "INVERSE_AGENT_MODEL_CONTEXT_TOKENS for model runs"
+        ),
+    )
+    benchmark_investigation.add_argument(
+        "--model-estimator-bytes-per-token",
+        type=float,
+        help=(
+            "Calibrated conservative UTF-8 bytes-per-token floor; defaults to "
+            "INVERSE_AGENT_MODEL_ESTIMATOR_BYTES_PER_TOKEN and is required for model runs"
+        ),
+    )
+    benchmark_investigation.add_argument(
         "--model-allow-remote",
         action="store_true",
         help="Permit a non-loopback model endpoint (requires https)",
@@ -448,11 +465,43 @@ def benchmark_investigation_command(args: argparse.Namespace) -> int:
             allow_remote=allow_remote,
             timeout_seconds=120,
         )
+        context_tokens = args.model_context_tokens
+        if context_tokens is None:
+            raw_context = os.environ.get("INVERSE_AGENT_MODEL_CONTEXT_TOKENS")
+            if raw_context is None:
+                raise ValueError(
+                    "model investigation requires a calibrated model context-token value"
+                )
+            try:
+                context_tokens = int(raw_context)
+            except ValueError as exc:
+                raise ValueError("INVERSE_AGENT_MODEL_CONTEXT_TOKENS must be an integer") from exc
+        if context_tokens not in {16_384, 24_576, 32_768, 49_152}:
+            raise ValueError("model context tokens must be one of 16384, 24576, 32768, or 49152")
+        estimator_bytes_per_token = args.model_estimator_bytes_per_token
+        if estimator_bytes_per_token is None:
+            raw_estimator = os.environ.get("INVERSE_AGENT_MODEL_ESTIMATOR_BYTES_PER_TOKEN")
+            if raw_estimator is None:
+                raise ValueError(
+                    "model investigation requires a calibrated estimator bytes-per-token value"
+                )
+            try:
+                estimator_bytes_per_token = float(raw_estimator)
+            except ValueError as exc:
+                raise ValueError(
+                    "INVERSE_AGENT_MODEL_ESTIMATOR_BYTES_PER_TOKEN must be numeric"
+                ) from exc
+        if not 1.0 <= estimator_bytes_per_token <= 4.0:
+            raise ValueError("model estimator bytes per token must be between 1.0 and 4.0")
 
         from inverse_agent.investigation import AgentBudget
 
         def factory(case: BenchmarkCase, goal: str) -> ModelInvestigationPlanner:
-            return ModelInvestigationPlanner(client=client)
+            return ModelInvestigationPlanner(
+                client=client,
+                context_tokens=context_tokens,
+                estimator_bytes_per_token=estimator_bytes_per_token,
+            )
 
         # A local 20B model needs more exploration budget than the tight default
         # to locate evidence across files and recover from a wrong first guess.
@@ -471,6 +520,8 @@ def benchmark_investigation_command(args: argparse.Namespace) -> int:
             "successful_responses": client.successful_response_count,
             "attributed_responses": client.attributed_response_count,
             "endpoint_model_consistent": endpoint_model_consistent,
+            "context_tokens": context_tokens,
+            "estimator_bytes_per_token": estimator_bytes_per_token,
         }
     else:
         result = run_benchmark(cases)
@@ -489,14 +540,23 @@ def benchmark_investigation_command(args: argparse.Namespace) -> int:
                 "passed": variant.passed,
                 "verdict": variant.verdict,
                 "reason": variant.reason,
+                "decisions_used": variant.decisions_used,
+                "tool_calls_used": variant.tool_calls_used,
+                "physical_requests_used": variant.physical_requests_used,
+                "completion_tokens_used": variant.completion_tokens_used,
+                "completion_tokens_charged": variant.completion_tokens_charged,
+                "completion_tokens_requested": variant.completion_tokens_requested,
+                "observation_bytes_used": variant.observation_bytes_used,
+                "active_seconds": variant.active_seconds,
+                "transport_retries": variant.transport_retries,
+                "schema_retries": variant.schema_retries,
+                "model_calls": [asdict(call) for call in variant.model_calls],
             }
             for variant in result.variants
         ],
     }
     if args.output:
-        Path(args.output).resolve().write_text(
-            json.dumps(summary, indent=2), encoding="utf-8"
-        )
+        Path(args.output).resolve().write_text(json.dumps(summary, indent=2), encoding="utf-8")
     print(json.dumps(summary, indent=2))
     return 0 if gate_passed else 1
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -44,6 +45,20 @@ class PlannerTransportError(PlannerError):
 
 class PlannerProtocolError(PlannerError):
     """Raised when the model endpoint returns an invalid response."""
+
+
+class PlannerBudgetError(PlannerError):
+    """Raised before a model call would exceed a configured run budget."""
+
+
+@dataclass(frozen=True)
+class ModelResponseMetadata:
+    """Validated provider metadata for the most recent successful response."""
+
+    model: str | None
+    prompt_tokens: int | None
+    completion_tokens: int | None
+    total_tokens: int | None
 
 
 def validate_model_endpoint(base_url: str, *, allow_remote: bool = False) -> str:
@@ -126,6 +141,7 @@ class OpenAICompatibleClient:
         self._observed_response_models: set[str] = set()
         self._successful_response_count = 0
         self._attributed_response_count = 0
+        self._last_response_metadata: ModelResponseMetadata | None = None
         self._observation_lock = Lock()
 
     @property
@@ -143,6 +159,11 @@ class OpenAICompatibleClient:
         with self._observation_lock:
             return self._attributed_response_count
 
+    @property
+    def last_response_metadata(self) -> ModelResponseMetadata | None:
+        with self._observation_lock:
+            return self._last_response_metadata
+
     def complete_json(self, *, system: str, prompt: str) -> dict[str, Any]:
         return self.complete_structured_json(
             system=system,
@@ -159,6 +180,7 @@ class OpenAICompatibleClient:
         schema_name: str,
         schema: Mapping[str, Any],
         max_tokens: int = MAX_MODEL_COMPLETION_TOKENS,
+        timeout_seconds: float | None = None,
     ) -> dict[str, Any]:
         """Complete a caller-supplied strict JSON schema over the hardened transport."""
 
@@ -166,6 +188,15 @@ class OpenAICompatibleClient:
             raise ValueError("schema name contains unsupported characters")
         if not 1 <= max_tokens <= MAX_MODEL_COMPLETION_TOKENS:
             raise ValueError(f"max tokens must be between 1 and {MAX_MODEL_COMPLETION_TOKENS}")
+        if timeout_seconds is not None and (
+            not math.isfinite(timeout_seconds) or timeout_seconds <= 0
+        ):
+            raise ValueError("request timeout must be a positive finite number")
+        effective_timeout = float(self.timeout_seconds)
+        if timeout_seconds is not None:
+            effective_timeout = min(effective_timeout, timeout_seconds)
+        with self._observation_lock:
+            self._last_response_metadata = None
         schema_payload = dict(schema)
         try:
             Draft202012Validator.check_schema(schema_payload)
@@ -202,12 +233,12 @@ class OpenAICompatibleClient:
         connection = connection_type(
             hostname,
             port=parsed_url.port,
-            timeout=self.timeout_seconds,
+            timeout=effective_timeout,
         )
         request_path = f"{parsed_url.path.rstrip('/')}/chat/completions"
         if not request_path.startswith("/"):
             request_path = f"/{request_path}"
-        deadline = monotonic() + self.timeout_seconds
+        deadline = monotonic() + effective_timeout
         try:
             connection.request("POST", request_path, body=body, headers=headers)
             self._apply_deadline(connection, deadline)
@@ -231,6 +262,30 @@ class OpenAICompatibleClient:
                 or MODEL_RESPONSE_ID_PATTERN.fullmatch(reported_model) is None
             ):
                 raise TypeError("response model identity is invalid")
+            usage = payload.get("usage")
+            prompt_tokens: int | None = None
+            completion_tokens: int | None = None
+            total_tokens: int | None = None
+            if usage is not None:
+                if not isinstance(usage, dict):
+                    raise TypeError("response usage is not an object")
+                prompt_tokens = self._usage_count(usage, "prompt_tokens")
+                completion_tokens = self._usage_count(usage, "completion_tokens")
+                total_tokens = self._usage_count(usage, "total_tokens")
+                if total_tokens != prompt_tokens + completion_tokens:
+                    raise TypeError("response usage totals are inconsistent")
+                if completion_tokens > max_tokens:
+                    raise TypeError("response completion usage exceeds the request allowance")
+            # Retain independently validated envelope metadata even when the
+            # decision content below is malformed. The caller can then charge
+            # reported usage and attribute a protocol failure accurately.
+            with self._observation_lock:
+                self._last_response_metadata = ModelResponseMetadata(
+                    model=reported_model,
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                    total_tokens=total_tokens,
+                )
             choices = payload["choices"]
             content = choices[0]["message"]["content"]
             if not isinstance(content, str):
@@ -252,6 +307,13 @@ class OpenAICompatibleClient:
                 self._observed_response_models.add(reported_model)
                 self._attributed_response_count += 1
         return parsed
+
+    @staticmethod
+    def _usage_count(usage: dict[str, Any], name: str) -> int:
+        value = usage.get(name)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise TypeError(f"response usage {name} is invalid")
+        return value
 
     @staticmethod
     def _apply_deadline(

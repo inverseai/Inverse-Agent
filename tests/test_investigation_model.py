@@ -9,7 +9,7 @@ from typing import Any
 import pytest
 
 from inverse_agent.attestations import AttestationScope, ScopedTrustStore
-from inverse_agent.fs_tools import ToolObservation
+from inverse_agent.fs_tools import ToolObservation, WorkspaceReader
 from inverse_agent.investigation import (
     AgentAnswer,
     InvestigationLoop,
@@ -19,11 +19,13 @@ from inverse_agent.investigation import (
 )
 from inverse_agent.investigation_model import (
     ModelInvestigationPlanner,
+    _encoded_string_tokens,
     _render_catalog,
     parse_decision,
 )
 from inverse_agent.planner import (
-    PlannerError,
+    ModelResponseMetadata,
+    PlannerBudgetError,
     PlannerProtocolError,
     PlannerTransportError,
 )
@@ -32,9 +34,19 @@ from inverse_agent.planner import (
 class FakeClient:
     """Returns queued payloads; raises queued exceptions to exercise retry."""
 
-    def __init__(self, responses: list[dict[str, Any] | Exception]) -> None:
+    def __init__(
+        self,
+        responses: list[dict[str, Any] | Exception],
+        *,
+        metadata: list[ModelResponseMetadata | None] | None = None,
+    ) -> None:
         self._responses = responses
+        self._metadata = metadata or []
         self.calls = 0
+        self.max_tokens_requested: list[int] = []
+        self.prompts: list[str] = []
+        self.timeouts_requested: list[float | None] = []
+        self.last_response_metadata: ModelResponseMetadata | None = None
 
     def complete_structured_json(
         self,
@@ -44,9 +56,16 @@ class FakeClient:
         schema_name: str,
         schema: Mapping[str, Any],
         max_tokens: int = 4096,
+        timeout_seconds: float | None = None,
     ) -> dict[str, Any]:
         self.calls += 1
+        self.max_tokens_requested.append(max_tokens)
+        self.prompts.append(prompt)
+        self.timeouts_requested.append(timeout_seconds)
+        self.last_response_metadata = None
         item = self._responses.pop(0)
+        if self._metadata:
+            self.last_response_metadata = self._metadata.pop(0)
         if isinstance(item, Exception):
             raise item
         return item
@@ -118,6 +137,8 @@ def test_schema_retry_then_success() -> None:
     assert client.calls == 2
     assert planner.schema_retries == 1
     assert planner.requests_made == 2
+    assert client.max_tokens_requested == [2048, 1877]
+    assert planner.completion_tokens_charged == sum(client.max_tokens_requested)
 
 
 def test_second_same_class_failure_is_not_retried() -> None:
@@ -129,6 +150,47 @@ def test_second_same_class_failure_is_not_retried() -> None:
     assert client.calls == 2
 
 
+def test_protocol_failure_retains_validated_usage_metadata() -> None:
+    metadata = ModelResponseMetadata(
+        model="inverse-gpt-oss-20b",
+        prompt_tokens=100,
+        completion_tokens=7,
+        total_tokens=107,
+    )
+    client = FakeClient(
+        [PlannerProtocolError("bad json")],
+        metadata=[metadata],
+    )
+    planner = ModelInvestigationPlanner(client=client, max_schema_retries=0)
+
+    with pytest.raises(PlannerProtocolError):
+        planner.decide(goal="x", catalog=())
+
+    assert planner.completion_tokens_requested == 2048
+    assert planner.completion_tokens_charged == 7
+    assert planner.completion_tokens_reported == 7
+    assert planner.model_calls[0].reported_prompt_tokens == 100
+    assert planner.model_calls[0].reported_model == "inverse-gpt-oss-20b"
+    assert planner.model_calls[0].outcome == "protocol_error"
+
+
+def test_unadmitted_schema_retry_preserves_original_failure() -> None:
+    client = FakeClient([PlannerProtocolError("malformed decision")])
+    planner = ModelInvestigationPlanner(
+        client=client,
+        max_logical_decisions=1,
+        max_completion_tokens=1024,
+    )
+
+    with pytest.raises(PlannerProtocolError, match="malformed decision"):
+        planner.decide(goal="x", catalog=())
+
+    assert client.calls == 1
+    assert planner.requests_made == 1
+    assert planner.schema_retries == 0
+    assert [call.outcome for call in planner.model_calls] == ["protocol_error"]
+
+
 def test_transport_and_schema_retries_are_separate() -> None:
     good = _base("list_files", path=".")
     client = FakeClient([PlannerTransportError("net"), PlannerProtocolError("bad"), good])
@@ -138,16 +200,54 @@ def test_transport_and_schema_retries_are_separate() -> None:
     assert planner.transport_retries == 1
     assert planner.schema_retries == 1
     assert client.calls == 3
+    assert [call.outcome for call in planner.model_calls] == [
+        "transport_error",
+        "protocol_error",
+        "success",
+    ]
+    assert all(call.logical_decision == 1 for call in planner.model_calls)
 
 
 def test_total_request_budget_bounds_calls() -> None:
-    client = FakeClient([PlannerTransportError("net")] * 10)
-    planner = ModelInvestigationPlanner(
-        client=client, max_transport_retries=100, max_total_requests=3
-    )
-    with pytest.raises(PlannerError):
+    client = FakeClient([_base("list_files", path=".")] * 3)
+    planner = ModelInvestigationPlanner(client=client, max_total_requests=3)
+    for _ in range(3):
+        planner.decide(goal="x", catalog=())
+    with pytest.raises(PlannerBudgetError, match="request budget"):
         planner.decide(goal="x", catalog=())
     assert planner.requests_made == 3
+
+
+def test_completion_budget_exhaustion_is_not_schema_retried() -> None:
+    client = FakeClient([_base("list_files", path=".")])
+    planner = ModelInvestigationPlanner(
+        client=client,
+        max_logical_decisions=1,
+        max_completion_tokens=1024,
+    )
+    planner.decide(goal="x", catalog=())
+
+    with pytest.raises(PlannerBudgetError, match="completion-token budget"):
+        planner.decide(goal="x", catalog=())
+
+    assert client.calls == 1
+    assert planner.schema_retries == 0
+
+
+def test_retry_limits_cannot_exceed_protocol_contract() -> None:
+    with pytest.raises(ValueError, match="max_transport_retries"):
+        ModelInvestigationPlanner(client=FakeClient([]), max_transport_retries=2)
+    with pytest.raises(ValueError, match="max_schema_retries"):
+        ModelInvestigationPlanner(client=FakeClient([]), max_schema_retries=2)
+
+
+def test_dense_estimator_requires_context_that_can_render_a_legal_read() -> None:
+    with pytest.raises(ValueError, match="context/estimator pair"):
+        ModelInvestigationPlanner(
+            client=FakeClient([]),
+            context_tokens=16_384,
+            estimator_bytes_per_token=2.0,
+        )
 
 
 def test_unsupported_action_raises() -> None:
@@ -277,6 +377,10 @@ def test_loop_maps_repeated_final_boolean_schema_failure_to_protocol_failure(
     assert planner.schema_retries == 1
     assert report.verdict is InvestigationVerdict.FAILED
     assert report.stop_reason is StopReason.PROTOCOL_FAILURE
+    assert report.completion_tokens_used == 0
+    assert report.completion_tokens_charged == planner.completion_tokens_charged
+    assert report.completion_tokens_requested == planner.completion_tokens_requested
+    assert [call.outcome for call in report.model_calls] == ["schema_error", "schema_error"]
 
 
 def test_large_read_is_fully_rendered_not_dropped() -> None:
@@ -358,6 +462,145 @@ def test_recent_observation_survives_when_budget_exceeded() -> None:
     assert "omitted for space" in text
 
 
+def test_catalog_honors_json_encoded_token_budget() -> None:
+    observations = tuple(
+        ToolObservation(
+            observation_id=f"obs_{index}",
+            tool="list_files",
+            path=".",
+            content_hash=f"h{index}",
+            text='quoted "\\ value',
+            lines=(f'quoted-{index}-"\\-' + "x" * 100,),
+        )
+        for index in range(20)
+    )
+
+    text, ids = _render_catalog(observations, token_budget=512)
+
+    assert _encoded_string_tokens(text, bytes_per_token=2.0) <= 512
+    assert ids == frozenset()
+    assert "obs_19" in text
+
+
+def test_calibrated_context_bounds_full_prompt() -> None:
+    observations = tuple(
+        ToolObservation(
+            observation_id=f"obs_{index}",
+            tool="list_files",
+            path=".",
+            content_hash=f"h{index}",
+            text="x" * 500,
+            lines=(f"path/{index}/" + "x" * 300,),
+        )
+        for index in range(40)
+    )
+    client = FakeClient([_base("list_files", path=".")])
+    planner = ModelInvestigationPlanner(client=client, context_tokens=24_576)
+
+    planner.decide(goal="inspect the workspace", catalog=observations)
+
+    safety_margin = (planner.context_tokens + 9) // 10
+    assert (
+        planner._prompt_token_bound(client.prompts[0])
+        + client.max_tokens_requested[0]
+        + safety_margin
+        <= planner.context_tokens
+    )
+
+
+def test_json_escape_heavy_maximum_read_remains_citable_at_16k_context(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "large.py"
+    source.write_text("\n".join("\\" * 60 for _ in range(200)), encoding="utf-8")
+    read = WorkspaceReader.open(tmp_path).read_file("large.py")
+    planner = ModelInvestigationPlanner(
+        client=FakeClient([]),
+        context_tokens=16_384,
+        estimator_bytes_per_token=2.5,
+    )
+    planner._turn = 1
+    allowance = planner._completion_allowance()
+    history_budget = planner._history_token_budget(goal="inspect", completion_reserve=allowance)
+
+    text, ids = _render_catalog(
+        (read,),
+        token_budget=history_budget,
+        estimator_bytes_per_token=planner.estimator_bytes_per_token,
+    )
+
+    assert read.truncated
+    assert "\\\\" in text
+    assert ids == frozenset({read.observation_id})
+
+
+def test_redacted_line_metadata_does_not_crowd_out_citable_read_at_16k() -> None:
+    read = ToolObservation(
+        observation_id="obs_redacted_max",
+        tool="read_file",
+        path="config.py",
+        content_hash="h",
+        text="",
+        lines=tuple(f"{line}: [REDACTED_SECRET]" for line in range(1, 200))
+        + ("200: " + "\a" * 1_300,),
+        start_line=1,
+        truncated=True,
+        incomplete=True,
+        redacted=True,
+        metadata={"redacted_lines": tuple(range(1, 200))},
+    )
+    planner = ModelInvestigationPlanner(
+        client=FakeClient([]),
+        context_tokens=16_384,
+        estimator_bytes_per_token=2.5,
+    )
+    planner._turn = 1
+    allowance = planner._completion_allowance()
+    history_budget = planner._history_token_budget(goal="inspect", completion_reserve=allowance)
+
+    text, ids = _render_catalog(
+        (read,),
+        token_budget=history_budget,
+        estimator_bytes_per_token=planner.estimator_bytes_per_token,
+    )
+
+    assert "non_citable_redacted_lines=1-199" in text
+    assert ids == frozenset({read.observation_id})
+
+
+def test_reported_usage_reconciles_conservative_completion_charge() -> None:
+    metadata = ModelResponseMetadata(
+        model="inverse-gpt-oss-20b",
+        prompt_tokens=900,
+        completion_tokens=37,
+        total_tokens=937,
+    )
+    client = FakeClient([_base("list_files", path=".")], metadata=[metadata])
+    planner = ModelInvestigationPlanner(client=client)
+
+    planner.decide(goal="inspect", catalog=())
+
+    assert planner.completion_tokens_requested == 2048
+    assert planner.completion_tokens_charged == 37
+    assert planner.completion_tokens_reported == 37
+    assert planner.model_calls[0].reported_prompt_tokens == 900
+    assert planner.model_calls[0].reported_model == "inverse-gpt-oss-20b"
+    assert planner.model_calls[0].outcome == "success"
+
+
+def test_active_deadline_caps_model_transport_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = FakeClient([_base("list_files", path=".")])
+    planner = ModelInvestigationPlanner(client=client)
+    planner.active_deadline = 10.5
+    monkeypatch.setattr("inverse_agent.investigation_model.time.monotonic", lambda: 10.0)
+
+    planner.decide(goal="inspect", catalog=())
+
+    assert client.timeouts_requested == [0.5]
+
+
 def test_render_marks_fully_shown_read_as_citable() -> None:
     obs = ToolObservation(
         observation_id="obs_full",
@@ -386,7 +629,8 @@ def test_render_marks_redacted_lines_non_citable() -> None:
         metadata={"redacted_lines": (2,)},
     )
     text, ids = _render_catalog((obs,))
-    assert "2: [REDACTED_SECRET] [NON-CITABLE: REDACTED LINE]" in text
+    assert "non_citable_redacted_lines=2" in text
+    assert "2: [REDACTED_SECRET]" in text
     assert ids == frozenset({"obs_redacted"})
 
 

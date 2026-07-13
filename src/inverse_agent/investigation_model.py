@@ -12,13 +12,22 @@ protocol failure.
 from __future__ import annotations
 
 import json
+import math
+import time
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Protocol
 
+from inverse_agent.fs_tools import (
+    CHARS_PER_TOKEN,
+    PATH_MAX_CHARS,
+    READ_MAX_LINES,
+    READ_MAX_TOKENS,
+)
 from inverse_agent.investigation import (
     AgentAnswer,
     Decision,
+    ModelCallRecord,
     SourceCitation,
     ToolCall,
     ToolObservation,
@@ -27,17 +36,26 @@ from inverse_agent.investigation import (
 )
 from inverse_agent.planner import (
     MAX_MODEL_COMPLETION_TOKENS,
+    ModelResponseMetadata,
+    PlannerBudgetError,
     PlannerError,
+    PlannerProtocolError,
     PlannerTransportError,
 )
 
 __all__ = ["ModelInvestigationPlanner", "SupportsStructuredJson", "parse_decision"]
 
-# Must comfortably exceed one full read (READ_MAX_TOKENS*CHARS_PER_TOKEN plus
-# per-line "N: " prefixes and the header) so a legal 200-line read is never
-# dropped for lack of room; well within a 32K-token context.
-CATALOG_CHAR_BUDGET = 40_000
+# Direct unit callers get the legacy generous cap. Production planning derives
+# the actual catalog budget from the endpoint's calibrated context capacity.
+CATALOG_TOKEN_BUDGET = 20_000
 CATALOG_LINES_PER_OBS = 60
+CONTEXT_CALIBRATION_POINTS = (16_384, 24_576, 32_768, 49_152)
+MIN_COMPLETION_ALLOWANCE = 1_024
+MAX_COMPLETION_BUDGET = 49_152
+MAX_LOGICAL_DECISIONS = 24
+MAX_PHYSICAL_REQUESTS = 36
+PROMPT_TRANSPORT_OVERHEAD_TOKENS = 512
+DEFAULT_ESTIMATOR_BYTES_PER_TOKEN = 2.0
 
 DECISION_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -130,6 +148,7 @@ class SupportsStructuredJson(Protocol):
         schema_name: str,
         schema: Mapping[str, Any],
         max_tokens: int = ...,
+        timeout_seconds: float | None = ...,
     ) -> dict[str, Any]: ...
 
 
@@ -162,6 +181,8 @@ def _render_block(obs: ToolObservation) -> tuple[str, bool]:
         f"redacted={str(obs.redacted).lower()}"
     )
     header = f"id={obs.observation_id} tool={obs.tool} path={obs.path} status[{status}] ({citable})"
+    if redacted_lines:
+        header += f" non_citable_redacted_lines={_compact_line_ranges(redacted_lines)}"
     if obs.metadata.get("refused"):
         return f"{header}\n  REFUSED: {obs.text}", False
     if obs.metadata.get("binary"):
@@ -173,10 +194,8 @@ def _render_block(obs: ToolObservation) -> tuple[str, bool]:
     shown = obs.lines[:limit]
     fully_rendered = limit >= len(obs.lines)
     rendered_lines = []
-    for offset, line in enumerate(shown):
-        line_number = obs.start_line + offset
-        suffix = " [NON-CITABLE: REDACTED LINE]" if line_number in redacted_lines else ""
-        rendered_lines.append(f"  {line}{suffix}")
+    for line in shown:
+        rendered_lines.append(f"  {line}")
     body = "\n".join(rendered_lines) or "  (no matching content)"
     if obs.incomplete or obs.truncated:
         body = (
@@ -189,7 +208,70 @@ def _render_block(obs: ToolObservation) -> tuple[str, bool]:
     return f"{header}\n{body}", is_citable_read
 
 
-def _render_catalog(catalog: tuple[ToolObservation, ...]) -> tuple[str, frozenset[str]]:
+def _encoded_string_tokens(value: str, *, bytes_per_token: float) -> int:
+    """Estimate tokens from the exact JSON-encoded observation representation."""
+
+    encoded_bytes = len(json.dumps(value, ensure_ascii=True).encode("utf-8"))
+    return math.ceil(encoded_bytes / bytes_per_token)
+
+
+def _compact_line_ranges(lines: set[int]) -> str:
+    """Render a bounded integer set without repeating a label per source line."""
+
+    if not lines:
+        return ""
+    ordered = sorted(lines)
+    ranges: list[str] = []
+    start = previous = ordered[0]
+    for line in ordered[1:]:
+        if line == previous + 1:
+            previous = line
+            continue
+        ranges.append(str(start) if start == previous else f"{start}-{previous}")
+        start = previous = line
+    ranges.append(str(start) if start == previous else f"{start}-{previous}")
+    return ",".join(ranges)
+
+
+def _maximum_read_probe_tokens(*, bytes_per_token: float) -> int:
+    """Token estimate for the largest JSON-bounded read the tool can emit."""
+
+    serialized_budget = READ_MAX_TOKENS * CHARS_PER_TOKEN
+    line_break_bytes = 2 * (READ_MAX_LINES - 1)
+    # BEL is accepted as text by the read tier and expands to six ASCII bytes in
+    # JSON. Filling with it models the worst per-source-byte prompt expansion.
+    content_chars = max(1, (serialized_budget - 2 - line_break_bytes) // 6)
+    width, remainder = divmod(content_chars, READ_MAX_LINES)
+    lines = tuple(
+        f"{line}: " + "\a" * (width + (1 if line <= remainder else 0))
+        for line in range(1, READ_MAX_LINES + 1)
+    )
+    probe = ToolObservation(
+        observation_id="obs_0123456789abcdef",
+        tool="read_file",
+        # One non-BMP code point is four UTF-8 bytes and twelve bytes under
+        # ensure_ascii JSON escaping, the maximum expansion of accepted path
+        # text. Component limits can only make a real path smaller.
+        path="\U00010000" * PATH_MAX_CHARS,
+        content_hash="h" * 64,
+        text="",
+        lines=lines,
+        start_line=1,
+        truncated=True,
+        incomplete=True,
+        redacted=True,
+        metadata={"redacted_lines": tuple(range(1, READ_MAX_LINES))},
+    )
+    block, _citable = _render_block(probe)
+    return _encoded_string_tokens(block, bytes_per_token=bytes_per_token)
+
+
+def _render_catalog(
+    catalog: tuple[ToolObservation, ...],
+    *,
+    token_budget: int = CATALOG_TOKEN_BUDGET,
+    estimator_bytes_per_token: float = DEFAULT_ESTIMATOR_BYTES_PER_TOKEN,
+) -> tuple[str, frozenset[str]]:
     """Render the catalog and return (prompt text, ids of fully-rendered reads).
 
     A read_file observation only becomes citable when all of its lines were
@@ -201,6 +283,10 @@ def _render_catalog(catalog: tuple[ToolObservation, ...]) -> tuple[str, frozense
     newest-first; dropped context is always the oldest.
     """
 
+    if token_budget < 0:
+        raise ValueError("catalog token budget cannot be negative")
+    if not math.isfinite(estimator_bytes_per_token) or estimator_bytes_per_token <= 0:
+        raise ValueError("estimator bytes per token must be positive and finite")
     if not catalog:
         return "(no observations yet)", frozenset()
 
@@ -210,27 +296,46 @@ def _render_catalog(catalog: tuple[ToolObservation, ...]) -> tuple[str, frozense
         None,
     )
 
+    marker = "(earlier observations omitted for space)"
+
+    def render(indices: set[int]) -> str:
+        text_blocks = [blocks[i][0] for i in sorted(indices)]
+        if len(indices) < len(catalog):
+            text_blocks.insert(0, marker)
+        return "\n".join(text_blocks)
+
     selected: set[int] = set()
-    used = 0
     if newest_read_index is not None:
-        # Force-include the latest read (bounded well under the budget).
-        selected.add(newest_read_index)
-        used += len(blocks[newest_read_index][0])
+        # Preserve the latest citable read only when it fits the calibrated
+        # history allowance. Oversized evidence is omitted and therefore cannot
+        # become a repair/validation target.
+        trial = {newest_read_index}
+        if (
+            _encoded_string_tokens(render(trial), bytes_per_token=estimator_bytes_per_token)
+            <= token_budget
+        ):
+            selected = trial
     for index in range(len(catalog) - 1, -1, -1):
         if index in selected:
             continue
-        block_len = len(blocks[index][0])
-        if used + block_len > CATALOG_CHAR_BUDGET and selected:
-            continue
-        selected.add(index)
-        used += block_len
+        trial = {*selected, index}
+        if (
+            _encoded_string_tokens(render(trial), bytes_per_token=estimator_bytes_per_token)
+            <= token_budget
+        ):
+            selected = trial
 
     omitted = len(selected) < len(catalog)
     rendered_read_ids = {catalog[i].observation_id for i in selected if blocks[i][1]}
-    text_blocks = [blocks[i][0] for i in sorted(selected)]
-    if omitted:
-        text_blocks.insert(0, "(earlier observations omitted for space)")
-    return "\n".join(text_blocks), frozenset(rendered_read_ids)
+    if selected:
+        rendered = render(selected)
+    elif omitted and (
+        _encoded_string_tokens(marker, bytes_per_token=estimator_bytes_per_token) <= token_budget
+    ):
+        rendered = marker
+    else:
+        rendered = ""
+    return rendered, frozenset(rendered_read_ids)
 
 
 def _repair_citations(
@@ -373,13 +478,61 @@ class ModelInvestigationPlanner:
     max_schema_retries: int = 1
     max_auto_reads: int = 3
     max_nudges: int = 3
-    max_total_requests: int = 54
+    max_total_requests: int = 18
+    max_logical_decisions: int = 12
+    max_completion_tokens: int = 24_576
+    context_tokens: int = 24_576
+    estimator_bytes_per_token: float = DEFAULT_ESTIMATOR_BYTES_PER_TOKEN
+    max_estimator_error_tokens: int = 0
     requests_made: int = field(default=0, init=False)
+    completion_tokens_requested: int = field(default=0, init=False)
+    completion_tokens_charged: int = field(default=0, init=False)
+    completion_tokens_reported: int = field(default=0, init=False)
+    completion_allowances: list[int] = field(default_factory=list, init=False)
+    model_calls: list[ModelCallRecord] = field(default_factory=list, init=False)
     transport_retries: int = field(default=0, init=False)
     schema_retries: int = field(default=0, init=False)
+    active_deadline: float | None = field(default=None, init=False)
     _turn: int = field(default=0, init=False)
     _auto_reads: int = field(default=0, init=False)
     _nudges: int = field(default=0, init=False)
+
+    def __post_init__(self) -> None:
+        if not 0 <= self.max_transport_retries <= 1:
+            raise ValueError("max_transport_retries must be 0 or 1")
+        if not 0 <= self.max_schema_retries <= 1:
+            raise ValueError("max_schema_retries must be 0 or 1")
+        if not 0 <= self.max_auto_reads <= 3:
+            raise ValueError("max_auto_reads must be between 0 and 3")
+        if not 0 <= self.max_nudges <= 3:
+            raise ValueError("max_nudges must be between 0 and 3")
+        if not 1 <= self.max_total_requests <= MAX_PHYSICAL_REQUESTS:
+            raise ValueError(f"max_total_requests must be between 1 and {MAX_PHYSICAL_REQUESTS}")
+        if not 1 <= self.max_logical_decisions <= MAX_LOGICAL_DECISIONS:
+            raise ValueError(f"max_logical_decisions must be between 1 and {MAX_LOGICAL_DECISIONS}")
+        minimum_completion = self.max_logical_decisions * MIN_COMPLETION_ALLOWANCE
+        if not minimum_completion <= self.max_completion_tokens <= MAX_COMPLETION_BUDGET:
+            raise ValueError(
+                "max_completion_tokens must preserve at least 1024 tokens per decision "
+                f"and not exceed {MAX_COMPLETION_BUDGET}"
+            )
+        if self.context_tokens not in CONTEXT_CALIBRATION_POINTS:
+            raise ValueError(
+                "context_tokens must be one of the measured calibration points: "
+                "16384, 24576, 32768, or 49152"
+            )
+        if not 1.0 <= self.estimator_bytes_per_token <= 4.0:
+            raise ValueError("estimator_bytes_per_token must be between 1.0 and 4.0")
+        if (
+            _maximum_read_probe_tokens(bytes_per_token=self.estimator_bytes_per_token)
+            > self.context_tokens // 2
+        ):
+            raise ValueError(
+                "context/estimator pair cannot render one maximum legal read; "
+                "select a larger calibrated context"
+            )
+        if not 0 <= self.max_estimator_error_tokens <= self.context_tokens:
+            raise ValueError("max_estimator_error_tokens is outside the context range")
 
     def _nudge_if_ungrounded(
         self, answer: AgentAnswer, catalog: tuple[ToolObservation, ...]
@@ -438,22 +591,40 @@ class ModelInvestigationPlanner:
             return ToolCall(tool="read_file", path=citation.path, start_line=citation.start_line)
         return None
 
-    def _request(self, prompt: str) -> dict[str, Any]:
-        if self.requests_made >= self.max_total_requests:
-            raise PlannerError("model request budget exhausted")
-        self.requests_made += 1
-        return self.client.complete_structured_json(
-            system=_SYSTEM_PROMPT,
-            prompt=prompt,
-            schema_name="investigation_decision",
-            schema=DECISION_SCHEMA,
-            max_tokens=MAX_MODEL_COMPLETION_TOKENS,
+    def _completion_allowance(self) -> int:
+        remaining_budget = self.max_completion_tokens - self.completion_tokens_charged
+        remaining_decisions = max(1, self.max_logical_decisions - self._turn + 1)
+        allowance = min(MAX_MODEL_COMPLETION_TOKENS, remaining_budget // remaining_decisions)
+        if allowance < MIN_COMPLETION_ALLOWANCE:
+            raise PlannerBudgetError("model completion-token budget exhausted")
+        return allowance
+
+    def _prompt_token_bound(self, prompt: str) -> int:
+        encoded_bytes = (
+            len(_SYSTEM_PROMPT.encode("utf-8"))
+            + len(json.dumps(DECISION_SCHEMA, ensure_ascii=True).encode("utf-8"))
+            + len(prompt.encode("utf-8"))
+        )
+        estimated = math.ceil(encoded_bytes / self.estimator_bytes_per_token)
+        return estimated + PROMPT_TRANSPORT_OVERHEAD_TOKENS
+
+    def _history_token_budget(self, *, goal: str, completion_reserve: int) -> int:
+        empty_prompt = self._build_prompt(goal=goal, observations="")
+        non_observation_tokens = self._prompt_token_bound(empty_prompt)
+        safety_margin = max(
+            (self.context_tokens + 9) // 10,
+            2 * self.max_estimator_error_tokens,
+        )
+        return max(
+            0,
+            min(
+                self.context_tokens // 2,
+                self.context_tokens - completion_reserve - non_observation_tokens - safety_margin,
+            ),
         )
 
-    def decide(self, *, goal: str, catalog: tuple[ToolObservation, ...]) -> Decision:
-        self._turn += 1
-        observations, rendered_ids = _render_catalog(catalog)
-        prompt = json.dumps(
+    def _build_prompt(self, *, goal: str, observations: str) -> str:
+        return json.dumps(
             {
                 "goal": goal,
                 "hint": self.goal_hint,
@@ -463,25 +634,179 @@ class ModelInvestigationPlanner:
                     "Return one action. If you have enough evidence, return "
                     "final_answer with citations; otherwise read or search."
                 ),
-            }
+            },
+            ensure_ascii=True,
         )
+
+    def _reconcile_response_metadata(
+        self,
+        *,
+        allowance: int,
+        prompt: str,
+    ) -> tuple[int, int | None, int | None, str | None]:
+        metadata = getattr(self.client, "last_response_metadata", None)
+        if not isinstance(metadata, ModelResponseMetadata):
+            return allowance, None, None, None
+        reported_completion = metadata.completion_tokens
+        charged = allowance
+        if reported_completion is not None:
+            charged = reported_completion
+            self.completion_tokens_charged -= allowance - charged
+            self.completion_tokens_reported += reported_completion
+        if metadata.prompt_tokens is not None:
+            estimated_prompt = self._prompt_token_bound(prompt)
+            self.max_estimator_error_tokens = max(
+                self.max_estimator_error_tokens,
+                metadata.prompt_tokens - estimated_prompt,
+            )
+        return charged, metadata.prompt_tokens, reported_completion, metadata.model
+
+    def _request(self, prompt: str) -> dict[str, Any]:
+        if self.requests_made >= self.max_total_requests:
+            raise PlannerBudgetError("model request budget exhausted")
+        timeout_seconds: float | None = None
+        if self.active_deadline is not None:
+            timeout_seconds = self.active_deadline - time.monotonic()
+            if timeout_seconds <= 0:
+                raise PlannerBudgetError("active-time budget exhausted")
+        allowance = self._completion_allowance()
+        self.requests_made += 1
+        # Charge before transport so failed and retried requests cannot receive
+        # free completion capacity when an endpoint omits usage.
+        self.completion_tokens_charged += allowance
+        self.completion_tokens_requested += allowance
+        self.completion_allowances.append(allowance)
+        started_at = time.monotonic()
+        try:
+            payload = self.client.complete_structured_json(
+                system=_SYSTEM_PROMPT,
+                prompt=prompt,
+                schema_name="investigation_decision",
+                schema=DECISION_SCHEMA,
+                max_tokens=allowance,
+                timeout_seconds=timeout_seconds,
+            )
+        except Exception as exc:
+            if isinstance(exc, PlannerTransportError):
+                outcome = "transport_error"
+            elif isinstance(exc, PlannerProtocolError):
+                outcome = "protocol_error"
+            elif isinstance(exc, PlannerError):
+                outcome = "planner_error"
+            else:
+                outcome = "client_error"
+            charged, reported_prompt, reported_completion, reported_model = (
+                self._reconcile_response_metadata(allowance=allowance, prompt=prompt)
+            )
+            self.model_calls.append(
+                ModelCallRecord(
+                    request_index=self.requests_made,
+                    logical_decision=self._turn,
+                    requested_completion_tokens=allowance,
+                    charged_completion_tokens=charged,
+                    reported_prompt_tokens=reported_prompt,
+                    reported_completion_tokens=reported_completion,
+                    reported_model=reported_model,
+                    latency_seconds=max(0.0, time.monotonic() - started_at),
+                    outcome=outcome,
+                )
+            )
+            raise
+        charged, reported_prompt, reported_completion, reported_model = (
+            self._reconcile_response_metadata(allowance=allowance, prompt=prompt)
+        )
+        self.model_calls.append(
+            ModelCallRecord(
+                request_index=self.requests_made,
+                logical_decision=self._turn,
+                requested_completion_tokens=allowance,
+                charged_completion_tokens=charged,
+                reported_prompt_tokens=reported_prompt,
+                reported_completion_tokens=reported_completion,
+                reported_model=reported_model,
+                latency_seconds=max(0.0, time.monotonic() - started_at),
+                outcome="success",
+            )
+        )
+        return payload
+
+    def _mark_last_call_schema_error(self) -> None:
+        if self.model_calls and self.model_calls[-1].outcome == "success":
+            self.model_calls[-1] = replace(self.model_calls[-1], outcome="schema_error")
+
+    def decide(self, *, goal: str, catalog: tuple[ToolObservation, ...]) -> Decision:
+        self._turn += 1
+        completion_reserve = self._completion_allowance()
+        history_budget = self._history_token_budget(
+            goal=goal,
+            completion_reserve=completion_reserve,
+        )
+        observations, rendered_ids = _render_catalog(
+            catalog,
+            token_budget=history_budget,
+            estimator_bytes_per_token=self.estimator_bytes_per_token,
+        )
+        prompt = self._build_prompt(goal=goal, observations=observations)
+        safety_margin = max(
+            (self.context_tokens + 9) // 10,
+            2 * self.max_estimator_error_tokens,
+        )
+        if (
+            self._prompt_token_bound(prompt) + completion_reserve + safety_margin
+            > self.context_tokens
+        ):
+            raise PlannerBudgetError("model context budget exhausted")
         transport_used = 0
         schema_used = 0
+        pending_retry: str | None = None
+        pending_failure: Exception | None = None
+
+        def record_executed_retry(kind: str | None) -> None:
+            if kind == "transport":
+                self.transport_retries += 1
+            elif kind == "schema":
+                self.schema_retries += 1
+
         while True:
+            payload_received = False
+            requests_before = self.requests_made
             try:
                 payload = self._request(prompt)
+                record_executed_retry(pending_retry)
+                pending_retry = None
+                pending_failure = None
+                payload_received = True
                 decision = parse_decision(payload)
-            except PlannerTransportError:
+            except PlannerTransportError as exc:
+                if self.requests_made > requests_before:
+                    record_executed_retry(pending_retry)
+                pending_retry = None
+                pending_failure = None
                 if transport_used >= self.max_transport_retries:
                     raise
                 transport_used += 1
-                self.transport_retries += 1
+                pending_retry = "transport"
+                pending_failure = exc
                 continue
-            except (PlannerError, ValueError, KeyError, TypeError):
+            except PlannerBudgetError as budget_error:
+                if pending_retry is not None:
+                    if self.requests_made > requests_before:
+                        record_executed_retry(pending_retry)
+                    elif pending_failure is not None:
+                        raise pending_failure from budget_error
+                raise
+            except (PlannerError, ValueError, KeyError, TypeError) as exc:
+                if self.requests_made > requests_before:
+                    record_executed_retry(pending_retry)
+                pending_retry = None
+                pending_failure = None
+                if payload_received:
+                    self._mark_last_call_schema_error()
                 if schema_used >= self.max_schema_retries:
                     raise
                 schema_used += 1
-                self.schema_retries += 1
+                pending_retry = "schema"
+                pending_failure = exc
                 continue
             if isinstance(decision, AgentAnswer):
                 # Prefer a targeted read of a cited-but-unread file; fall back to a

@@ -10,6 +10,8 @@ from inverse_agent.fs_tools import WorkspaceReader, _glob_match
 def test_glob_strips_recursive_prefix() -> None:
     assert _glob_match("**/*.py", "app.py")
     assert _glob_match("*.py", "app.py")
+    assert _glob_match("src/**/*.py", "app.py", relative_path="src/a/b/app.py")
+    assert not _glob_match("src/*.py", "app.py", relative_path="x/src/app.py")
     assert not _glob_match("**/*.py", "app.xml")
 
 
@@ -87,6 +89,34 @@ def test_interior_recursive_glob_matches_nested(tmp_path: Path) -> None:
     assert "other.py" not in obs.lines
 
 
+def test_glob_is_relative_to_requested_listing_base(tmp_path: Path) -> None:
+    package = tmp_path / "src" / "pkg"
+    package.mkdir(parents=True)
+    (package / "mod.py").write_text("x\n", encoding="utf-8")
+    (tmp_path / "src" / "top.py").write_text("y\n", encoding="utf-8")
+    reader = WorkspaceReader.open(tmp_path)
+
+    obs = reader.list_files("src", glob="pkg/*.py")
+
+    assert obs.lines == ("src/pkg/mod.py",)
+    assert obs.metadata["recursive"] is True
+
+
+def test_search_glob_matches_workspace_relative_path(tmp_path: Path) -> None:
+    source = tmp_path / "src" / "pkg"
+    source.mkdir(parents=True)
+    tests = tmp_path / "tests"
+    tests.mkdir()
+    (source / "mod.py").write_text("needle\n", encoding="utf-8")
+    (tests / "test_mod.py").write_text("needle\n", encoding="utf-8")
+    reader = WorkspaceReader.open(tmp_path)
+
+    obs = reader.search_text("needle", glob="src/**/*.py")
+
+    assert any(line.startswith("src/pkg/mod.py:") for line in obs.lines)
+    assert all(not line.startswith("tests/") for line in obs.lines)
+
+
 def test_recursive_listing_reports_entry_cap_truncation(tmp_path: Path) -> None:
     # More than LIST_MAX_ENTRIES files must report truncated=True, not hide it.
     from inverse_agent.fs_tools import LIST_MAX_ENTRIES
@@ -126,9 +156,7 @@ def test_walk_visit_limit_bounds_a_single_large_directory(
     assert obs.truncated is True
 
 
-def test_search_reports_truncation_when_walk_capped(
-    tmp_path: Path, monkeypatch: object
-) -> None:
+def test_search_reports_truncation_when_walk_capped(tmp_path: Path, monkeypatch: object) -> None:
     # search_text must not report a capped scan as complete.
     import inverse_agent.fs_tools as fs_tools
 
