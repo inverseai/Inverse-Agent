@@ -132,6 +132,96 @@ def test_read_file_rejects_symlinked_parent(tmp_path: Path) -> None:
         reader.read_file("linkdir/file.txt")
 
 
+def test_read_file_rejects_hard_link(tmp_path: Path) -> None:
+    outside = tmp_path.parent / f"{tmp_path.name}-outside.txt"
+    outside.write_text("outside secret\n", encoding="utf-8")
+    linked = tmp_path / "linked.txt"
+    try:
+        os.link(outside, linked)
+    except OSError:
+        pytest.skip("hard links not permitted in this environment")
+    reader = WorkspaceReader.open(tmp_path)
+    with pytest.raises(FsToolError, match="multiple hard links"):
+        reader.read_file("linked.txt")
+
+
+def test_read_file_uses_validated_handle_not_path_reopen(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "safe.txt"
+    target.write_text("retained handle\n", encoding="utf-8")
+    reader = WorkspaceReader.open(tmp_path)
+
+    def path_reopen_forbidden(_path: Path) -> bytes:
+        raise AssertionError("validated path was reopened")
+
+    monkeypatch.setattr(Path, "read_bytes", path_reopen_forbidden)
+    assert reader.read_file("safe.txt").text == "retained handle\n"
+
+
+def test_reader_rejects_replaced_workspace_root(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "safe.txt").write_text("old root\n", encoding="utf-8")
+    reader = WorkspaceReader.open(workspace)
+    moved = tmp_path / "moved-workspace"
+    workspace.rename(moved)
+    workspace.mkdir()
+    (workspace / "safe.txt").write_text("replacement root\n", encoding="utf-8")
+    with pytest.raises(FsToolError, match="workspace root was replaced"):
+        reader.read_file("safe.txt")
+
+
+def test_read_file_enforces_operation_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import inverse_agent.fs_tools as fs_tools
+
+    (tmp_path / "safe.txt").write_text("content\n", encoding="utf-8")
+    reader = WorkspaceReader.open(tmp_path)
+    monkeypatch.setattr(fs_tools, "FS_OPERATION_TIMEOUT_SECONDS", -1.0)
+    with pytest.raises(FsToolError, match="deadline"):
+        reader.read_file("safe.txt")
+
+
+def test_recursive_list_and_search_propagate_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import inverse_agent.fs_tools as fs_tools
+
+    (tmp_path / "safe.py").write_text("needle\n", encoding="utf-8")
+    reader = WorkspaceReader.open(tmp_path)
+    monkeypatch.setattr(fs_tools, "FS_OPERATION_TIMEOUT_SECONDS", -1.0)
+    with pytest.raises(FsToolError, match="deadline"):
+        reader.list_files(".", glob="**/*.py")
+    with pytest.raises(FsToolError, match="deadline"):
+        reader.search_text("needle")
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX special-file behavior")
+def test_posix_fifo_is_refused_without_blocking(tmp_path: Path) -> None:
+    fifo = tmp_path / "pipe"
+    os.mkfifo(fifo)
+    reader = WorkspaceReader.open(tmp_path)
+    with pytest.raises(FsToolError, match="regular file"):
+        reader.read_file("pipe")
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX permission behavior")
+def test_posix_unreadable_regular_file_makes_listing_fail_closed(tmp_path: Path) -> None:
+    target = tmp_path / "unreadable.txt"
+    target.write_text("hidden evidence\n", encoding="utf-8")
+    reader = WorkspaceReader.open(tmp_path)
+    target.chmod(0)
+    try:
+        with pytest.raises(FsToolError, match="could not be opened and verified"):
+            reader.list_files(".")
+        with pytest.raises(FsToolError, match="could not be opened and verified"):
+            reader.search_text("hidden evidence")
+    finally:
+        target.chmod(0o600)
+
+
 def test_read_file_max_lines_bounds(workspace: Path) -> None:
     reader = WorkspaceReader.open(workspace)
     with pytest.raises(FsToolError, match="max_lines"):
@@ -281,3 +371,142 @@ def test_windows_reparse_attribute_detected(tmp_path: Path) -> None:
     (tmp_path / "plain.txt").write_text("ok\n", encoding="utf-8")
     obs = reader.read_file("plain.txt")
     assert obs.path == "plain.txt"
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="directory junctions are windows-only")
+def test_windows_directory_junction_is_never_traversed(tmp_path: Path) -> None:
+    import subprocess
+
+    outside = tmp_path.parent / f"{tmp_path.name}-outside"
+    outside.mkdir()
+    (outside / "secret.txt").write_text("outside secret\n", encoding="utf-8")
+    junction = tmp_path / "junction"
+    created = subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(junction), str(outside)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if created.returncode != 0:
+        pytest.skip("directory junctions not permitted in this environment")
+    try:
+        reader = WorkspaceReader.open(tmp_path)
+        with pytest.raises(FsToolError, match="symlink, junction, or reparse"):
+            reader.read_file("junction/secret.txt")
+        assert "outside secret" not in reader.search_text("outside secret").text
+    finally:
+        junction.rmdir()
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows sharing semantics")
+def test_windows_read_handle_denies_concurrent_writer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import threading
+
+    import inverse_agent.secure_fs as secure_fs
+
+    target = tmp_path / "stable.txt"
+    target.write_bytes(b"A" * (128 * 1024))
+    reader = WorkspaceReader.open(tmp_path)
+    entered = threading.Event()
+    release = threading.Event()
+    failures: list[BaseException] = []
+    original_read = secure_fs._windows_read
+
+    def delayed_read(handle: int, *, maximum_bytes: int, deadline: float) -> bytes:
+        entered.set()
+        if not release.wait(5):
+            raise AssertionError("writer probe did not release the read")
+        return original_read(handle, maximum_bytes=maximum_bytes, deadline=deadline)
+
+    def run_read() -> None:
+        try:
+            reader.read_file("stable.txt")
+        except BaseException as exc:
+            failures.append(exc)
+
+    monkeypatch.setattr(secure_fs, "_windows_read", delayed_read)
+    thread = threading.Thread(target=run_read)
+    thread.start()
+    assert entered.wait(5)
+    try:
+        with pytest.raises(OSError):
+            target.open("r+b")
+    finally:
+        release.set()
+        thread.join(5)
+    assert not thread.is_alive()
+    assert failures == []
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows sharing semantics")
+def test_windows_writer_cannot_hide_file_from_listing_or_search(tmp_path: Path) -> None:
+    target = tmp_path / "visible.txt"
+    target.write_text("visible evidence\n", encoding="utf-8")
+    reader = WorkspaceReader.open(tmp_path)
+    with target.open("r+b"):
+        assert "visible.txt" in reader.list_files(".").lines
+        with pytest.raises(FsToolError):
+            reader.search_text("visible evidence")
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows sharing semantics")
+def test_windows_exclusive_writer_makes_listing_and_search_fail_closed(tmp_path: Path) -> None:
+    import ctypes
+    from ctypes import wintypes
+
+    target = tmp_path / "exclusive.txt"
+    target.write_text("exclusive evidence\n", encoding="utf-8")
+    reader = WorkspaceReader.open(tmp_path)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
+    create_file.restype = wintypes.HANDLE
+    handle = create_file(str(target), 0xC0000000, 0, None, 3, 0, None)
+    assert handle not in {None, ctypes.c_void_p(-1).value}
+    try:
+        with pytest.raises(FsToolError, match="could not be opened and verified"):
+            reader.list_files(".")
+        with pytest.raises(FsToolError, match="could not be opened and verified"):
+            reader.search_text("exclusive evidence")
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows sharing semantics")
+def test_windows_unverifiable_denied_name_is_not_disclosed(tmp_path: Path) -> None:
+    import ctypes
+    from ctypes import wintypes
+
+    target = tmp_path / ".env"
+    target.write_text("SECRET=value\n", encoding="utf-8")
+    reader = WorkspaceReader.open(tmp_path)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
+    create_file.restype = wintypes.HANDLE
+    handle = create_file(str(target), 0xC0000000, 0, None, 3, 0, None)
+    assert handle not in {None, ctypes.c_void_p(-1).value}
+    try:
+        with pytest.raises(FsToolError) as error:
+            reader.list_files(".")
+        assert ".env" not in str(error.value)
+    finally:
+        kernel32.CloseHandle(handle)

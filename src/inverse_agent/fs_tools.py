@@ -15,14 +15,19 @@ an earlier observation actually returned.
 from __future__ import annotations
 
 import hashlib
-import os
 import re
-import stat
+import time
 from dataclasses import dataclass, field
 from fnmatch import fnmatch
 from pathlib import Path, PurePosixPath
 
 from inverse_agent.redaction import SECRET_PATTERNS
+from inverse_agent.secure_fs import (
+    SecureFsDeadlineError,
+    SecureFsError,
+    SecureFsPolicyError,
+    SecureWorkspace,
+)
 
 # Token-denominated bounds (a chars/token upper-bound heuristic keeps reads inside
 # a small local context window). Byte limits are defensive backstops.
@@ -44,6 +49,7 @@ QUERY_MAX_CHARS = 256
 GLOB_MAX_CHARS = 128
 # Post-serialization ceiling for list/search results (~2,000 tokens backstop).
 RESPONSE_MAX_BYTES = 16 * 1024
+FS_OPERATION_TIMEOUT_SECONDS = 10.0
 
 # Windows reserved device names (checked per path component, case-insensitively,
 # ignoring any extension).
@@ -82,8 +88,6 @@ _DENIED_NAME_PATTERNS = (
     re.compile(r"(?i)^\.netrc$"),
     re.compile(r"(?i)^credentials(\.json)?$"),
 )
-
-_WINDOWS_FILE_ATTRIBUTE_REPARSE_POINT = 0x400
 
 
 class FsToolError(ValueError):
@@ -157,13 +161,6 @@ def _reject_sensitive_name(name: str) -> None:
             raise PolicyViolationError(f"file is denied by the sensitive-file policy: {name}")
 
 
-def _is_reparse_point(entry: os.stat_result) -> bool:
-    attributes = getattr(entry, "st_file_attributes", 0)
-    if attributes & _WINDOWS_FILE_ATTRIBUTE_REPARSE_POINT:
-        return True
-    return stat.S_ISLNK(entry.st_mode)
-
-
 def _relative_parts(raw_path: str) -> tuple[str, ...]:
     if not raw_path or len(raw_path) > PATH_MAX_CHARS:
         raise PolicyViolationError("path is empty or exceeds the length limit")
@@ -177,44 +174,6 @@ def _relative_parts(raw_path: str) -> tuple[str, ...]:
     for part in parts:
         _reject_component(part)
     return parts
-
-
-def _resolve_within(workspace: Path, raw_path: str) -> tuple[Path, str]:
-    """Resolve a workspace-relative path component by component, refusing links.
-
-    Returns the resolved filesystem path and its canonical workspace-relative
-    form. Traversal is anchored at the workspace root and every intermediate
-    component is checked (non-reparse, directory) before descending, then the
-    fully realpath-resolved target is confirmed to still lie inside the root and
-    to use only canonical (non-alias) names. This is a check-then-open design
-    with a realpath containment backstop; the spec's fully handle-relative
-    (``FILE_FLAG_OPEN_REPARSE_POINT`` / ``OBJ_DONT_REPARSE``) open that closes the
-    residual mid-traversal swap race is deferred to the hardened v0.2b build.
-    """
-
-    parts = _relative_parts(raw_path)
-    if not parts:
-        raise PolicyViolationError("path must reference a file or directory inside the workspace")
-    current = workspace
-    for index, part in enumerate(parts):
-        current = current / part
-        try:
-            entry = current.lstat()
-        except OSError as exc:
-            raise FsToolError("path does not exist inside the workspace") from exc
-        if _is_reparse_point(entry):
-            raise PolicyViolationError("path component is a symlink, junction, or reparse point")
-        is_last = index == len(parts) - 1
-        if not is_last and not stat.S_ISDIR(entry.st_mode):
-            raise PolicyViolationError("path traverses a non-directory")
-    # Canonicalize: expand 8.3 aliases and confirm the resolved path is still
-    # inside the root, then run every policy check against the canonical name.
-    canonical = _canonical_relative(workspace, current)
-    if tuple(name.lower() for name in canonical) != tuple(name.lower() for name in parts):
-        raise PolicyViolationError("path uses a short-name alias or non-canonical form")
-    for name in canonical:
-        _reject_component(name)
-    return current, "/".join(canonical)
 
 
 def _looks_binary(data: bytes) -> bool:
@@ -260,21 +219,12 @@ def _sanitize_line_preserving(text: str) -> tuple[str, bool]:
     return result, redacted["any"]
 
 
-def _canonical_relative(workspace: Path, resolved: Path) -> tuple[str, ...]:
-    """Return the canonical (long-name, link-resolved) workspace-relative parts.
-
-    On Windows this expands 8.3 short-name aliases and resolves any residual
-    reparse indirection, so name-based deny checks cannot be evaded with an
-    alias, and confirms the final path is still inside the workspace root.
-    """
-
-    final = Path(os.path.realpath(resolved))
-    root = Path(os.path.realpath(workspace))
-    try:
-        relative = final.relative_to(root)
-    except ValueError as exc:
-        raise PolicyViolationError("resolved path escapes the workspace root") from exc
-    return relative.parts
+def _tool_error(exc: SecureFsError) -> FsToolError:
+    if isinstance(exc, SecureFsPolicyError):
+        return PolicyViolationError(str(exc))
+    if isinstance(exc, SecureFsDeadlineError):
+        return FsToolError(str(exc))
+    return FsToolError(str(exc))
 
 
 @dataclass(frozen=True)
@@ -282,25 +232,19 @@ class WorkspaceReader:
     """A source_read-scoped reader bound to one resolved workspace root."""
 
     workspace: Path
-    root_id: tuple[int, int]
+    secure: SecureWorkspace
 
     @classmethod
     def open(cls, workspace: Path) -> WorkspaceReader:
-        resolved = workspace.resolve()
-        if not resolved.is_dir():
-            raise FsToolError("workspace is not an existing directory")
-        entry = resolved.stat()
-        return cls(resolved, (entry.st_dev, entry.st_ino))
-
-    def _verify_root(self) -> None:
-        """Detect a root rename/swap between open() and this call."""
-
         try:
-            entry = self.workspace.stat()
-        except OSError as exc:
-            raise FsToolError("workspace root is no longer accessible") from exc
-        if (entry.st_dev, entry.st_ino) != self.root_id:
-            raise PolicyViolationError("workspace root was replaced since it was opened")
+            secure = SecureWorkspace.open(workspace)
+        except SecureFsError as exc:
+            raise _tool_error(exc) from exc
+        return cls(secure.workspace, secure)
+
+    @staticmethod
+    def _deadline() -> float:
+        return time.monotonic() + FS_OPERATION_TIMEOUT_SECONDS
 
     def read_file(
         self,
@@ -313,21 +257,21 @@ class WorkspaceReader:
             raise FsToolError("start_line must be >= 1")
         if not 1 <= max_lines <= READ_MAX_LINES:
             raise FsToolError(f"max_lines must be between 1 and {READ_MAX_LINES}")
-        self._verify_root()
-        resolved, relative = _resolve_within(self.workspace, path)
+        parts = _relative_parts(path)
+        if not parts:
+            raise PolicyViolationError("path must reference a file inside the workspace")
+        relative = "/".join(parts)
         _reject_sensitive_name(relative.rsplit("/", 1)[-1])
-        entry = resolved.lstat()
-        if not stat.S_ISREG(entry.st_mode):
-            raise FsToolError("path is not a regular file")
-        if entry.st_nlink > 1:
-            raise PolicyViolationError("file has multiple hard links; refusing to read")
-        if entry.st_size > FILE_MAX_BYTES:
-            raise FsToolError("file exceeds the maximum readable size")
-        data = resolved.read_bytes()
-        # Fail closed on mid-read mutation.
-        after = resolved.lstat()
-        if (after.st_size, after.st_mtime_ns) != (entry.st_size, entry.st_mtime_ns):
-            raise FsToolError("file changed while being read")
+        try:
+            secure_read = self.secure.read_bytes(
+                parts,
+                maximum_bytes=FILE_MAX_BYTES,
+                deadline=self._deadline(),
+            )
+        except SecureFsError as exc:
+            raise _tool_error(exc) from exc
+        data = secure_read.data
+        entry = secure_read.entry
         raw_hash = hashlib.sha256(data).hexdigest()
         window_salt = f"{raw_hash}:{start_line}:{max_lines}"
         if _looks_binary(data):
@@ -338,7 +282,7 @@ class WorkspaceReader:
                 content_hash=raw_hash,
                 text="",
                 incomplete=False,
-                metadata={"binary": True, "size_bytes": entry.st_size},
+                metadata={"binary": True, "size_bytes": entry.size},
             )
         decoded = _decode_strict(data)
         # Sanitize the WHOLE file before slicing so a window starting inside a
@@ -358,9 +302,7 @@ class WorkspaceReader:
             text = _clip_to_byte_budget(text, READ_MAX_BYTES)
             window = text.split("\n")
             truncated = True
-        numbered = tuple(
-            f"{start_line + offset}: {line}" for offset, line in enumerate(window)
-        )
+        numbered = tuple(f"{start_line + offset}: {line}" for offset, line in enumerate(window))
         return ToolObservation(
             observation_id=_observation_id("read_file", relative, window_salt),
             tool="read_file",
@@ -378,18 +320,20 @@ class WorkspaceReader:
     def list_files(self, path: str = ".", *, glob: str | None = None) -> ToolObservation:
         if glob is not None and len(glob) > GLOB_MAX_CHARS:
             raise FsToolError("glob pattern exceeds the length limit")
-        self._verify_root()
+        deadline = self._deadline()
         if path in ("", "."):
-            base, relative = self.workspace, "."
+            base_parts: tuple[str, ...] = ()
+            relative = "."
         else:
-            base, relative = _resolve_within(self.workspace, path)
-            if not base.is_dir():
-                raise FsToolError("list target is not a directory")
+            base_parts = _relative_parts(path)
+            if not base_parts:
+                raise PolicyViolationError("list path must reference a workspace directory")
+            relative = "/".join(base_parts)
         # A recursive glob (containing ``**``) returns a bounded file tree of
         # matching workspace-relative paths, so a model can discover nested files
         # in one call instead of drilling directory by directory.
         if glob is not None and "**" in glob:
-            return self._list_recursive(base, relative, glob)
+            return self._list_recursive(base_parts, relative, glob, deadline=deadline)
         # Scan lazily and bound the number of entries examined so a directory
         # with millions of children cannot be fully materialized before the
         # LIST_MAX_ENTRIES cap applies.
@@ -397,45 +341,44 @@ class WorkspaceReader:
         visited = 0
         truncated_scan = False
         try:
-            with os.scandir(base) as scan:
-                for entry in scan:
-                    visited += 1
-                    if visited > WALK_VISIT_LIMIT or len(rows) >= LIST_MAX_ENTRIES * 4:
-                        truncated_scan = True
-                        break
-                    name = entry.name
-                    try:
-                        _reject_component(name)
-                    except FsToolError:
-                        continue
-                    try:
-                        child_stat = entry.stat(follow_symlinks=False)
-                    except OSError:
-                        continue
-                    if _is_reparse_point(child_stat):
-                        continue
-                    is_dir = stat.S_ISDIR(child_stat.st_mode)
-                    if not is_dir:
-                        # Sensitive files are denied by name in listings too, so a
-                        # directory listing cannot enumerate secret-bearing paths.
-                        try:
-                            _reject_sensitive_name(name)
-                        except FsToolError:
-                            continue
-                    if glob is not None and not is_dir and not _glob_match(glob, name):
-                        continue
-                    rows.append((name, is_dir))
-        except OSError as exc:
-            raise FsToolError("directory could not be listed") from exc
+            listing = self.secure.list_directory(
+                base_parts,
+                maximum_visits=min(WALK_VISIT_LIMIT, LIST_MAX_ENTRIES * 4),
+                deadline=deadline,
+            )
+        except SecureFsError as exc:
+            raise _tool_error(exc) from exc
+        truncated_scan = listing.truncated
+        for entry in listing.entries:
+            visited += 1
+            if visited > WALK_VISIT_LIMIT or len(rows) >= LIST_MAX_ENTRIES * 4:
+                truncated_scan = True
+                break
+            name = entry.name
+            try:
+                _reject_component(name)
+            except FsToolError:
+                continue
+            is_dir = entry.is_dir
+            if not is_dir:
+                if entry.link_count > 1:
+                    continue
+                try:
+                    _reject_sensitive_name(name)
+                except FsToolError:
+                    continue
+            if glob is not None and not is_dir and not _glob_match(glob, name):
+                continue
+            rows.append((name, is_dir))
         rows.sort()
-        entries = [
+        rendered_entries = [
             f"{name}{'/' if is_dir else ''}"[:PATH_MAX_CHARS]
             for name, is_dir in rows[:LIST_MAX_ENTRIES]
         ]
         cap_hit = truncated_scan or len(rows) > LIST_MAX_ENTRIES
-        entries, ceiling_hit = _apply_response_ceiling(entries)
+        rendered_entries, ceiling_hit = _apply_response_ceiling(rendered_entries)
         ceiling_hit = ceiling_hit or cap_hit
-        text = "\n".join(entries)
+        text = "\n".join(rendered_entries)
         content_hash = hashlib.sha256(text.encode()).hexdigest()
         return ToolObservation(
             observation_id=_observation_id("list_files", relative, content_hash),
@@ -443,30 +386,37 @@ class WorkspaceReader:
             path=relative,
             content_hash=content_hash,
             text=text,
-            lines=tuple(entries),
+            lines=tuple(rendered_entries),
             truncated=ceiling_hit,
-            metadata={"entry_count": len(entries)},
+            metadata={"entry_count": len(rendered_entries)},
         )
 
-    def _list_recursive(self, base: Path, relative: str, glob: str) -> ToolObservation:
+    def _list_recursive(
+        self,
+        base_parts: tuple[str, ...],
+        relative: str,
+        glob: str,
+        *,
+        deadline: float,
+    ) -> ToolObservation:
         """Return a bounded tree of workspace-relative files matching a ``**`` glob."""
 
         matches: list[str] = []
-        walked, walk_truncated = self._walk_files(base)
+        walked, walk_truncated = self._walk_files(base_parts, deadline=deadline)
         cap_hit = walk_truncated
-        for file_path in walked:
+        for relative_file in walked:
             if len(matches) >= LIST_MAX_ENTRIES:
                 cap_hit = True
                 break
-            rel_file = "/".join(file_path.relative_to(self.workspace).parts)
-            if not _glob_match(glob, file_path.name, relative_path=rel_file):
+            name = relative_file.rsplit("/", 1)[-1]
+            if not _glob_match(glob, name, relative_path=relative_file):
                 continue
             try:
                 # Sensitive files are denied by name in recursive listings too.
-                _reject_sensitive_name(file_path.name)
+                _reject_sensitive_name(name)
             except FsToolError:
                 continue
-            matches.append(rel_file[:PATH_MAX_CHARS])
+            matches.append(relative_file[:PATH_MAX_CHARS])
         matches.sort()
         matches, ceiling_hit = _apply_response_ceiling(matches)
         text = "\n".join(matches)
@@ -487,40 +437,42 @@ class WorkspaceReader:
             raise FsToolError("query is empty or exceeds the length limit")
         if glob is not None and len(glob) > GLOB_MAX_CHARS:
             raise FsToolError("glob pattern exceeds the length limit")
-        self._verify_root()
+        deadline = self._deadline()
         needle = query.lower()
         matches: list[str] = []
         files_scanned = 0
         bytes_scanned = 0
         redacted_any = False
         decode_refused = False
-        walked, walk_truncated = self._walk_files()
+        walked, walk_truncated = self._walk_files((), deadline=deadline)
         scan_truncated = False
-        for file_path in walked:
+        for relative in walked:
             if files_scanned >= SEARCH_MAX_FILES or bytes_scanned >= SEARCH_MAX_SCAN_BYTES:
                 scan_truncated = True
                 break
-            relative = "/".join(file_path.relative_to(self.workspace).parts)
-            if glob is not None and not _glob_match(glob, file_path.name):
+            name = relative.rsplit("/", 1)[-1]
+            if glob is not None and not _glob_match(glob, name):
                 continue
             try:
-                _reject_sensitive_name(file_path.name)
+                _reject_sensitive_name(name)
             except FsToolError:
                 continue
-            entry = file_path.lstat()
-            # Re-confirm the entry is a real regular file (not a reparse point a
-            # concurrent writer swapped in) immediately before reading it.
-            if _is_reparse_point(entry) or not stat.S_ISREG(entry.st_mode):
-                continue
-            if entry.st_size > FILE_MAX_BYTES:
-                continue
-            if entry.st_nlink > 1:
-                # A hard link can point at an inode outside the workspace.
-                continue
-            if bytes_scanned + entry.st_size > SEARCH_MAX_SCAN_BYTES:
+            try:
+                secure_read = self.secure.read_bytes(
+                    tuple(relative.split("/")),
+                    maximum_bytes=FILE_MAX_BYTES,
+                    deadline=deadline,
+                )
+            except SecureFsDeadlineError as exc:
+                raise _tool_error(exc) from exc
+            except SecureFsPolicyError as exc:
+                raise _tool_error(exc) from exc
+            except SecureFsError as exc:
+                raise _tool_error(exc) from exc
+            if bytes_scanned + secure_read.entry.size > SEARCH_MAX_SCAN_BYTES:
                 scan_truncated = True
                 break
-            data = file_path.read_bytes()
+            data = secure_read.data
             files_scanned += 1
             bytes_scanned += len(data)
             if _looks_binary(data):
@@ -570,59 +522,60 @@ class WorkspaceReader:
             },
         )
 
-    def _walk_files(self, base: Path | None = None) -> tuple[list[Path], bool]:
-        """Collect regular files under ``base`` (default: the workspace root).
+    def _walk_files(
+        self,
+        base_parts: tuple[str, ...],
+        *,
+        deadline: float,
+    ) -> tuple[list[str], bool]:
+        """Collect regular files under a workspace-relative directory.
 
         Returns the collected files and whether the ``WALK_VISIT_LIMIT`` work
         bound was reached (so callers can report truncation rather than imply
         completeness).
 
-        Walking is scoped to ``base`` so listing a subdirectory does not traverse
-        the entire workspace, bounded by ``WALK_VISIT_LIMIT`` visited entries, and
-        each directory is re-confirmed non-reparse before it is opened. This
-        shrinks - but does not fully close - the window in which a concurrent
-        writer swaps a directory for a junction between the walk and a later read;
-        fully handle-relative (no-follow) enumeration remains future work and is
-        noted in docs/milestone-v0.2.md.
+        Every directory enumeration is anchored at the retained workspace root
+        and every child is opened relative to its retained parent handle.
         """
 
-        root = base if base is not None else self.workspace
-        collected: list[Path] = []
-        stack: list[Path] = [root]
+        collected: list[str] = []
+        stack: list[tuple[str, ...]] = [base_parts]
         visited = 0
         while stack:
-            directory = stack.pop()
-            # Re-confirm the directory is inside the workspace and not a reparse
-            # point right before opening it, so a swapped parent is refused here.
+            directory_parts = stack.pop()
+            remaining = WALK_VISIT_LIMIT - visited
+            if remaining <= 0:
+                return sorted(collected), True
             try:
-                if directory != self.workspace:
-                    dir_stat = directory.lstat()
-                    if _is_reparse_point(dir_stat) or not stat.S_ISDIR(dir_stat.st_mode):
+                listing = self.secure.list_directory(
+                    directory_parts,
+                    maximum_visits=remaining,
+                    deadline=deadline,
+                )
+            except SecureFsDeadlineError as exc:
+                raise _tool_error(exc) from exc
+            except SecureFsError as exc:
+                raise _tool_error(exc) from exc
+            visited += listing.visited
+            for entry in listing.entries:
+                name = entry.name
+                if name.lower() in _DENIED_DIR_NAMES:
+                    continue
+                try:
+                    _reject_component(name)
+                except FsToolError:
+                    continue
+                child_parts = (*directory_parts, name)
+                if entry.is_dir:
+                    stack.append(child_parts)
+                elif entry.is_file and entry.link_count <= 1:
+                    try:
+                        _reject_sensitive_name(name)
+                    except FsToolError:
                         continue
-                # os.scandir yields lazily, so the visit cap bounds total work even
-                # inside a single directory holding millions of entries - iterdir()
-                # would have materialized the whole directory before any check.
-                with os.scandir(directory) as scan:
-                    for entry in scan:
-                        visited += 1
-                        if visited > WALK_VISIT_LIMIT:
-                            return sorted(collected), True
-                        name = entry.name
-                        if name.lower() in _DENIED_DIR_NAMES:
-                            continue
-                        try:
-                            child_stat = entry.stat(follow_symlinks=False)
-                        except OSError:
-                            continue
-                        if _is_reparse_point(child_stat):
-                            continue
-                        child = directory / name
-                        if stat.S_ISDIR(child_stat.st_mode):
-                            stack.append(child)
-                        elif stat.S_ISREG(child_stat.st_mode) and child_stat.st_nlink <= 1:
-                            collected.append(child)
-            except OSError:
-                continue
+                    collected.append("/".join(child_parts))
+            if listing.truncated:
+                return sorted(collected), True
         return sorted(collected), False
 
 

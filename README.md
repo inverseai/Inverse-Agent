@@ -148,6 +148,7 @@ The source checkout also retains `benchmarks\commit_review\suite.json` for fixtu
 - Gradle verification runs offline. Git inspection disables global/system config, prompts, pagers, and fsmonitor hooks.
 - Subprocess environments omit API tokens and other undeclared variables.
 - Output is size-capped and secret-like material, including complete PEM blocks, is redacted.
+- Source reads and directory walks are handle-relative, refuse links/reparse points and hard links, and never reopen a validated pathname to fetch bytes.
 - Timeouts terminate the spawned process group or Windows process tree.
 - Commit review accepts only bounded hexadecimal object IDs, uses fixed-location system Git discovery, neutralizes likely source-directed model instructions, hides filenames behind opaque IDs, and validates every model-reported line against an immutable changed hunk.
 
