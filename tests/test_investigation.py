@@ -63,6 +63,114 @@ def test_loop_passes_with_valid_citation(
     assert report.tool_calls_used == 1
 
 
+def test_negative_answer_cannot_pass_after_incomplete_search(
+    trusted_workspace: tuple[Path, ScopedTrustStore],
+) -> None:
+    workspace, trust = trusted_workspace
+    (workspace / "large.txt").write_text("hidden issue\n" + "x" * (1024 * 1024))
+
+    def negative_answer(catalog: tuple[ToolObservation, ...]) -> AgentAnswer:
+        read = next(observation for observation in catalog if observation.tool == "read_file")
+        return AgentAnswer(
+            summary="issue absent",
+            findings=("app.py looks normal",),
+            next_actions=(),
+            citations=(
+                SourceCitation(
+                    observation_id=read.observation_id,
+                    path=read.path,
+                    start_line=read.start_line,
+                    end_line=read.start_line,
+                ),
+            ),
+            complete=True,
+            issue_present=False,
+        )
+
+    planner = ScriptedInvestigationPlanner(
+        steps=(
+            ToolCall(tool="search_text", query="hidden issue"),
+            ToolCall(tool="read_file", path="app.py"),
+        ),
+        build_answer=negative_answer,
+    )
+    report = InvestigationLoop(planner=planner, trust=trust).run(
+        run_id="r-incomplete-negative",
+        goal="is hidden issue present",
+        workspace=workspace,
+    )
+    assert report.verdict is InvestigationVerdict.INCOMPLETE
+    assert report.stop_reason is StopReason.INCOMPLETE_EVIDENCE
+
+
+def test_negative_answer_cannot_pass_after_retryable_read_refusal(
+    trusted_workspace: tuple[Path, ScopedTrustStore],
+) -> None:
+    workspace, trust = trusted_workspace
+
+    def negative_answer(catalog: tuple[ToolObservation, ...]) -> AgentAnswer:
+        read = next(observation for observation in catalog if observation.content_hash)
+        return AgentAnswer(
+            summary="missing file means issue absent",
+            findings=("unrelated app.py was readable",),
+            next_actions=(),
+            citations=(
+                SourceCitation(
+                    observation_id=read.observation_id,
+                    path=read.path,
+                    start_line=read.start_line,
+                    end_line=read.start_line,
+                ),
+            ),
+            issue_present=False,
+        )
+
+    planner = ScriptedInvestigationPlanner(
+        steps=(
+            ToolCall(tool="read_file", path="missing.py"),
+            ToolCall(tool="read_file", path="app.py"),
+        ),
+        build_answer=negative_answer,
+    )
+    report = InvestigationLoop(planner=planner, trust=trust).run(
+        run_id="r-refused-negative",
+        goal="is the missing implementation safe",
+        workspace=workspace,
+    )
+    assert report.catalog[0].metadata["refused"] is True
+    assert report.catalog[0].incomplete and report.catalog[0].truncated
+    assert report.verdict is InvestigationVerdict.INCOMPLETE
+    assert report.stop_reason is StopReason.INCOMPLETE_EVIDENCE
+
+
+def test_answer_complete_false_forces_incomplete(
+    trusted_workspace: tuple[Path, ScopedTrustStore],
+) -> None:
+    workspace, trust = trusted_workspace
+
+    def incomplete_answer(catalog: tuple[ToolObservation, ...]) -> AgentAnswer:
+        answer = _cite_first_line(catalog)
+        return AgentAnswer(
+            summary=answer.summary,
+            findings=answer.findings,
+            next_actions=answer.next_actions,
+            citations=answer.citations,
+            complete=False,
+        )
+
+    planner = ScriptedInvestigationPlanner(
+        steps=(ToolCall(tool="read_file", path="app.py"),),
+        build_answer=incomplete_answer,
+    )
+    report = InvestigationLoop(planner=planner, trust=trust).run(
+        run_id="r-self-incomplete",
+        goal="inspect app",
+        workspace=workspace,
+    )
+    assert report.verdict is InvestigationVerdict.INCOMPLETE
+    assert report.stop_reason is StopReason.INCOMPLETE_EVIDENCE
+
+
 def test_loop_blocks_without_attestation(tmp_path: Path) -> None:
     workspace = tmp_path / "ws"
     workspace.mkdir()
@@ -174,9 +282,7 @@ def test_budget_exhaustion_is_incomplete(
     workspace, trust = trusted_workspace
 
     class NeverAnswers:
-        def decide(
-            self, *, goal: str, catalog: tuple[ToolObservation, ...]
-        ) -> Decision:
+        def decide(self, *, goal: str, catalog: tuple[ToolObservation, ...]) -> Decision:
             del goal, catalog
             return ToolCall(tool="list_files", path=".")
 
@@ -196,9 +302,7 @@ def test_repeated_no_progress_call_stops(
     workspace, trust = trusted_workspace
 
     class Repeats:
-        def decide(
-            self, *, goal: str, catalog: tuple[ToolObservation, ...]
-        ) -> Decision:
+        def decide(self, *, goal: str, catalog: tuple[ToolObservation, ...]) -> Decision:
             del goal, catalog
             return ToolCall(tool="read_file", path="app.py")
 
@@ -214,9 +318,7 @@ def test_planner_protocol_failure_is_failed(
     workspace, trust = trusted_workspace
 
     class Broken:
-        def decide(
-            self, *, goal: str, catalog: tuple[ToolObservation, ...]
-        ) -> Decision:
+        def decide(self, *, goal: str, catalog: tuple[ToolObservation, ...]) -> Decision:
             raise RuntimeError("model returned garbage")
 
     loop = InvestigationLoop(planner=Broken(), trust=trust)
@@ -287,9 +389,7 @@ def test_physical_budget_counts_real_requests(
         max_total_requests = 999  # the loop overrides this to the budget
         requests_made = 0
 
-        def decide(
-            self, *, goal: str, catalog: tuple[ToolObservation, ...]
-        ) -> Decision:
+        def decide(self, *, goal: str, catalog: tuple[ToolObservation, ...]) -> Decision:
             # Simulate two client requests per decision (a retry). Vary the call
             # each turn so the no-progress guard does not fire before the budget.
             self.requests_made += 2

@@ -9,10 +9,13 @@ from pathlib import Path
 import pytest
 
 from inverse_agent.fs_tools import (
+    FILE_MAX_BYTES,
     READ_MAX_LINES,
     FsToolError,
+    PolicyViolationError,
     WorkspaceReader,
 )
+from inverse_agent.secure_fs import SecureFsPolicyError
 
 
 @pytest.fixture
@@ -45,6 +48,18 @@ def test_read_file_rejects_traversal(workspace: Path) -> None:
     reader = WorkspaceReader.open(workspace)
     with pytest.raises(FsToolError, match="traversal"):
         reader.read_file("../secret.txt")
+
+
+def test_secure_backend_revalidates_relative_components(workspace: Path) -> None:
+    secure = WorkspaceReader.open(workspace).secure
+    with pytest.raises(SecureFsPolicyError):
+        secure.read_bytes(
+            ("..", "secret.txt"),
+            maximum_bytes=1024,
+            deadline=float("inf"),
+        )
+    with pytest.raises(SecureFsPolicyError):
+        secure.list_directory(("src/app.py/child",), maximum_visits=10, deadline=float("inf"))
 
 
 def test_read_file_rejects_git_internals(workspace: Path) -> None:
@@ -214,10 +229,12 @@ def test_posix_unreadable_regular_file_makes_listing_fail_closed(tmp_path: Path)
     reader = WorkspaceReader.open(tmp_path)
     target.chmod(0)
     try:
-        with pytest.raises(FsToolError, match="could not be opened and verified"):
-            reader.list_files(".")
-        with pytest.raises(FsToolError, match="could not be opened and verified"):
-            reader.search_text("hidden evidence")
+        listing = reader.list_files(".")
+        assert listing.incomplete and listing.truncated
+        assert "unreadable.txt" not in listing.lines
+        search = reader.search_text("hidden evidence")
+        assert search.incomplete and search.truncated
+        assert search.lines == ()
     finally:
         target.chmod(0o600)
 
@@ -255,6 +272,22 @@ def test_reader_open_rejects_missing_workspace(tmp_path: Path) -> None:
         WorkspaceReader.open(tmp_path / "does-not-exist")
 
 
+def test_missing_file_is_retryable_not_a_policy_violation(tmp_path: Path) -> None:
+    reader = WorkspaceReader.open(tmp_path)
+    with pytest.raises(FsToolError) as error:
+        reader.read_file("missing.txt")
+    assert not isinstance(error.value, PolicyViolationError)
+
+
+def test_query_and_glob_reject_surrogate_text(tmp_path: Path) -> None:
+    (tmp_path / "safe.txt").write_text("content\n", encoding="utf-8")
+    reader = WorkspaceReader.open(tmp_path)
+    with pytest.raises(FsToolError, match="non-UTF-8"):
+        reader.search_text("\udcff")
+    with pytest.raises(FsToolError, match="non-UTF-8"):
+        reader.list_files(".", glob="*\udcff")
+
+
 def test_read_file_redacts_multiline_private_key(tmp_path: Path) -> None:
     # Regression: per-line redaction leaked the key body; span redaction must
     # remove the whole block while preserving line numbers.
@@ -277,6 +310,31 @@ def test_read_file_redacts_multiline_private_key(tmp_path: Path) -> None:
     assert "BEGIN RSA PRIVATE KEY" not in obs.text
     # Line numbers preserved: "after = 2" stays on line 6.
     assert "6: after = 2" in obs.lines
+
+
+def test_redacted_content_hash_is_not_a_raw_secret_oracle(tmp_path: Path) -> None:
+    first = "before\n-----BEGIN PRIVATE KEY-----\nSECRET_A\n-----END PRIVATE KEY-----\nafter\n"
+    second = first.replace("SECRET_A", "SECRET_B")
+    (tmp_path / "first.txt").write_text(first, encoding="utf-8")
+    (tmp_path / "second.txt").write_text(second, encoding="utf-8")
+    reader = WorkspaceReader.open(tmp_path)
+    first_obs = reader.read_file("first.txt")
+    second_obs = reader.read_file("second.txt")
+    assert first_obs.redacted and second_obs.redacted
+    assert first_obs.text == second_obs.text
+    assert first_obs.content_hash == second_obs.content_hash
+
+
+def test_search_skips_oversized_file_and_marks_result_incomplete(tmp_path: Path) -> None:
+    (tmp_path / "large.txt").write_text(
+        "needle\n" + "x" * FILE_MAX_BYTES,
+        encoding="utf-8",
+    )
+    (tmp_path / "small.txt").write_text("other\n", encoding="utf-8")
+    observation = WorkspaceReader.open(tmp_path).search_text("needle")
+    assert observation.lines == ()
+    assert observation.incomplete and observation.truncated
+    assert observation.metadata["oversized_skipped"] == 1
 
 
 def test_read_file_past_eof_yields_no_citable_lines(tmp_path: Path) -> None:
@@ -447,8 +505,9 @@ def test_windows_writer_cannot_hide_file_from_listing_or_search(tmp_path: Path) 
     reader = WorkspaceReader.open(tmp_path)
     with target.open("r+b"):
         assert "visible.txt" in reader.list_files(".").lines
-        with pytest.raises(FsToolError):
-            reader.search_text("visible evidence")
+        search = reader.search_text("visible evidence")
+        assert search.incomplete and search.truncated
+        assert search.lines == ()
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows sharing semantics")
@@ -474,10 +533,12 @@ def test_windows_exclusive_writer_makes_listing_and_search_fail_closed(tmp_path:
     handle = create_file(str(target), 0xC0000000, 0, None, 3, 0, None)
     assert handle not in {None, ctypes.c_void_p(-1).value}
     try:
-        with pytest.raises(FsToolError, match="could not be opened and verified"):
-            reader.list_files(".")
-        with pytest.raises(FsToolError, match="could not be opened and verified"):
-            reader.search_text("exclusive evidence")
+        listing = reader.list_files(".")
+        assert listing.incomplete and listing.truncated
+        assert "exclusive.txt" not in listing.lines
+        search = reader.search_text("exclusive evidence")
+        assert search.incomplete and search.truncated
+        assert search.lines == ()
     finally:
         kernel32.CloseHandle(handle)
 
@@ -505,8 +566,8 @@ def test_windows_unverifiable_denied_name_is_not_disclosed(tmp_path: Path) -> No
     handle = create_file(str(target), 0xC0000000, 0, None, 3, 0, None)
     assert handle not in {None, ctypes.c_void_p(-1).value}
     try:
-        with pytest.raises(FsToolError) as error:
-            reader.list_files(".")
-        assert ".env" not in str(error.value)
+        listing = reader.list_files(".")
+        assert listing.incomplete and listing.truncated
+        assert all(".env" not in line for line in listing.lines)
     finally:
         kernel32.CloseHandle(handle)

@@ -53,6 +53,7 @@ class StopReason(StrEnum):
     BUDGET_EXHAUSTED = "budget_exhausted"
     UNSUPPORTED_CITATION = "unsupported_citation"
     STRICT_DECODE_REFUSAL = "strict_decode_refusal"
+    INCOMPLETE_EVIDENCE = "incomplete_evidence"
     NO_PROGRESS = "no_progress"
     PROTOCOL_FAILURE = "protocol_failure"
     NOT_ATTESTED = "not_attested"
@@ -206,9 +207,7 @@ def _is_evidence(observation: ToolObservation) -> bool:
     return any(_line_body(line).strip() for line in observation.lines)
 
 
-def _validate_citations(
-    answer: AgentAnswer, catalog: tuple[ToolObservation, ...]
-) -> str | None:
+def _validate_citations(answer: AgentAnswer, catalog: tuple[ToolObservation, ...]) -> str | None:
     """Return an error string if any citation is unsupported, else None."""
 
     # Refusals, empty results, and binary observations are not citable evidence.
@@ -343,6 +342,25 @@ class InvestigationLoop:
             decisions += 1
 
             if isinstance(decision, AgentAnswer):
+                uncertain_catalog = any(
+                    observation.incomplete or observation.truncated for observation in catalog
+                )
+                if not decision.complete or (not decision.issue_present and uncertain_catalog):
+                    return self._finish(
+                        run_id,
+                        InvestigationVerdict.INCOMPLETE,
+                        StopReason.INCOMPLETE_EVIDENCE,
+                        decision,
+                        catalog,
+                        decisions,
+                        tool_calls,
+                        physical,
+                        error=(
+                            "final answer declared itself incomplete"
+                            if not decision.complete
+                            else "an incomplete observation cannot support a negative conclusion"
+                        ),
+                    )
                 citation_error = _validate_citations(decision, tuple(catalog))
                 if citation_error is not None:
                     return self._finish(
@@ -447,6 +465,8 @@ class InvestigationLoop:
                     path=decision.path,
                     content_hash="",
                     text=f"[refused] {message}",
+                    truncated=True,
+                    incomplete=True,
                     metadata={"refused": True},
                 )
             # A strict-decode refusal surfaced during a search also forces INCOMPLETE.
@@ -508,9 +528,7 @@ class ScriptedInvestigationPlanner:
     build_answer: AnswerBuilder
     _index: int = field(default=0, init=False)
 
-    def decide(
-        self, *, goal: str, catalog: tuple[ToolObservation, ...]
-    ) -> Decision:
+    def decide(self, *, goal: str, catalog: tuple[ToolObservation, ...]) -> Decision:
         del goal
         if self._index < len(self.steps):
             call = self.steps[self._index]

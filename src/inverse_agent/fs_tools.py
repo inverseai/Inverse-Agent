@@ -26,6 +26,7 @@ from inverse_agent.secure_fs import (
     SecureFsDeadlineError,
     SecureFsError,
     SecureFsPolicyError,
+    SecureFsTooLargeError,
     SecureWorkspace,
 )
 
@@ -138,11 +139,22 @@ def _estimate_tokens(text: str) -> int:
     return (len(text) + CHARS_PER_TOKEN - 1) // CHARS_PER_TOKEN
 
 
+def _require_utf8(value: str, label: str) -> None:
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise FsToolError(f"{label} contains non-UTF-8 text") from exc
+
+
 def _reject_component(name: str) -> None:
     if not name or name in {".", ".."}:
         raise PolicyViolationError("path traversal is not permitted")
     if "\x00" in name:
         raise PolicyViolationError("path contains a null byte")
+    try:
+        name.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise PolicyViolationError("path contains non-UTF-8 text") from exc
     if ":" in name:
         # NTFS alternate-data-stream syntax (name:stream) and drive-letter syntax.
         raise PolicyViolationError("path contains an alternate-data-stream or drive separator")
@@ -272,14 +284,15 @@ class WorkspaceReader:
             raise _tool_error(exc) from exc
         data = secure_read.data
         entry = secure_read.entry
-        raw_hash = hashlib.sha256(data).hexdigest()
-        window_salt = f"{raw_hash}:{start_line}:{max_lines}"
         if _looks_binary(data):
+            empty_hash = hashlib.sha256(b"").hexdigest()
             return ToolObservation(
-                observation_id=_observation_id("read_file", relative, window_salt),
+                observation_id=_observation_id(
+                    "read_file", relative, f"binary:{entry.size}:{start_line}:{max_lines}"
+                ),
                 tool="read_file",
                 path=relative,
-                content_hash=raw_hash,
+                content_hash=empty_hash,
                 text="",
                 incomplete=False,
                 metadata={"binary": True, "size_bytes": entry.size},
@@ -288,6 +301,8 @@ class WorkspaceReader:
         # Sanitize the WHOLE file before slicing so a window starting inside a
         # multi-line secret cannot leak the body, and redaction is line-preserving.
         sanitized_full, redacted = _sanitize_line_preserving(decoded)
+        sanitized_hash = hashlib.sha256(sanitized_full.encode("utf-8")).hexdigest()
+        window_salt = f"{sanitized_hash}:{start_line}:{max_lines}"
         all_lines = sanitized_full.split("\n")
         total_lines = len(all_lines)
         # Clamp to end-of-file: a start past EOF yields an empty, non-citable window
@@ -307,7 +322,7 @@ class WorkspaceReader:
             observation_id=_observation_id("read_file", relative, window_salt),
             tool="read_file",
             path=relative,
-            content_hash=raw_hash,
+            content_hash=sanitized_hash,
             text=text,
             lines=numbered,
             start_line=start_line,
@@ -320,6 +335,8 @@ class WorkspaceReader:
     def list_files(self, path: str = ".", *, glob: str | None = None) -> ToolObservation:
         if glob is not None and len(glob) > GLOB_MAX_CHARS:
             raise FsToolError("glob pattern exceeds the length limit")
+        if glob is not None:
+            _require_utf8(glob, "glob")
         deadline = self._deadline()
         if path in ("", "."):
             base_parts: tuple[str, ...] = ()
@@ -348,7 +365,7 @@ class WorkspaceReader:
             )
         except SecureFsError as exc:
             raise _tool_error(exc) from exc
-        truncated_scan = listing.truncated
+        truncated_scan = listing.truncated or listing.refused > 0
         for entry in listing.entries:
             visited += 1
             if visited > WALK_VISIT_LIMIT or len(rows) >= LIST_MAX_ENTRIES * 4:
@@ -388,7 +405,11 @@ class WorkspaceReader:
             text=text,
             lines=tuple(rendered_entries),
             truncated=ceiling_hit,
-            metadata={"entry_count": len(rendered_entries)},
+            incomplete=listing.refused > 0,
+            metadata={
+                "entry_count": len(rendered_entries),
+                "refused_entry_count": listing.refused,
+            },
         )
 
     def _list_recursive(
@@ -402,8 +423,8 @@ class WorkspaceReader:
         """Return a bounded tree of workspace-relative files matching a ``**`` glob."""
 
         matches: list[str] = []
-        walked, walk_truncated = self._walk_files(base_parts, deadline=deadline)
-        cap_hit = walk_truncated
+        walked, walk_truncated, walk_incomplete = self._walk_files(base_parts, deadline=deadline)
+        cap_hit = walk_truncated or walk_incomplete
         for relative_file in walked:
             if len(matches) >= LIST_MAX_ENTRIES:
                 cap_hit = True
@@ -429,14 +450,18 @@ class WorkspaceReader:
             text=text,
             lines=tuple(matches),
             truncated=cap_hit or ceiling_hit,
+            incomplete=walk_incomplete,
             metadata={"entry_count": len(matches), "recursive": True},
         )
 
     def search_text(self, query: str, *, glob: str | None = None) -> ToolObservation:
         if not query or len(query) > QUERY_MAX_CHARS:
             raise FsToolError("query is empty or exceeds the length limit")
+        _require_utf8(query, "query")
         if glob is not None and len(glob) > GLOB_MAX_CHARS:
             raise FsToolError("glob pattern exceeds the length limit")
+        if glob is not None:
+            _require_utf8(glob, "glob")
         deadline = self._deadline()
         needle = query.lower()
         matches: list[str] = []
@@ -444,7 +469,9 @@ class WorkspaceReader:
         bytes_scanned = 0
         redacted_any = False
         decode_refused = False
-        walked, walk_truncated = self._walk_files((), deadline=deadline)
+        read_refused = False
+        oversized_skipped = 0
+        walked, walk_truncated, walk_incomplete = self._walk_files((), deadline=deadline)
         scan_truncated = False
         for relative in walked:
             if files_scanned >= SEARCH_MAX_FILES or bytes_scanned >= SEARCH_MAX_SCAN_BYTES:
@@ -467,8 +494,12 @@ class WorkspaceReader:
                 raise _tool_error(exc) from exc
             except SecureFsPolicyError as exc:
                 raise _tool_error(exc) from exc
-            except SecureFsError as exc:
-                raise _tool_error(exc) from exc
+            except SecureFsTooLargeError:
+                oversized_skipped += 1
+                continue
+            except SecureFsError:
+                read_refused = True
+                continue
             if bytes_scanned + secure_read.entry.size > SEARCH_MAX_SCAN_BYTES:
                 scan_truncated = True
                 break
@@ -511,14 +542,25 @@ class WorkspaceReader:
                 raw_match_count >= SEARCH_MAX_MATCHES
                 or ceiling_hit
                 or walk_truncated
+                or walk_incomplete
                 or scan_truncated
+                or read_refused
+                or oversized_skipped > 0
             ),
-            incomplete=redacted_any or decode_refused,
+            incomplete=(
+                redacted_any
+                or decode_refused
+                or walk_incomplete
+                or read_refused
+                or oversized_skipped > 0
+            ),
             redacted=redacted_any,
             metadata={
                 "match_count": len(matches),
                 "files_scanned": files_scanned,
                 "decode_refused": decode_refused,
+                "read_refused": read_refused,
+                "oversized_skipped": oversized_skipped,
             },
         )
 
@@ -527,7 +569,7 @@ class WorkspaceReader:
         base_parts: tuple[str, ...],
         *,
         deadline: float,
-    ) -> tuple[list[str], bool]:
+    ) -> tuple[list[str], bool, bool]:
         """Collect regular files under a workspace-relative directory.
 
         Returns the collected files and whether the ``WALK_VISIT_LIMIT`` work
@@ -541,11 +583,12 @@ class WorkspaceReader:
         collected: list[str] = []
         stack: list[tuple[str, ...]] = [base_parts]
         visited = 0
+        incomplete = False
         while stack:
             directory_parts = stack.pop()
             remaining = WALK_VISIT_LIMIT - visited
             if remaining <= 0:
-                return sorted(collected), True
+                return sorted(collected), True, incomplete
             try:
                 listing = self.secure.list_directory(
                     directory_parts,
@@ -557,6 +600,7 @@ class WorkspaceReader:
             except SecureFsError as exc:
                 raise _tool_error(exc) from exc
             visited += listing.visited
+            incomplete = incomplete or listing.refused > 0
             for entry in listing.entries:
                 name = entry.name
                 if name.lower() in _DENIED_DIR_NAMES:
@@ -575,8 +619,8 @@ class WorkspaceReader:
                         continue
                     collected.append("/".join(child_parts))
             if listing.truncated:
-                return sorted(collected), True
-        return sorted(collected), False
+                return sorted(collected), True, incomplete
+        return sorted(collected), False, incomplete
 
 
 def _glob_match(pattern: str, name: str, *, relative_path: str | None = None) -> bool:

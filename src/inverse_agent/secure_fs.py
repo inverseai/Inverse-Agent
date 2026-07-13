@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import contextlib
 import ctypes
+import errno
 import os
 import stat
 import time
@@ -30,6 +31,10 @@ class SecureFsPolicyError(SecureFsError):
 
 class SecureFsDeadlineError(SecureFsError):
     """The bounded filesystem operation exceeded its deadline."""
+
+
+class SecureFsTooLargeError(SecureFsError):
+    """A regular file exceeded the configured content-read limit."""
 
 
 @dataclass(frozen=True)
@@ -53,12 +58,32 @@ class SecureRead:
 class SecureListing:
     entries: tuple[SecureEntry, ...]
     visited: int
+    refused: int
     truncated: bool
 
 
 def _check_deadline(deadline: float) -> None:
     if time.monotonic() > deadline:
         raise SecureFsDeadlineError("filesystem operation exceeded its deadline")
+
+
+def _validate_parts(parts: tuple[str, ...], *, allow_empty: bool) -> None:
+    if not parts and not allow_empty:
+        raise SecureFsPolicyError("file path is empty")
+    for part in parts:
+        if (
+            not part
+            or part in {".", ".."}
+            or "\x00" in part
+            or "/" in part
+            or "\\" in part
+            or ":" in part
+        ):
+            raise SecureFsPolicyError("path component is not a safe relative name")
+        try:
+            part.encode("utf-8")
+        except UnicodeEncodeError as exc:
+            raise SecureFsPolicyError("path component is not valid UTF-8") from exc
 
 
 def _same_entry(left: SecureEntry, right: SecureEntry) -> bool:
@@ -102,8 +127,7 @@ class SecureWorkspace:
         maximum_bytes: int,
         deadline: float,
     ) -> SecureRead:
-        if not parts:
-            raise SecureFsError("file path is empty")
+        _validate_parts(parts, allow_empty=False)
         if os.name == "nt":
             return self._read_windows(parts, maximum_bytes=maximum_bytes, deadline=deadline)
         return self._read_posix(parts, maximum_bytes=maximum_bytes, deadline=deadline)
@@ -115,6 +139,7 @@ class SecureWorkspace:
         maximum_visits: int,
         deadline: float,
     ) -> SecureListing:
+        _validate_parts(parts, allow_empty=True)
         if maximum_visits < 1:
             raise SecureFsError("directory visit limit must be positive")
         if os.name == "nt":
@@ -135,19 +160,22 @@ class SecureWorkspace:
             if before.link_count > 1:
                 raise SecureFsPolicyError("file has multiple hard links")
             if before.size > maximum_bytes:
-                raise SecureFsError("file exceeds the maximum readable size")
+                raise SecureFsTooLargeError("file exceeds the maximum readable size")
             chunks: list[bytes] = []
             remaining = maximum_bytes + 1
             while remaining:
                 _check_deadline(deadline)
-                chunk = os.read(descriptor, min(64 * 1024, remaining))
+                try:
+                    chunk = os.read(descriptor, min(64 * 1024, remaining))
+                except OSError as exc:
+                    raise SecureFsError("file bytes could not be read") from exc
                 if not chunk:
                     break
                 chunks.append(chunk)
                 remaining -= len(chunk)
             data = b"".join(chunks)
             if len(data) > maximum_bytes:
-                raise SecureFsError("file exceeds the maximum readable size")
+                raise SecureFsTooLargeError("file exceeds the maximum readable size")
             after = _posix_entry(descriptor, parts[-1])
             if not _same_entry(before, after):
                 raise SecureFsError("file changed while being read")
@@ -163,6 +191,7 @@ class SecureWorkspace:
         with self._posix_target(parts, expect_directory=True, deadline=deadline) as descriptor:
             result: list[SecureEntry] = []
             visited = 0
+            refused_count = 0
             truncated = False
             try:
                 with os.scandir(descriptor) as scan:
@@ -184,36 +213,35 @@ class SecureWorkspace:
                                 | getattr(os, "O_NONBLOCK", 0)
                             )
                             child = os.open(name, flags, dir_fd=descriptor)
-                        except OSError as exc:
+                        except OSError:
                             try:
                                 refused = os.stat(
                                     name,
                                     dir_fd=descriptor,
                                     follow_symlinks=False,
                                 )
-                            except OSError as stat_exc:
-                                raise SecureFsError(
-                                    "directory entry could not be opened and verified"
-                                ) from stat_exc
+                            except OSError:
+                                refused_count += 1
+                                continue
                             if stat.S_ISLNK(refused.st_mode) or not (
                                 stat.S_ISDIR(refused.st_mode) or stat.S_ISREG(refused.st_mode)
                             ):
                                 continue
-                            raise SecureFsError(
-                                "directory entry could not be opened and verified"
-                            ) from exc
+                            refused_count += 1
+                            continue
                         try:
                             entry = _posix_entry(child, name)
                             if not (entry.is_dir or entry.is_file):
                                 continue
                             result.append(entry)
                         finally:
-                            os.close(child)
+                            with contextlib.suppress(OSError):
+                                os.close(child)
             except SecureFsError:
                 raise
             except OSError as exc:
                 raise SecureFsError("directory could not be listed") from exc
-            return SecureListing(tuple(result), visited, truncated)
+            return SecureListing(tuple(result), visited, refused_count, truncated)
 
     @contextlib.contextmanager
     def _posix_target(
@@ -245,9 +273,11 @@ class SecureWorkspace:
                     try:
                         child = os.open(part, flags, dir_fd=current)
                     except OSError as exc:
-                        raise SecureFsPolicyError(
-                            "path component is unavailable or is a link"
-                        ) from exc
+                        if exc.errno == errno.ELOOP:
+                            raise SecureFsPolicyError(
+                                "path component is a symlink, junction, or reparse point"
+                            ) from exc
+                        raise SecureFsError("path component could not be opened") from exc
                     owned.append(child)
                     entry = _posix_entry(child, part)
                     if wants_directory and not entry.is_dir:
@@ -256,7 +286,8 @@ class SecureWorkspace:
                 yield current
             finally:
                 for descriptor in reversed(owned):
-                    os.close(descriptor)
+                    with contextlib.suppress(OSError):
+                        os.close(descriptor)
 
     def _read_windows(
         self,
@@ -272,7 +303,7 @@ class SecureWorkspace:
             if before.link_count > 1:
                 raise SecureFsPolicyError("file has multiple hard links")
             if before.size > maximum_bytes:
-                raise SecureFsError("file exceeds the maximum readable size")
+                raise SecureFsTooLargeError("file exceeds the maximum readable size")
             data = _windows_read(handle, maximum_bytes=maximum_bytes, deadline=deadline)
             after = _windows_entry(handle, parts[-1])
             if not _same_entry(before, after):
@@ -289,6 +320,7 @@ class SecureWorkspace:
         with self._windows_target(parts, expect_directory=True, deadline=deadline) as directory:
             result: list[SecureEntry] = []
             visited = 0
+            refused_count = 0
             truncated = False
             for name, attributes in _windows_directory_names(directory, deadline=deadline):
                 _check_deadline(deadline)
@@ -307,12 +339,13 @@ class SecureWorkspace:
                         expect_directory=expect_directory,
                     ) as child:
                         entry = _windows_entry(child, name)
-                except SecureFsError as exc:
-                    raise SecureFsError("directory entry could not be opened and verified") from exc
+                except SecureFsError:
+                    refused_count += 1
+                    continue
                 if not (entry.is_dir or entry.is_file):
                     continue
                 result.append(entry)
-            return SecureListing(tuple(result), visited, truncated)
+            return SecureListing(tuple(result), visited, refused_count, truncated)
 
     @contextlib.contextmanager
     def _windows_target(
@@ -355,7 +388,10 @@ class SecureWorkspace:
 
 
 def _posix_entry(descriptor: int, name: str) -> SecureEntry:
-    info = os.fstat(descriptor)
+    try:
+        info = os.fstat(descriptor)
+    except OSError as exc:
+        raise SecureFsError("file metadata could not be read") from exc
     return SecureEntry(
         name=name,
         is_dir=stat.S_ISDIR(info.st_mode),
@@ -378,7 +414,8 @@ def _posix_root(workspace: Path) -> Iterator[int]:
     try:
         yield descriptor
     finally:
-        os.close(descriptor)
+        with contextlib.suppress(OSError):
+            os.close(descriptor)
 
 
 _FILE_ATTRIBUTE_DIRECTORY = 0x10
@@ -394,6 +431,7 @@ _FILE_READ_ATTRIBUTES = 0x80
 _SYNCHRONIZE = 0x00100000
 _OBJ_CASE_INSENSITIVE = 0x40
 _OBJ_DONT_REPARSE = 0x1000
+_REPARSE_NTSTATUS = frozenset({0x8000002D, 0xC0000279, 0xC000050B})
 _OPEN_EXISTING = 3
 _FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
 _FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
@@ -585,10 +623,10 @@ def _windows_open_child(
         )
     )
     if status < 0:
-        raise SecureFsPolicyError(
-            "path component is unavailable or is a symlink, junction, or reparse point "
-            f"(NTSTATUS 0x{status & 0xFFFFFFFF:08X})"
-        )
+        status_code = status & 0xFFFFFFFF
+        if status_code in _REPARSE_NTSTATUS:
+            raise SecureFsPolicyError("path component is a symlink, junction, or reparse point")
+        raise SecureFsError("path component could not be opened")
     value = handle.value if handle.value is not None else _INVALID_HANDLE_VALUE
     if value == _INVALID_HANDLE_VALUE:
         raise SecureFsError("Windows returned an invalid file handle")
@@ -687,7 +725,10 @@ def _windows_directory_names(handle: int, *, deadline: float) -> Iterator[tuple[
             )
             start = offset + _FILE_ID_BOTH_DIR_INFO.FileName.offset
             end = start + int(header.FileNameLength)
-            name = buffer.raw[start:end].decode("utf-16-le", errors="strict")
+            try:
+                name = buffer.raw[start:end].decode("utf-16-le", errors="strict")
+            except UnicodeDecodeError as exc:
+                raise SecureFsError("directory entry name is not valid Unicode") from exc
             yield name, int(header.FileAttributes)
             if header.NextEntryOffset == 0:
                 break

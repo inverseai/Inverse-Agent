@@ -49,6 +49,7 @@ DECISION_SCHEMA: dict[str, Any] = {
         "max_lines": {"type": "integer", "minimum": 1, "maximum": 200},
         "summary": {"type": "string"},
         "condition_holds": {"type": "boolean"},
+        "complete": {"type": "boolean"},
         "findings": {"type": "array", "items": {"type": "string"}},
         "next_actions": {"type": "array", "items": {"type": "string"}},
         "citations": {
@@ -75,6 +76,7 @@ DECISION_SCHEMA: dict[str, Any] = {
         "max_lines",
         "summary",
         "condition_holds",
+        "complete",
         "findings",
         "next_actions",
         "citations",
@@ -102,7 +104,11 @@ _SYSTEM_PROMPT = (
     "entrypoint DOES exist, the bug IS present) and false only if the code shows "
     "it genuinely does not hold; give a non-empty summary and at least one "
     "finding.\n"
-    "Fill unused fields with \"\" or []."
+    "Observation completeness: headers explicitly show truncated/incomplete flags. "
+    "Never infer absence from a truncated or incomplete observation. If the final "
+    "answer depends on missing content, set complete=false. Set complete=true on "
+    "tool actions.\n"
+    'Fill unused fields with "" or [].'
 )
 
 
@@ -129,7 +135,12 @@ def _render_block(obs: ToolObservation) -> tuple[str, bool]:
         citable = "CITABLE - cite this observation_id with its N: line numbers"
     else:
         citable = "pointer only - read_file a listed path to cite it"
-    header = f"id={obs.observation_id} tool={obs.tool} path={obs.path} ({citable})"
+    status = (
+        f"truncated={str(obs.truncated).lower()} "
+        f"incomplete={str(obs.incomplete).lower()} "
+        f"redacted={str(obs.redacted).lower()}"
+    )
+    header = f"id={obs.observation_id} tool={obs.tool} path={obs.path} status[{status}] ({citable})"
     if obs.metadata.get("refused"):
         return f"{header}\n  REFUSED: {obs.text}", False
     if obs.metadata.get("binary"):
@@ -141,9 +152,12 @@ def _render_block(obs: ToolObservation) -> tuple[str, bool]:
     shown = obs.lines[:limit]
     fully_rendered = limit >= len(obs.lines)
     body = "\n".join(f"  {line}" for line in shown) or "  (no matching content)"
-    is_citable_read = (
-        obs.tool == "read_file" and bool(obs.content_hash) and fully_rendered
-    )
+    if obs.incomplete or obs.truncated:
+        body = (
+            "  WARNING: this result is incomplete; omitted content may change a "
+            f"negative conclusion.\n{body}"
+        )
+    is_citable_read = obs.tool == "read_file" and bool(obs.content_hash) and fully_rendered
     return f"{header}\n{body}", is_citable_read
 
 
@@ -184,9 +198,7 @@ def _render_catalog(catalog: tuple[ToolObservation, ...]) -> tuple[str, frozense
         used += block_len
 
     omitted = len(selected) < len(catalog)
-    rendered_read_ids = {
-        catalog[i].observation_id for i in selected if blocks[i][1]
-    }
+    rendered_read_ids = {catalog[i].observation_id for i in selected if blocks[i][1]}
     text_blocks = [blocks[i][0] for i in sorted(selected)]
     if omitted:
         text_blocks.insert(0, "(earlier observations omitted for space)")
@@ -288,6 +300,7 @@ def _parse_decision(payload: Mapping[str, Any]) -> Decision:
             findings=tuple(str(f) for f in payload.get("findings", [])),
             next_actions=tuple(str(a) for a in payload.get("next_actions", [])),
             citations=citations,
+            complete=bool(payload.get("complete", True)),
             issue_present=bool(payload.get("condition_holds", True)),
         )
     if action in {"read_file", "list_files", "search_text"}:
@@ -396,9 +409,7 @@ class ModelInvestigationPlanner:
             max_tokens=MAX_MODEL_COMPLETION_TOKENS,
         )
 
-    def decide(
-        self, *, goal: str, catalog: tuple[ToolObservation, ...]
-    ) -> Decision:
+    def decide(self, *, goal: str, catalog: tuple[ToolObservation, ...]) -> Decision:
         self._turn += 1
         observations, rendered_ids = _render_catalog(catalog)
         prompt = json.dumps(

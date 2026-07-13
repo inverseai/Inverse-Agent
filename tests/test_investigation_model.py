@@ -52,6 +52,8 @@ def _base(action: str, **overrides: Any) -> dict[str, Any]:
         "start_line": 1,
         "max_lines": 200,
         "summary": "",
+        "condition_holds": True,
+        "complete": True,
         "findings": [],
         "next_actions": [],
         "citations": [],
@@ -87,9 +89,7 @@ def test_parse_final_answer_with_citation() -> None:
         summary="done",
         findings=["found the bug"],
         next_actions=["fix it"],
-        citations=[
-            {"observation_id": "obs_1", "path": "a.py", "start_line": 2, "end_line": 3}
-        ],
+        citations=[{"observation_id": "obs_1", "path": "a.py", "start_line": 2, "end_line": 3}],
     )
     client = FakeClient([payload])
     planner = ModelInvestigationPlanner(client=client, max_auto_reads=0, max_nudges=0)
@@ -122,9 +122,7 @@ def test_second_same_class_failure_is_not_retried() -> None:
 
 def test_transport_and_schema_retries_are_separate() -> None:
     good = _base("list_files", path=".")
-    client = FakeClient(
-        [PlannerTransportError("net"), PlannerProtocolError("bad"), good]
-    )
+    client = FakeClient([PlannerTransportError("net"), PlannerProtocolError("bad"), good])
     planner = ModelInvestigationPlanner(client=client)
     decision = planner.decide(goal="x", catalog=())
     assert isinstance(decision, ToolCall)
@@ -179,6 +177,42 @@ def test_render_empty_catalog() -> None:
     text, ids = _render_catalog(())
     assert "no observations" in text
     assert ids == frozenset()
+
+
+def test_render_catalog_exposes_incomplete_pointer_state() -> None:
+    observation = ToolObservation(
+        observation_id="obs_partial",
+        tool="search_text",
+        path=".",
+        content_hash="h",
+        text="",
+        lines=(),
+        truncated=True,
+        incomplete=True,
+        metadata={"oversized_skipped": 1},
+    )
+    text, ids = _render_catalog((observation,))
+    assert "truncated=true" in text
+    assert "incomplete=true" in text
+    assert "WARNING: this result is incomplete" in text
+    assert ids == frozenset()
+
+
+def test_parse_final_answer_preserves_explicit_incomplete() -> None:
+    client = FakeClient(
+        [
+            _base(
+                "final_answer",
+                summary="partial",
+                findings=["uncertain"],
+                complete=False,
+            )
+        ]
+    )
+    planner = ModelInvestigationPlanner(client=client, max_auto_reads=0, max_nudges=0)
+    decision = planner.decide(goal="x", catalog=())
+    assert isinstance(decision, AgentAnswer)
+    assert decision.complete is False
 
 
 def test_large_read_is_fully_rendered_not_dropped() -> None:
@@ -344,9 +378,7 @@ def test_citation_id_brackets_are_stripped() -> None:
         "final_answer",
         summary="s",
         findings=["f"],
-        citations=[
-            {"observation_id": "[obs_abc]", "path": "a.py", "start_line": 1, "end_line": 1}
-        ],
+        citations=[{"observation_id": "[obs_abc]", "path": "a.py", "start_line": 1, "end_line": 1}],
     )
     client = FakeClient([payload])
     planner = ModelInvestigationPlanner(client=client, max_auto_reads=0, max_nudges=0)
