@@ -25,28 +25,55 @@ _PEM_TOKEN = re.compile(
 _PRIVATE_KEY_LABEL = re.compile(r"PRIVATE KEY", re.IGNORECASE | re.ASCII)
 _PEM_MARKER_CLOSE_LENGTH = 5
 
-_SOURCE_AUTHORITY = (
-    r"(?:"
+_SOURCE_LABEL_AUTHORITY = (
     r"(?:reviewer|assistant|model|system|developer|user|prompt|instruction)"
-    r"(?=\s*[:\-])|"
+    r"(?=\s*[:\-])"
+)
+_SOURCE_PHRASE_AUTHORITY = (
+    r"(?:"
     r"(?:system|developer|reviewer|assistant|model|user)\s+"
     r"(?:message|prompt|instructions?)|"
     r"language\s+model|ai\s+(?:assistant|model)"
     r")"
 )
+_SOURCE_AUTHORITY = rf"(?:{_SOURCE_LABEL_AUTHORITY}|{_SOURCE_PHRASE_AUTHORITY})"
+_SOURCE_EXPLICIT_AUTHORITY = rf"(?:(?:reviewer|assistant)(?=\s*[:\-])|{_SOURCE_PHRASE_AUTHORITY})"
 _SOURCE_OVERRIDE = r"(?:ignore|disregard|override)"
+
+
+def _compile_source_context_patterns(
+    authority: str, *, allow_assignment: bool
+) -> tuple[re.Pattern[str], ...]:
+    assignment_guard = "" if allow_assignment else r"(?!\s*[:=])"
+    return (
+        re.compile(
+            rf"(?i)\b{authority}\b.{{0,160}}"
+            rf"\b{_SOURCE_OVERRIDE}\b{assignment_guard}"
+        ),
+        re.compile(
+            rf"(?i)\b{_SOURCE_OVERRIDE}\b{assignment_guard}.{{0,160}}"
+            rf"\b{authority}\b"
+        ),
+        # Outcome manipulation is review-specific. Bare ``complete`` is not an
+        # outcome here because ordinary code commonly returns that value.
+        re.compile(
+            rf"(?i)\b{authority}\b.{{0,160}}"
+            rf"\b(?:return|output|respond(?:\s+with)?|report)\b{assignment_guard}.{{0,80}}"
+            r"\b(?:pass|no\s+findings?|verdict|investigation\s+complete)\b"
+        ),
+        re.compile(
+            rf"(?i)\b{authority}\b.{{0,160}}\bmark\b{assignment_guard}.{{0,80}}"
+            r"\b(?:pass|complete|no\s+findings?|verdict)\b"
+        ),
+    )
+
+
 _SOURCE_CONTEXT_INSTRUCTION_PATTERNS = (
     # Explicit authority claims paired with an instruction override. Keeping
     # the authority vocabulary phrase-based avoids treating ordinary code such
     # as ``return self.model.forward(x)`` as a prompt-injection payload.
-    re.compile(rf"(?i)\b{_SOURCE_AUTHORITY}\b.{{0,160}}\b{_SOURCE_OVERRIDE}\b"),
-    re.compile(rf"(?i)\b{_SOURCE_OVERRIDE}\b.{{0,160}}\b{_SOURCE_AUTHORITY}\b"),
-    # Catch explicit requests to manipulate the review/investigation outcome.
-    re.compile(
-        rf"(?i)\b{_SOURCE_AUTHORITY}\b.{{0,160}}"
-        r"\b(?:return|output|respond(?:\s+with)?|report|mark)\b.{0,80}"
-        r"\b(?:pass|no\s+findings?|verdict|investigation\s+complete|complete)\b"
-    ),
+    *_compile_source_context_patterns(_SOURCE_EXPLICIT_AUTHORITY, allow_assignment=True),
+    *_compile_source_context_patterns(_SOURCE_AUTHORITY, allow_assignment=False),
     # Preserve the existing fail-closed treatment of an instruction disguised
     # as executable reviewer/model plumbing without broad bare-word matching.
     re.compile(
@@ -54,16 +81,21 @@ _SOURCE_CONTEXT_INSTRUCTION_PATTERNS = (
         r"\breturn\b.{0,80}\bfinding\b"
     ),
 )
+_SOURCE_STRONG_CONTEXT_INSTRUCTION_PATTERNS = _compile_source_context_patterns(
+    _SOURCE_PHRASE_AUTHORITY,
+    allow_assignment=True,
+)
 _SOURCE_STANDALONE_INSTRUCTION_PATTERNS = (
     # A direct attempt to replace prior instructions remains hostile even when
     # it omits an authority label.
     re.compile(
-        r"(?i)\b(?:ignore|disregard|override)\b.{0,80}"
+        r"(?i)\b(?:ignore|disregard|override)\b(?!\s*[:=]).{0,80}"
         r"\b(?:all|any|previous|prior|above)\b.{0,80}"
         r"\b(?:instructions?|system\s+(?:message|prompt)|developer\s+message)\b"
     ),
 )
 _SOURCE_COMMENT_MARKERS = ("//", "#", "/*", "<!--", "-- ")
+_SOURCE_REVIEW_LABEL_LINE = re.compile(r"(?i)^(?:reviewer|assistant)\s*[:\-]\s*$")
 SOURCE_INSTRUCTION_REDACTION_MARKER = "[untrusted source instruction redacted]"
 
 _SECRET_PATTERNS = (
@@ -117,35 +149,107 @@ def _instruction_probe(value: str) -> str:
     return "".join(character for character in normalized if category(character) != "Cf")
 
 
+def _instruction_content(value: str) -> str:
+    # ``-- `` is a raw SQL/Haskell comment marker as well as an ambiguous diff
+    # shape. Preserve it: a real removed line still retains its leading ``-``
+    # for changed-line accounting after neutralization.
+    has_diff_prefix = value[:1] in {"+", "-", " "} and not value.startswith("-- ")
+    diff_stripped = value[1:] if has_diff_prefix else value
+    return diff_stripped.lstrip()
+
+
+def _instruction_comment_membership(values: list[str]) -> tuple[bool, ...]:
+    """Classify comment/blank lines with block state carried across the file."""
+
+    membership: list[bool] = []
+    in_c_block = False
+    in_html_block = False
+    for value in values:
+        content = _instruction_content(value)
+        if not content.strip():
+            # Blank separators are compatible with a short comment payload but
+            # cannot create one without an authority/directive pattern.
+            membership.append(True)
+            continue
+        if in_c_block:
+            membership.append(True)
+            if "*/" in content:
+                in_c_block = False
+            continue
+        if in_html_block:
+            membership.append(True)
+            if "-->" in content:
+                in_html_block = False
+            continue
+        if content.startswith("/*"):
+            membership.append(True)
+            in_c_block = "*/" not in content[2:]
+            continue
+        if content.startswith("<!--"):
+            membership.append(True)
+            in_html_block = "-->" not in content[4:]
+            continue
+        if content.startswith(("//", "#", "-- ")):
+            membership.append(True)
+            continue
+        membership.append(False)
+    return tuple(membership)
+
+
+def _instruction_is_review_label(value: str) -> bool:
+    return _SOURCE_REVIEW_LABEL_LINE.fullmatch(_instruction_content(value)) is not None
+
+
 def _instruction_line_indexes(lines: list[str]) -> set[int]:
     """Find single-line and short split-line instruction payloads."""
 
     probes = [_instruction_probe(line) for line in lines]
-    contextual_matches = {
+    comment_membership = _instruction_comment_membership(probes)
+    single_contextual_matches = {
         index
         for index, probe in enumerate(probes)
         if any(pattern.search(probe) for pattern in _SOURCE_CONTEXT_INSTRUCTION_PATTERNS)
     }
-    matched = contextual_matches | {
+    single_standalone_matches = {
         index
         for index, probe in enumerate(probes)
         if any(pattern.search(probe) for pattern in _SOURCE_STANDALONE_INSTRUCTION_PATTERNS)
     }
+    matched = single_contextual_matches | single_standalone_matches
+    window_matches: set[int] = set()
     # Prompt injections commonly split the authority claim and directive across
     # adjacent comments. Match bounded two/three-line windows while retaining the
     # original records for line-preserving replacement.
     for width in (2, 3):
         for start in range(0, len(probes) - width + 1):
-            indexes = range(start, start + width)
+            indexes = tuple(range(start, start + width))
             # Do not let a wider window swallow safe lines after a smaller
-            # contextual payload has already been identified. Standalone
-            # override lines may still pull in an adjacent authority label.
-            if any(index in contextual_matches for index in indexes):
+            # payload or a complete single-line contextual payload has already
+            # been identified. A standalone override may still pull in an
+            # adjacent authority label when the combined window is contextual.
+            if any(index in window_matches for index in indexes) or any(
+                index in single_contextual_matches for index in indexes
+            ):
                 continue
             window = " ".join(probes[start : start + width])
-            if any(pattern.search(window) for pattern in _SOURCE_CONTEXT_INSTRUCTION_PATTERNS):
-                matched.update(indexes)
-                contextual_matches.update(indexes)
+            use_label_authority = all(comment_membership[index] for index in indexes) or any(
+                _instruction_is_review_label(probes[index]) for index in indexes
+            )
+            context_patterns = (
+                _SOURCE_CONTEXT_INSTRUCTION_PATTERNS
+                if use_label_authority
+                else _SOURCE_STRONG_CONTEXT_INSTRUCTION_PATTERNS
+            )
+            has_context = any(pattern.search(window) for pattern in context_patterns)
+            has_standalone = any(
+                pattern.search(window) for pattern in _SOURCE_STANDALONE_INSTRUCTION_PATTERNS
+            )
+            if not has_context and (
+                not has_standalone or any(index in single_standalone_matches for index in indexes)
+            ):
+                continue
+            matched.update(indexes)
+            window_matches.update(indexes)
     return matched
 
 
@@ -198,7 +302,8 @@ def neutralize_source_instructions(
             or redacted_line_window[0] <= line_number <= redacted_line_window[1]
         ):
             redacted_lines.append(line_number)
-        diff_prefix = line[:1] if line[:1] in {"+", "-", " "} else ""
+        has_diff_prefix = line[:1] in {"+", "-", " "} and not line.startswith("-- ")
+        diff_prefix = line[:1] if has_diff_prefix else ""
         content = line[len(diff_prefix) :]
         if not source:
             output.append(f"{diff_prefix}{SOURCE_INSTRUCTION_REDACTION_MARKER}{ending}")
@@ -214,8 +319,10 @@ def neutralize_source_instructions(
             continue
         position, marker = comment_positions[0]
         code_prefix = content[:position]
+        marker_separator = "" if marker.endswith(" ") else " "
         output.append(
-            f"{diff_prefix}{code_prefix}{marker} {SOURCE_INSTRUCTION_REDACTION_MARKER}{ending}"
+            f"{diff_prefix}{code_prefix}{marker}{marker_separator}"
+            f"{SOURCE_INSTRUCTION_REDACTION_MARKER}{ending}"
         )
         incomplete = incomplete or bool(code_prefix.strip())
     if check is not None:
