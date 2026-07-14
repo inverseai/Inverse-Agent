@@ -68,6 +68,11 @@ def _compile_source_context_patterns(
     )
 
 
+_SOURCE_EXECUTABLE_INSTRUCTION_PATTERN = re.compile(
+    r"(?i)(?P<reviewer>\breviewer\b)\s*=\s*(?P<model>\bmodel\b).{0,160}"
+    r"(?P<return>\breturn\b).{0,80}(?P<finding>\bfinding\b)"
+)
+_SOURCE_EXECUTABLE_GROUPS = ("reviewer", "model", "return", "finding")
 _SOURCE_CONTEXT_INSTRUCTION_PATTERNS = (
     # Explicit authority claims paired with an instruction override. Keeping
     # the authority vocabulary phrase-based avoids treating ordinary code such
@@ -76,26 +81,43 @@ _SOURCE_CONTEXT_INSTRUCTION_PATTERNS = (
     *_compile_source_context_patterns(_SOURCE_AUTHORITY, allow_assignment=False),
     # Preserve the existing fail-closed treatment of an instruction disguised
     # as executable reviewer/model plumbing without broad bare-word matching.
-    re.compile(
-        r"(?i)\breviewer\b\s*=\s*\bmodel\b.{0,160}"
-        r"\breturn\b.{0,80}\bfinding\b"
-    ),
+    _SOURCE_EXECUTABLE_INSTRUCTION_PATTERN,
 )
 _SOURCE_STRONG_CONTEXT_INSTRUCTION_PATTERNS = _compile_source_context_patterns(
     _SOURCE_PHRASE_AUTHORITY,
     allow_assignment=True,
 )
-_SOURCE_STANDALONE_INSTRUCTION_PATTERNS = (
-    # A direct attempt to replace prior instructions remains hostile even when
-    # it omits an authority label.
-    re.compile(
-        r"(?i)\b(?:ignore|disregard|override)\b(?!\s*[:=]).{0,80}"
-        r"\b(?:all|any|previous|prior|above)\b.{0,80}"
-        r"\b(?:instructions?|system\s+(?:message|prompt)|developer\s+message)\b"
-    ),
+_SOURCE_STANDALONE_INSTRUCTION_PATTERN = re.compile(
+    r"(?i)^(?:please\s+)?(?:ignore|disregard|override)\b(?!\s*[:=]).{0,80}"
+    r"\b(?:all|any|previous|prior|above)\b.{0,80}"
+    r"\b(?:instructions?|system\s+(?:message|prompt)|developer\s+message)\b"
+)
+_SOURCE_STANDALONE_FRAGMENT_PATTERN = re.compile(
+    r"(?i)^(?:"
+    r"(?:please\s+)?(?:ignore|disregard|override)\b(?!\s*[:=])"
+    r"(?:\s+(?:all|any|previous|prior|above))?\s*[.!:]?$|"
+    r"(?:(?:all|any|previous|prior|above)\s+)?"
+    r"(?:instructions?|system\s+(?:message|prompt)|developer\s+message)\b"
+    r")"
 )
 _SOURCE_COMMENT_MARKERS = ("//", "#", "/*", "<!--", "-- ")
+_SOURCE_RUST_RAW_STRING_OPEN = re.compile(r'(?:br|r)(?P<hashes>#+)"')
+_SOURCE_CPP_RAW_STRING_OPEN = re.compile(
+    r'(?:(?:u8|u|U|L)?R)"(?P<delimiter>[^ ()\\\t\r\n]{0,16})\('
+)
+_SOURCE_CSHARP_VERBATIM_OPEN = re.compile(r'(?:\$@|@\$|@)"')
 _SOURCE_REVIEW_LABEL_LINE = re.compile(r"(?i)^(?:reviewer|assistant)\s*[:\-]\s*$")
+_SOURCE_LABEL_AUTHORITY_PATTERN = re.compile(rf"(?i)\b{_SOURCE_LABEL_AUTHORITY}\b")
+_SOURCE_AUTHORITY_PATTERN = re.compile(rf"(?i)\b{_SOURCE_AUTHORITY}\b")
+_SOURCE_CONTEXT_PAYLOAD_FRAGMENT_PATTERN = re.compile(
+    r"(?i)(?:"
+    rf"\b{_SOURCE_OVERRIDE}\b(?!\s*[:=]).{{0,80}}\b(?:instructions?|findings?)\b|"
+    r"\b(?:return|output|respond|report|mark)\b(?!\s*[:=]).{0,80}"
+    r"\b(?:pass|no\s+findings?|verdict|complete|finding)\b"
+    r")"
+)
+_SOURCE_COMMENT_PREFIX_PATTERN = re.compile(r"^(?:(?:<!--|-->|/\*|\*/|#+|/{2,}|\*+|--\s+)\s*)+")
+_SOURCE_COMMENT_SUFFIX_PATTERN = re.compile(r"\s*(?:\*/|-->)\s*$")
 SOURCE_INSTRUCTION_REDACTION_MARKER = "[untrusted source instruction redacted]"
 
 _SECRET_PATTERNS = (
@@ -144,96 +166,420 @@ class SourceInstructionResult:
     redacted_lines: tuple[int, ...] = ()
 
 
+@dataclass(frozen=True)
+class _InstructionCommentSpan:
+    start: int
+    marker: str
+    end: int | None
+    closer: str | None
+
+
+@dataclass(frozen=True)
+class _InstructionLexicalLine:
+    comment_spans: tuple[_InstructionCommentSpan, ...]
+    unquoted_text: str
+    member: bool
+
+
 def _instruction_probe(value: str) -> str:
     normalized = normalize("NFKC", value)
     return "".join(character for character in normalized if category(character) != "Cf")
 
 
-def _instruction_content(value: str) -> str:
+def _instruction_has_diff_prefix(value: str) -> bool:
+    return value[:1] in {"+", "-", " "} and not value.startswith(("-- ", "-->"))
+
+
+def _instruction_record_content(value: str) -> str:
     # ``-- `` is a raw SQL/Haskell comment marker as well as an ambiguous diff
     # shape. Preserve it: a real removed line still retains its leading ``-``
     # for changed-line accounting after neutralization.
-    has_diff_prefix = value[:1] in {"+", "-", " "} and not value.startswith("-- ")
-    diff_stripped = value[1:] if has_diff_prefix else value
-    return diff_stripped.lstrip()
+    return value[1:] if _instruction_has_diff_prefix(value) else value
 
 
-def _instruction_comment_membership(values: list[str]) -> tuple[bool, ...]:
-    """Classify comment/blank lines with block state carried across the file."""
+def _instruction_content(value: str) -> str:
+    return _instruction_record_content(value).lstrip()
 
-    membership: list[bool] = []
-    in_c_block = False
-    in_html_block = False
+
+def _instruction_find_unescaped(value: str, needle: str, start: int) -> int | None:
+    position = value.find(needle, start)
+    while position >= 0:
+        backslashes = 0
+        cursor = position - 1
+        while cursor >= 0 and value[cursor] == "\\":
+            backslashes += 1
+            cursor -= 1
+        if backslashes % 2 == 0:
+            return position
+        position = value.find(needle, position + len(needle))
+    return None
+
+
+def _instruction_find_verbatim_close(value: str, start: int) -> int | None:
+    position = value.find('"', start)
+    while position >= 0:
+        if position + 1 < len(value) and value[position + 1] == '"':
+            position = value.find('"', position + 2)
+            continue
+        return position
+    return None
+
+
+def _instruction_has_line_continuation(value: str) -> bool:
+    stripped = value.rstrip()
+    backslashes = 0
+    for character in reversed(stripped):
+        if character != "\\":
+            break
+        backslashes += 1
+    return backslashes % 2 == 1
+
+
+def _instruction_mask_range(output: list[str], start: int, end: int) -> None:
+    for index in range(start, end):
+        output[index] = " "
+
+
+def _instruction_token_boundary(value: str, index: int) -> bool:
+    return index == 0 or not (value[index - 1].isalnum() or value[index - 1] == "_")
+
+
+def _instruction_lexical_lines(values: list[str]) -> tuple[_InstructionLexicalLine, ...]:
+    """Scan comments and mask literals once, carrying multiline lexical state."""
+
+    lines: list[_InstructionLexicalLine] = []
+    block_closer: str | None = None
+    literal_closer: str | None = None
+    literal_escape_aware = False
+    literal_doubled_closer = False
     for value in values:
-        content = _instruction_content(value)
-        if not content.strip():
-            # Blank separators are compatible with a short comment payload but
-            # cannot create one without an authority/directive pattern.
-            membership.append(True)
-            continue
-        if in_c_block:
-            membership.append(True)
-            if "*/" in content:
-                in_c_block = False
-            continue
-        if in_html_block:
-            membership.append(True)
-            if "-->" in content:
-                in_html_block = False
-            continue
-        if content.startswith("/*"):
-            membership.append(True)
-            in_c_block = "*/" not in content[2:]
-            continue
-        if content.startswith("<!--"):
-            membership.append(True)
-            in_html_block = "-->" not in content[4:]
-            continue
-        if content.startswith(("//", "#", "-- ")):
-            membership.append(True)
-            continue
-        membership.append(False)
-    return tuple(membership)
+        content = _instruction_record_content(value)
+        unquoted = list(content)
+        member = not content.strip()
+        comment_spans: list[_InstructionCommentSpan] = []
+        index = 0
+
+        if block_closer is not None:
+            member = True
+            comment_start = len(content) - len(content.lstrip())
+            close = content.find(block_closer)
+            if close < 0:
+                comment_spans.append(_InstructionCommentSpan(comment_start, "", None, None))
+                lines.append(_InstructionLexicalLine(tuple(comment_spans), content, member))
+                continue
+            comment_end = close + len(block_closer)
+            comment_spans.append(
+                _InstructionCommentSpan(
+                    comment_start,
+                    "",
+                    comment_end,
+                    block_closer,
+                )
+            )
+            block_closer = None
+            index = comment_end
+
+        while index < len(content):
+            if literal_closer is not None:
+                if literal_doubled_closer:
+                    literal_close = _instruction_find_verbatim_close(content, index)
+                elif literal_escape_aware:
+                    literal_close = _instruction_find_unescaped(content, literal_closer, index)
+                else:
+                    raw_close = content.find(literal_closer, index)
+                    literal_close = raw_close if raw_close >= 0 else None
+                if literal_close is None:
+                    _instruction_mask_range(unquoted, index, len(content))
+                    index = len(content)
+                    break
+                literal_end = literal_close + len(literal_closer)
+                _instruction_mask_range(unquoted, index, literal_end)
+                index = literal_end
+                literal_closer = None
+                literal_escape_aware = False
+                literal_doubled_closer = False
+                continue
+
+            csharp_verbatim = _SOURCE_CSHARP_VERBATIM_OPEN.match(content, index)
+            if csharp_verbatim is not None and _instruction_token_boundary(content, index):
+                verbatim_close = _instruction_find_verbatim_close(content, csharp_verbatim.end())
+                if verbatim_close is None:
+                    _instruction_mask_range(unquoted, index, len(content))
+                    literal_closer = '"'
+                    literal_escape_aware = False
+                    literal_doubled_closer = True
+                    index = len(content)
+                    break
+                literal_end = verbatim_close + 1
+                _instruction_mask_range(unquoted, index, literal_end)
+                index = literal_end
+                continue
+
+            rust_raw = _SOURCE_RUST_RAW_STRING_OPEN.match(content, index)
+            if rust_raw is not None and _instruction_token_boundary(content, index):
+                closer = f'"{rust_raw.group("hashes")}'
+                close = content.find(closer, rust_raw.end())
+                if close < 0:
+                    _instruction_mask_range(unquoted, index, len(content))
+                    literal_closer = closer
+                    literal_escape_aware = False
+                    literal_doubled_closer = False
+                    index = len(content)
+                    break
+                literal_end = close + len(closer)
+                _instruction_mask_range(unquoted, index, literal_end)
+                index = literal_end
+                continue
+
+            cpp_raw = _SOURCE_CPP_RAW_STRING_OPEN.match(content, index)
+            if cpp_raw is not None and _instruction_token_boundary(content, index):
+                closer = f'){cpp_raw.group("delimiter")}"'
+                close = content.find(closer, cpp_raw.end())
+                if close < 0:
+                    _instruction_mask_range(unquoted, index, len(content))
+                    literal_closer = closer
+                    literal_escape_aware = False
+                    literal_doubled_closer = False
+                    index = len(content)
+                    break
+                literal_end = close + len(closer)
+                _instruction_mask_range(unquoted, index, literal_end)
+                index = literal_end
+                continue
+
+            triple = next(
+                (marker for marker in ('"""', "'''") if content.startswith(marker, index)),
+                None,
+            )
+            if triple is not None:
+                triple_close = _instruction_find_unescaped(content, triple, index + len(triple))
+                if triple_close is None:
+                    _instruction_mask_range(unquoted, index, len(content))
+                    literal_closer = triple
+                    literal_escape_aware = True
+                    literal_doubled_closer = False
+                    index = len(content)
+                    break
+                literal_end = triple_close + len(triple)
+                _instruction_mask_range(unquoted, index, literal_end)
+                index = literal_end
+                continue
+
+            character = content[index]
+            if character in {'"', "'", "`"}:
+                quote_close = _instruction_find_unescaped(content, character, index + 1)
+                if quote_close is None:
+                    # Unmatched apostrophes are valid Rust lifetimes and Haskell
+                    # identifier primes. Other unmatched delimiters conservatively
+                    # mask the rest of this logical line.
+                    continued = _instruction_has_line_continuation(content)
+                    if character == "'" and not continued:
+                        index += 1
+                        continue
+                    _instruction_mask_range(unquoted, index, len(content))
+                    if character == "`" or continued:
+                        literal_closer = character
+                        literal_escape_aware = True
+                        literal_doubled_closer = False
+                    index = len(content)
+                    break
+                _instruction_mask_range(unquoted, index, quote_close + 1)
+                index = quote_close + 1
+                continue
+
+            marker_match: str | None = None
+            for marker in _SOURCE_COMMENT_MARKERS:
+                if not content.startswith(marker, index):
+                    continue
+                if marker == "//" and index > 0 and content[index - 1] == ":":
+                    continue
+                marker_match = marker
+                break
+            if marker_match is not None:
+                member = True
+                if marker_match in {"/*", "<!--"}:
+                    closer = "*/" if marker_match == "/*" else "-->"
+                    close = content.find(closer, index + len(marker_match))
+                    if close < 0:
+                        comment_spans.append(
+                            _InstructionCommentSpan(index, marker_match, None, None)
+                        )
+                        block_closer = closer
+                        break
+                    else:
+                        comment_end = close + len(closer)
+                        comment_spans.append(
+                            _InstructionCommentSpan(
+                                index,
+                                marker_match,
+                                comment_end,
+                                closer,
+                            )
+                        )
+                        index = comment_end
+                        continue
+                comment_spans.append(_InstructionCommentSpan(index, marker_match, None, None))
+                break
+            index += 1
+
+        lines.append(
+            _InstructionLexicalLine(
+                comment_spans=tuple(comment_spans),
+                unquoted_text="".join(unquoted),
+                member=member,
+            )
+        )
+    return tuple(lines)
 
 
 def _instruction_is_review_label(value: str) -> bool:
     return _SOURCE_REVIEW_LABEL_LINE.fullmatch(_instruction_content(value)) is not None
 
 
-def _instruction_line_indexes(lines: list[str]) -> set[int]:
+def _instruction_has_label_authority(value: str) -> bool:
+    return _SOURCE_LABEL_AUTHORITY_PATTERN.search(value) is not None
+
+
+def _instruction_has_authority(value: str) -> bool:
+    return _SOURCE_AUTHORITY_PATTERN.search(value) is not None
+
+
+def _instruction_directive_window(values: tuple[str, ...]) -> str:
+    """Return normalized comment prose for an anchored split directive check."""
+
+    parts: list[str] = []
+    for value in values:
+        content = _instruction_content(value)
+        content = _SOURCE_COMMENT_PREFIX_PATTERN.sub("", content)
+        content = _SOURCE_COMMENT_SUFFIX_PATTERN.sub("", content)
+        stripped = content.strip()
+        if stripped:
+            parts.append(stripped)
+    return " ".join(parts)
+
+
+def _instruction_executable_text(lexical: _InstructionLexicalLine) -> str:
+    """Return quote-masked source with every recognized comment span masked."""
+
+    output = list(lexical.unquoted_text)
+    for span in lexical.comment_spans:
+        _instruction_mask_range(output, span.start, span.end or len(output))
+    return "".join(output)
+
+
+def _instruction_executable_match_indexes(
+    probes: tuple[str, ...],
+    indexes: tuple[int, ...],
+) -> tuple[int, ...]:
+    """Map exact executable-pattern capture groups back to contributing lines."""
+
+    parts = tuple(probes[index] for index in indexes)
+    match = _SOURCE_EXECUTABLE_INSTRUCTION_PATTERN.search(" ".join(parts))
+    if match is None:
+        return ()
+    ranges: list[tuple[int, int, int]] = []
+    cursor = 0
+    for index, part in zip(indexes, parts, strict=True):
+        ranges.append((cursor, cursor + len(part), index))
+        cursor += len(part) + 1
+    matched: set[int] = set()
+    for group in _SOURCE_EXECUTABLE_GROUPS:
+        position = match.start(group)
+        matched.update(index for start, end, index in ranges if start <= position < end)
+    return tuple(sorted(matched))
+
+
+def _instruction_line_indexes(
+    lines: list[str],
+) -> tuple[
+    set[int],
+    tuple[_InstructionLexicalLine, ...],
+    tuple[tuple[int, ...], ...],
+]:
     """Find single-line and short split-line instruction payloads."""
 
+    lexical_lines = _instruction_lexical_lines(lines)
     probes = [_instruction_probe(line) for line in lines]
-    comment_membership = _instruction_comment_membership(probes)
+    comment_membership = tuple(line.member for line in lexical_lines)
+    comment_span_texts = tuple(
+        tuple(
+            _instruction_probe(
+                _instruction_record_content(lines[index])[span.start : span.end].strip()
+            )
+            for span in lexical.comment_spans
+        )
+        for index, lexical in enumerate(lexical_lines)
+    )
+    comment_texts = tuple(
+        " ".join(comment_span_texts[index])
+        if lexical.comment_spans
+        else probe.strip()
+        if lexical.member
+        else None
+        for index, (probe, lexical) in enumerate(zip(probes, lexical_lines, strict=True))
+    )
+    contextual_probes = tuple(
+        comment_text if comment_text is not None else _instruction_probe(lexical.unquoted_text)
+        for lexical, comment_text in zip(lexical_lines, comment_texts, strict=True)
+    )
+    executable_probes = tuple(
+        _instruction_probe(_instruction_executable_text(lexical)) for lexical in lexical_lines
+    )
+    executable_matches: set[int] = set()
+    for width in (1, 2, 3):
+        for start in range(0, len(executable_probes) - width + 1):
+            indexes = tuple(range(start, start + width))
+            executable_matches.update(
+                _instruction_executable_match_indexes(executable_probes, indexes)
+            )
     single_contextual_matches = {
         index
-        for index, probe in enumerate(probes)
+        for index, probe in enumerate(contextual_probes)
         if any(pattern.search(probe) for pattern in _SOURCE_CONTEXT_INSTRUCTION_PATTERNS)
     }
     single_standalone_matches = {
         index
-        for index, probe in enumerate(probes)
-        if any(pattern.search(probe) for pattern in _SOURCE_STANDALONE_INSTRUCTION_PATTERNS)
+        for index, probe in enumerate(contextual_probes)
+        if _SOURCE_STANDALONE_INSTRUCTION_PATTERN.search(
+            _instruction_directive_window(((comment_texts[index] or probe),))
+        )
+        is not None
     }
-    matched = single_contextual_matches | single_standalone_matches
-    window_matches: set[int] = set()
+    matched = single_contextual_matches | single_standalone_matches | executable_matches
     # Prompt injections commonly split the authority claim and directive across
     # adjacent comments. Match bounded two/three-line windows while retaining the
     # original records for line-preserving replacement.
     for width in (2, 3):
         for start in range(0, len(probes) - width + 1):
             indexes = tuple(range(start, start + width))
-            # Do not let a wider window swallow safe lines after a smaller
-            # payload or a complete single-line contextual payload has already
-            # been identified. A standalone override may still pull in an
-            # adjacent authority label when the combined window is contextual.
-            if any(index in window_matches for index in indexes) or any(
-                index in single_contextual_matches for index in indexes
-            ):
-                continue
-            window = " ".join(probes[start : start + width])
-            use_label_authority = all(comment_membership[index] for index in indexes) or any(
-                _instruction_is_review_label(probes[index]) for index in indexes
+            single_indexes = tuple(index for index in indexes if index in single_contextual_matches)
+            if single_indexes:
+                complementary_indexes = tuple(
+                    index for index in indexes if index not in single_contextual_matches
+                )
+                if not any(
+                    comment_texts[index]
+                    and _SOURCE_CONTEXT_PAYLOAD_FRAGMENT_PATTERN.search(comment_texts[index] or "")
+                    is not None
+                    for index in complementary_indexes
+                ):
+                    continue
+            window = " ".join(contextual_probes[start : start + width])
+            all_comment = all(comment_membership[index] for index in indexes)
+            comment_label_authority = any(
+                comment_texts[index] is not None
+                and _instruction_has_label_authority(comment_texts[index] or "")
+                for index in indexes
+            )
+            comment_authority = any(
+                comment_texts[index] is not None
+                and _instruction_has_authority(comment_texts[index] or "")
+                for index in indexes
+            )
+            use_label_authority = (
+                all_comment
+                or comment_label_authority
+                or any(_instruction_is_review_label(probes[index]) for index in indexes)
             )
             context_patterns = (
                 _SOURCE_CONTEXT_INSTRUCTION_PATTERNS
@@ -241,16 +587,113 @@ def _instruction_line_indexes(lines: list[str]) -> set[int]:
                 else _SOURCE_STRONG_CONTEXT_INSTRUCTION_PATTERNS
             )
             has_context = any(pattern.search(window) for pattern in context_patterns)
-            has_standalone = any(
-                pattern.search(window) for pattern in _SOURCE_STANDALONE_INSTRUCTION_PATTERNS
+            nonblank_indexes = tuple(
+                index for index in indexes if _instruction_content(probes[index]).strip()
             )
-            if not has_context and (
-                not has_standalone or any(index in single_standalone_matches for index in indexes)
-            ):
+            standalone_comment_indexes = tuple(index for index in indexes if comment_texts[index])
+            standalone_indexes = standalone_comment_indexes or nonblank_indexes
+            has_standalone = bool(standalone_indexes) and (
+                _SOURCE_STANDALONE_INSTRUCTION_PATTERN.search(
+                    _instruction_directive_window(
+                        tuple(
+                            (comment_texts[index] or contextual_probes[index])
+                            for index in standalone_indexes
+                        )
+                    )
+                )
+                is not None
+            )
+            if not has_context:
+                if not has_standalone:
+                    continue
+                standalone_single_indexes = tuple(
+                    index for index in indexes if index in single_standalone_matches
+                )
+                if standalone_single_indexes:
+                    standalone_complements = tuple(
+                        index
+                        for index in standalone_indexes
+                        if index not in single_standalone_matches
+                    )
+                    if not any(
+                        _SOURCE_STANDALONE_FRAGMENT_PATTERN.search(
+                            _instruction_directive_window(
+                                ((comment_texts[index] or contextual_probes[index]),)
+                            )
+                        )
+                        is not None
+                        for index in standalone_complements
+                    ):
+                        continue
+            if has_context and comment_authority:
+                payload_indexes = tuple(
+                    index
+                    for index in indexes
+                    if comment_texts[index]
+                    and (
+                        _instruction_has_authority(comment_texts[index] or "")
+                        or _SOURCE_CONTEXT_PAYLOAD_FRAGMENT_PATTERN.search(
+                            comment_texts[index] or ""
+                        )
+                        is not None
+                        or (
+                            has_standalone
+                            and _SOURCE_STANDALONE_FRAGMENT_PATTERN.search(
+                                _instruction_directive_window(
+                                    ((comment_texts[index] or contextual_probes[index]),)
+                                )
+                            )
+                            is not None
+                        )
+                    )
+                )
+            elif has_standalone and standalone_comment_indexes:
+                payload_indexes = tuple(
+                    index
+                    for index in standalone_comment_indexes
+                    if index in single_standalone_matches
+                    or _SOURCE_STANDALONE_FRAGMENT_PATTERN.search(
+                        _instruction_directive_window(
+                            ((comment_texts[index] or contextual_probes[index]),)
+                        )
+                    )
+                    is not None
+                )
+            else:
+                payload_indexes = tuple(
+                    index for index in indexes if _instruction_content(probes[index]).strip()
+                )
+            if not payload_indexes:
                 continue
-            matched.update(indexes)
-            window_matches.update(indexes)
-    return matched
+            matched.update(payload_indexes)
+    selected_spans: list[tuple[int, ...]] = []
+    for index, span_texts in enumerate(comment_span_texts):
+        if index not in matched or not span_texts:
+            selected_spans.append(())
+            continue
+        if index in executable_matches:
+            selected_spans.append(())
+            continue
+        direct = tuple(
+            span_index
+            for span_index, text in enumerate(span_texts)
+            if any(pattern.search(text) for pattern in _SOURCE_CONTEXT_INSTRUCTION_PATTERNS)
+            or _SOURCE_STANDALONE_INSTRUCTION_PATTERN.search(_instruction_directive_window((text,)))
+            is not None
+        )
+        if direct:
+            selected_spans.append(direct)
+            continue
+        fragments = tuple(
+            span_index
+            for span_index, text in enumerate(span_texts)
+            if _instruction_has_authority(text)
+            or _SOURCE_CONTEXT_PAYLOAD_FRAGMENT_PATTERN.search(text) is not None
+            or _SOURCE_STANDALONE_FRAGMENT_PATTERN.search(_instruction_directive_window((text,)))
+            is not None
+        )
+        selected_spans.append(fragments or tuple(range(len(span_texts))))
+    return matched, lexical_lines, tuple(selected_spans)
 
 
 def neutralize_source_instructions(
@@ -279,7 +722,7 @@ def neutralize_source_instructions(
         else record
         for record in records
     ]
-    instruction_lines = _instruction_line_indexes(line_values)
+    instruction_lines, lexical_lines, selected_spans = _instruction_line_indexes(line_values)
     redacted = False
     incomplete = False
     redacted_lines: list[int] = []
@@ -302,29 +745,38 @@ def neutralize_source_instructions(
             or redacted_line_window[0] <= line_number <= redacted_line_window[1]
         ):
             redacted_lines.append(line_number)
-        has_diff_prefix = line[:1] in {"+", "-", " "} and not line.startswith("-- ")
+        has_diff_prefix = _instruction_has_diff_prefix(line)
         diff_prefix = line[:1] if has_diff_prefix else ""
         content = line[len(diff_prefix) :]
         if not source:
             output.append(f"{diff_prefix}{SOURCE_INSTRUCTION_REDACTION_MARKER}{ending}")
             continue
-        comment_positions = sorted(
-            (position, marker)
-            for marker in _SOURCE_COMMENT_MARKERS
-            if (position := content.find(marker)) >= 0
-        )
-        if not comment_positions:
+        lexical = lexical_lines[line_number - 1]
+        span_indexes = selected_spans[line_number - 1]
+        if not span_indexes:
             output.append(f"{diff_prefix}[untrusted source instruction line omitted]{ending}")
             incomplete = True
             continue
-        position, marker = comment_positions[0]
-        code_prefix = content[:position]
-        marker_separator = "" if marker.endswith(" ") else " "
-        output.append(
-            f"{diff_prefix}{code_prefix}{marker}{marker_separator}"
-            f"{SOURCE_INSTRUCTION_REDACTION_MARKER}{ending}"
-        )
-        incomplete = incomplete or bool(code_prefix.strip())
+        pieces: list[str] = []
+        preserved_parts: list[str] = []
+        cursor = 0
+        for span_index in span_indexes:
+            span = lexical.comment_spans[span_index]
+            preserved_part = content[cursor : span.start]
+            pieces.append(preserved_part)
+            preserved_parts.append(preserved_part)
+            marker_separator = "" if not span.marker or span.marker.endswith(" ") else " "
+            closer = f" {span.closer}" if span.closer is not None else ""
+            pieces.append(
+                f"{span.marker}{marker_separator}{SOURCE_INSTRUCTION_REDACTION_MARKER}{closer}"
+            )
+            cursor = span.end if span.end is not None else len(content)
+        preserved_part = content[cursor:]
+        pieces.append(preserved_part)
+        preserved_parts.append(preserved_part)
+        rewritten = "".join(pieces)
+        output.append(f"{diff_prefix}{rewritten}{ending}")
+        incomplete = incomplete or bool("".join(preserved_parts).strip())
     if check is not None:
         check()
     return SourceInstructionResult(
