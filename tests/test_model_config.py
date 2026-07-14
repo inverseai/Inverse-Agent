@@ -166,6 +166,8 @@ def test_planner_fingerprint_covers_non_secret_runtime_configuration() -> None:
         "http://user:password@127.0.0.1:1234/v1",
         "http://127.0.0.1:1234/v1?token=value",
         "http://example.test/v1",
+        "http://localhost:1234/v1",
+        "https://LOCALHOST:1234/v1",
         "http://127.0.0.1:1234/v1\nignored",
         "http://127.0.0.1:1234/v1\x7fignored",
         "http://127.0.0.1:99999/v1",
@@ -182,7 +184,6 @@ def test_endpoint_validation_rejects_unsafe_urls(url: str) -> None:
         "http://127.0.0.2:1234/v1",
         "http://[::1]:1234/v1",
         "https://127.0.0.1:1234/v1",
-        "http://LOCALHOST:1234/v1",
     ],
 )
 def test_endpoint_validation_accepts_loopback_variants(url: str) -> None:

@@ -202,6 +202,24 @@ def test_read_file_neutralizes_split_line_prompt_injection(tmp_path: Path) -> No
     assert observation.lines[2] == "3: safe = True"
 
 
+def test_benign_model_code_remains_visible_citable_and_searchable(tmp_path: Path) -> None:
+    source = "def evaluate(model, loader):\n    return sum(loss(model(x), y) for x, y in loader)\n"
+    (tmp_path / "benchmark.py").write_text(source, encoding="utf-8")
+    reader = WorkspaceReader.open(tmp_path)
+
+    read = reader.read_file("benchmark.py")
+    search = reader.search_text("return sum(loss(model(x), y)")
+
+    assert read.incomplete is False
+    assert read.redacted is False
+    assert read.metadata["instruction_neutralized"] is False
+    assert read.metadata["redacted_lines"] == ()
+    assert read.lines[1] == "2:     return sum(loss(model(x), y) for x, y in loader)"
+    assert search.incomplete is False
+    assert search.redacted is False
+    assert search.lines == ("benchmark.py:2: return sum(loss(model(x), y) for x, y in loader)",)
+
+
 def test_redaction_mask_is_bounded_to_returned_window() -> None:
     text = "\n".join(f"api_key=sk_live_{line:016d}" for line in range(1, 1001))
     sanitized, redacted, redacted_lines = _sanitize_line_preserving(

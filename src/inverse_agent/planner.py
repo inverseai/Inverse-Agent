@@ -88,12 +88,12 @@ def validate_model_endpoint(base_url: str, *, allow_remote: bool = False) -> str
         raise ValueError("model base URL must not include a query or fragment")
 
     hostname = parsed.hostname.lower()
-    is_loopback = hostname == "localhost"
-    if not is_loopback:
-        try:
-            is_loopback = ip_address(hostname).is_loopback
-        except ValueError:
-            is_loopback = False
+    if hostname == "localhost":
+        raise ValueError("loopback model endpoints must use a numeric IP literal")
+    try:
+        is_loopback = ip_address(hostname).is_loopback
+    except ValueError:
+        is_loopback = False
     if not is_loopback:
         if not allow_remote:
             raise ValueError("remote model endpoints require explicit dual opt-in")

@@ -25,14 +25,42 @@ _PEM_TOKEN = re.compile(
 _PRIVATE_KEY_LABEL = re.compile(r"PRIVATE KEY", re.IGNORECASE | re.ASCII)
 _PEM_MARKER_CLOSE_LENGTH = 5
 
-_SOURCE_INSTRUCTION_PATTERNS = (
+_SOURCE_AUTHORITY = (
+    r"(?:"
+    r"(?:reviewer|assistant|model|system|developer|user|prompt|instruction)"
+    r"(?=\s*[:\-])|"
+    r"(?:system|developer|reviewer|assistant|model|user)\s+"
+    r"(?:message|prompt|instructions?)|"
+    r"language\s+model|ai\s+(?:assistant|model)"
+    r")"
+)
+_SOURCE_OVERRIDE = r"(?:ignore|disregard|override)"
+_SOURCE_CONTEXT_INSTRUCTION_PATTERNS = (
+    # Explicit authority claims paired with an instruction override. Keeping
+    # the authority vocabulary phrase-based avoids treating ordinary code such
+    # as ``return self.model.forward(x)`` as a prompt-injection payload.
+    re.compile(rf"(?i)\b{_SOURCE_AUTHORITY}\b.{{0,160}}\b{_SOURCE_OVERRIDE}\b"),
+    re.compile(rf"(?i)\b{_SOURCE_OVERRIDE}\b.{{0,160}}\b{_SOURCE_AUTHORITY}\b"),
+    # Catch explicit requests to manipulate the review/investigation outcome.
     re.compile(
-        r"(?i)\b(?:reviewer|assistant|system|model|prompt)\b.{0,160}"
-        r"\b(?:ignore|disregard|override|return|output|respond|pass|finding|instruction)\b"
+        rf"(?i)\b{_SOURCE_AUTHORITY}\b.{{0,160}}"
+        r"\b(?:return|output|respond(?:\s+with)?|report|mark)\b.{0,80}"
+        r"\b(?:pass|no\s+findings?|verdict|investigation\s+complete|complete)\b"
     ),
+    # Preserve the existing fail-closed treatment of an instruction disguised
+    # as executable reviewer/model plumbing without broad bare-word matching.
     re.compile(
-        r"(?i)\b(?:ignore|disregard|override|return|output|respond)\b.{0,160}"
-        r"\b(?:reviewer|assistant|system|model|prompt|finding|pass)\b"
+        r"(?i)\breviewer\b\s*=\s*\bmodel\b.{0,160}"
+        r"\breturn\b.{0,80}\bfinding\b"
+    ),
+)
+_SOURCE_STANDALONE_INSTRUCTION_PATTERNS = (
+    # A direct attempt to replace prior instructions remains hostile even when
+    # it omits an authority label.
+    re.compile(
+        r"(?i)\b(?:ignore|disregard|override)\b.{0,80}"
+        r"\b(?:all|any|previous|prior|above)\b.{0,80}"
+        r"\b(?:instructions?|system\s+(?:message|prompt)|developer\s+message)\b"
     ),
 )
 _SOURCE_COMMENT_MARKERS = ("//", "#", "/*", "<!--", "-- ")
@@ -93,10 +121,15 @@ def _instruction_line_indexes(lines: list[str]) -> set[int]:
     """Find single-line and short split-line instruction payloads."""
 
     probes = [_instruction_probe(line) for line in lines]
-    matched = {
+    contextual_matches = {
         index
         for index, probe in enumerate(probes)
-        if any(pattern.search(probe) for pattern in _SOURCE_INSTRUCTION_PATTERNS)
+        if any(pattern.search(probe) for pattern in _SOURCE_CONTEXT_INSTRUCTION_PATTERNS)
+    }
+    matched = contextual_matches | {
+        index
+        for index, probe in enumerate(probes)
+        if any(pattern.search(probe) for pattern in _SOURCE_STANDALONE_INSTRUCTION_PATTERNS)
     }
     # Prompt injections commonly split the authority claim and directive across
     # adjacent comments. Match bounded two/three-line windows while retaining the
@@ -104,11 +137,15 @@ def _instruction_line_indexes(lines: list[str]) -> set[int]:
     for width in (2, 3):
         for start in range(0, len(probes) - width + 1):
             indexes = range(start, start + width)
-            if any(index in matched for index in indexes):
+            # Do not let a wider window swallow safe lines after a smaller
+            # contextual payload has already been identified. Standalone
+            # override lines may still pull in an adjacent authority label.
+            if any(index in contextual_matches for index in indexes):
                 continue
             window = " ".join(probes[start : start + width])
-            if any(pattern.search(window) for pattern in _SOURCE_INSTRUCTION_PATTERNS):
+            if any(pattern.search(window) for pattern in _SOURCE_CONTEXT_INSTRUCTION_PATTERNS):
                 matched.update(indexes)
+                contextual_matches.update(indexes)
     return matched
 
 
