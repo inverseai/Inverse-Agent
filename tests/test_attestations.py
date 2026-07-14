@@ -31,6 +31,28 @@ def test_revoke_scope(tmp_path: Path) -> None:
     assert not store.revoke(workspace, AttestationScope.SOURCE_READ)
 
 
+def test_regrant_uses_a_fresh_generation_and_invalidates_old_lease(tmp_path: Path) -> None:
+    store = ScopedTrustStore(tmp_path / "att.sqlite")
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    first = store.grant(workspace, AttestationScope.SOURCE_READ, granted_by="alice")
+
+    assert store.revoke(workspace, AttestationScope.SOURCE_READ)
+    second = store.grant(workspace, AttestationScope.SOURCE_READ, granted_by="alice")
+
+    assert second["generation"] > first["generation"]
+    assert not store.has_generation(
+        workspace,
+        AttestationScope.SOURCE_READ,
+        first["generation"],
+    )
+    assert store.has_generation(
+        workspace,
+        AttestationScope.SOURCE_READ,
+        second["generation"],
+    )
+
+
 def test_model_egress_scope_not_grantable(tmp_path: Path) -> None:
     store = ScopedTrustStore(tmp_path / "att.sqlite")
     workspace = tmp_path / "ws"

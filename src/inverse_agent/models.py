@@ -44,13 +44,24 @@ class ArtifactKind(StrEnum):
     TRACE = "trace"
 
 
+class RunKind(StrEnum):
+    """The durable workflow family executed for a run."""
+
+    VERIFICATION = "verification"
+    INVESTIGATION = "investigation"
+
+
 class RunStatus(StrEnum):
     PLANNED = "planned"
+    QUEUED = "queued"
     STARTING = "starting"
     WAITING_FOR_APPROVAL = "waiting_for_approval"
     APPROVING = "approving"
     RUNNING = "running"
+    CANCEL_REQUESTED = "cancel_requested"
     SUCCEEDED = "succeeded"
+    INCOMPLETE = "incomplete"
+    CANCELLED = "cancelled"
     FAILED = "failed"
     REFUSED = "refused"
 
@@ -99,6 +110,7 @@ class RunSpec:
     goal: str
     workspace: Path
     domain: Domain
+    kind: RunKind = RunKind.VERIFICATION
     autonomy_level: AutonomyLevel = AutonomyLevel.ASSISTED
     budget: dict[str, int | float] = field(default_factory=dict)
     expected_artifacts: set[ArtifactKind] = field(default_factory=set)

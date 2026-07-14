@@ -553,6 +553,14 @@ class ModelInvestigationPlanner:
     schema_retries: int = field(default=0, init=False)
     active_deadline: float | None = field(default=None, init=False)
     source_read_guard: Callable[[], bool] | None = field(default=None, init=False, repr=False)
+    request_event_sink: Callable[[dict[str, int | float | str | None]], None] | None = field(
+        default=None,
+        init=False,
+        repr=False,
+    )
+    resume_transport_retries_used: int = field(default=0, init=False, repr=False)
+    resume_schema_retries_used: int = field(default=0, init=False, repr=False)
+    resume_physical_attempts_used: int = field(default=0, init=False, repr=False)
     _turn: int = field(default=0, init=False)
     _auto_reads: int = field(default=0, init=False)
     _nudges: int = field(default=0, init=False)
@@ -739,7 +747,15 @@ class ModelInvestigationPlanner:
             )
         return charged, metadata.prompt_tokens, reported_completion, metadata.model
 
-    def _request(self, prompt: str) -> dict[str, Any]:
+    def _request(
+        self,
+        prompt: str,
+        *,
+        retry_kind: str | None,
+        transport_retries_used: int,
+        schema_retries_used: int,
+        physical_attempts_used: int,
+    ) -> dict[str, Any]:
         if self.source_read_guard is not None and not self.source_read_guard():
             raise PlannerAttestationError("source_read was revoked before model request")
         if self.requests_made >= self.max_total_requests:
@@ -756,6 +772,20 @@ class ModelInvestigationPlanner:
         self.completion_tokens_charged += allowance
         self.completion_tokens_requested += allowance
         self.completion_allowances.append(allowance)
+        if self.request_event_sink is not None:
+            self.request_event_sink(
+                {
+                    "request_index": self.requests_made,
+                    "logical_decision": self._turn,
+                    "requested_completion_tokens": allowance,
+                    "charged_completion_tokens": allowance,
+                    "started_at": time.time(),
+                    "retry_kind": retry_kind,
+                    "transport_retries_used": transport_retries_used,
+                    "schema_retries_used": schema_retries_used,
+                    "physical_attempts_used": physical_attempts_used,
+                }
+            )
         started_at = time.monotonic()
         try:
             payload = self.client.complete_structured_json(
@@ -836,8 +866,13 @@ class ModelInvestigationPlanner:
             > self.context_tokens
         ):
             raise PlannerBudgetError("model context budget exhausted")
-        transport_used = 0
-        schema_used = 0
+        transport_used = self.resume_transport_retries_used if self._turn == 1 else 0
+        schema_used = self.resume_schema_retries_used if self._turn == 1 else 0
+        physical_attempts_used = self.resume_physical_attempts_used if self._turn == 1 else 0
+        if self._turn == 1:
+            self.resume_transport_retries_used = 0
+            self.resume_schema_retries_used = 0
+            self.resume_physical_attempts_used = 0
         pending_retry: str | None = None
         pending_failure: Exception | None = None
 
@@ -847,14 +882,45 @@ class ModelInvestigationPlanner:
             elif kind == "schema":
                 self.schema_retries += 1
 
+        def account_started_attempt(
+            *,
+            requests_before: int,
+            attempts_before: int,
+            retry_kind: str | None,
+            retry_recorded: bool,
+        ) -> tuple[int, bool, bool]:
+            started = self.requests_made > requests_before
+            if not started:
+                return attempts_before, retry_recorded, False
+            if not retry_recorded:
+                record_executed_retry(retry_kind)
+            return attempts_before + 1, True, True
+
         while True:
+            if physical_attempts_used >= 3:
+                if pending_failure is not None:
+                    raise pending_failure
+                raise PlannerBudgetError("per-decision physical request budget exhausted")
             payload_received = False
             requests_before = self.requests_made
+            attempts_before = physical_attempts_used
+            request_retry_kind = pending_retry
+            retry_recorded = False
+
             try:
-                payload = self._request(prompt)
-                record_executed_retry(pending_retry)
-                pending_retry = None
-                pending_failure = None
+                payload = self._request(
+                    prompt,
+                    retry_kind=request_retry_kind,
+                    transport_retries_used=transport_used,
+                    schema_retries_used=schema_used,
+                    physical_attempts_used=physical_attempts_used + 1,
+                )
+                physical_attempts_used, retry_recorded, _ = account_started_attempt(
+                    requests_before=requests_before,
+                    attempts_before=attempts_before,
+                    retry_kind=request_retry_kind,
+                    retry_recorded=retry_recorded,
+                )
                 payload_received = True
                 decision = parse_decision(payload)
                 if (
@@ -863,11 +929,17 @@ class ModelInvestigationPlanner:
                     and decision.command not in self.allowed_commands
                 ):
                     raise ValueError("model selected a command that is unavailable in this run")
+                pending_retry = None
+                pending_failure = None
             except PlannerAttestationError:
                 raise
             except PlannerTransportError as exc:
-                if self.requests_made > requests_before:
-                    record_executed_retry(pending_retry)
+                physical_attempts_used, retry_recorded, _ = account_started_attempt(
+                    requests_before=requests_before,
+                    attempts_before=attempts_before,
+                    retry_kind=request_retry_kind,
+                    retry_recorded=retry_recorded,
+                )
                 pending_retry = None
                 pending_failure = None
                 if transport_used >= self.max_transport_retries:
@@ -878,14 +950,22 @@ class ModelInvestigationPlanner:
                 continue
             except PlannerBudgetError as budget_error:
                 if pending_retry is not None:
-                    if self.requests_made > requests_before:
-                        record_executed_retry(pending_retry)
-                    elif pending_failure is not None:
+                    physical_attempts_used, retry_recorded, started = account_started_attempt(
+                        requests_before=requests_before,
+                        attempts_before=attempts_before,
+                        retry_kind=request_retry_kind,
+                        retry_recorded=retry_recorded,
+                    )
+                    if not started and pending_failure is not None:
                         raise pending_failure from budget_error
                 raise
             except (PlannerError, ValueError, KeyError, TypeError) as exc:
-                if self.requests_made > requests_before:
-                    record_executed_retry(pending_retry)
+                physical_attempts_used, retry_recorded, _ = account_started_attempt(
+                    requests_before=requests_before,
+                    attempts_before=attempts_before,
+                    retry_kind=request_retry_kind,
+                    retry_recorded=retry_recorded,
+                )
                 pending_retry = None
                 pending_failure = None
                 if payload_received:

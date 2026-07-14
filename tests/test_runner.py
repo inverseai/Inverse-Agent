@@ -271,6 +271,50 @@ def test_approval_capability_is_bound_to_current_challenge(tmp_path: Path) -> No
     assert claims.challenge_id == "a" * 32
 
 
+def test_approval_can_be_minted_at_dequeue_without_extending_human_expiry(
+    tmp_path: Path,
+) -> None:
+    rule = CommandRule("probe", ("python", "probe.py"), Domain.GENERIC, requires_approval=True)
+    argv = (str(Path(sys.executable).resolve()), "probe.py")
+    authority = ApprovalAuthority(SECRET)
+
+    token, issued = authority.issue(
+        workspace=tmp_path,
+        domain=Domain.GENERIC,
+        rule=rule,
+        argv=argv,
+        approved_by="tester",
+        challenge_id="c" * 32,
+        now=250,
+        expires_at=300,
+    )
+    verified = authority.verify(
+        token,
+        workspace=tmp_path,
+        domain=Domain.GENERIC,
+        rule=rule,
+        argv=argv,
+        expected_challenge_id="c" * 32,
+        now=299,
+        consume=False,
+    )
+
+    assert issued.issued_at == 250
+    assert issued.expires_at == 300
+    assert verified.expires_at == 300
+    with pytest.raises(ApprovalError, match="expired"):
+        authority.verify(
+            token,
+            workspace=tmp_path,
+            domain=Domain.GENERIC,
+            rule=rule,
+            argv=argv,
+            expected_challenge_id="c" * 32,
+            now=300,
+            consume=False,
+        )
+
+
 def test_expired_approval_is_refused(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     (tmp_path / "probe.py").write_text("print('ok')\n", encoding="utf-8")
     argv = (sys.executable, "probe.py")

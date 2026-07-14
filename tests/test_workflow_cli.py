@@ -11,6 +11,7 @@ from pathlib import Path
 
 import pytest
 
+from inverse_agent.attestations import AttestationScope
 from inverse_agent.cli import approve_command, main
 from inverse_agent.models import AutonomyLevel, Domain, RunStatus
 from inverse_agent.planner import DeterministicPlanner, ExecutionPlan, PlannedAction, Planner
@@ -218,6 +219,59 @@ def test_waiting_run_resumes_without_replanning_after_config_change(tmp_path: Pa
     assert resumed.pending_approval and resumed.pending_approval["rule"] == "django-test"
 
 
+def test_legacy_waiting_run_binds_current_execution_scope_generation(
+    tmp_path: Path,
+) -> None:
+    state_dir = tmp_path / "state"
+    first = _service(state_dir)
+    first.trust_workspace(FIXTURES / "django_project", trusted_by="tester")
+    created = first.create_run(
+        goal="Resume after scope migration",
+        workspace=FIXTURES / "django_project",
+        domain=Domain.DJANGO,
+    )
+    first.start(created.run_id)
+    first.close()
+    with sqlite3.connect(state_dir / "runs.sqlite") as connection:
+        connection.execute(
+            "UPDATE runs SET scope_generations=? WHERE run_id=?",
+            ('{"__legacy_v01__":1}', created.run_id),
+        )
+
+    restarted = _service(state_dir)
+    try:
+        rebound = restarted.get(created.run_id)
+        resumed = _approve(restarted, rebound, "tester")
+    finally:
+        restarted.close()
+
+    assert rebound.scope_generations and "code_execution" in rebound.scope_generations
+    assert resumed.status == RunStatus.WAITING_FOR_APPROVAL.value
+
+
+def test_state_vector_versions_every_application_database(tmp_path: Path) -> None:
+    state_dir = tmp_path / "state"
+    service = _service(state_dir)
+    service.close()
+
+    versions: dict[str, int] = {}
+    for name in (
+        "runs.sqlite",
+        "workspace-trust.sqlite",
+        "approval-replay.sqlite",
+        "checkpoints.sqlite",
+    ):
+        with sqlite3.connect(state_dir / name) as connection:
+            versions[name] = int(connection.execute("PRAGMA user_version").fetchone()[0])
+
+    assert versions == {
+        "runs.sqlite": 3,
+        "workspace-trust.sqlite": 2,
+        "approval-replay.sqlite": 1,
+        "checkpoints.sqlite": 1,
+    }
+
+
 def test_run_store_migrates_planner_fingerprint_column(tmp_path: Path) -> None:
     path = tmp_path / "runs.sqlite"
     with sqlite3.connect(path) as connection:
@@ -277,6 +331,158 @@ def test_concurrent_double_start_invokes_workflow_once(
     assert current.status == RunStatus.WAITING_FOR_APPROVAL.value
 
 
+def test_expired_queued_approval_returns_to_a_fresh_challenge(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = _service(tmp_path / "state")
+    service.trust_workspace(FIXTURES / "django_project", trusted_by="tester")
+    target = service.create_run(
+        goal="Wait for an approval",
+        workspace=FIXTURES / "django_project",
+        domain=Domain.DJANGO,
+    )
+    waiting = service.start(target.run_id)
+    old_challenge = waiting.pending_approval["challenge_id"]
+
+    blocker_entered = threading.Event()
+    release_blocker = threading.Event()
+    original_start = service.workflow.start
+
+    def blocking_start(spec):
+        if spec.run_id == blocker.run_id:
+            blocker_entered.set()
+            if not release_blocker.wait(timeout=10):
+                raise RuntimeError("test blocker was not released")
+        return original_start(spec)
+
+    blocker = service.create_run(
+        goal="Occupy the worker",
+        workspace=FIXTURES / "django_project",
+        domain=Domain.DJANGO,
+        autonomy_level=AutonomyLevel.ADVISORY,
+    )
+    monkeypatch.setattr(service.workflow, "start", blocking_start)
+    try:
+        service.start(blocker.run_id, wait=False)
+        assert blocker_entered.wait(timeout=5)
+        queued = service.approve_and_resume(
+            target.run_id,
+            approved_by="tester",
+            expected_action_digest=waiting.pending_approval["action_digest"],
+            expected_challenge_id=old_challenge,
+            wait=False,
+        )
+        assert queued.status == RunStatus.QUEUED.value
+        with sqlite3.connect(service.runs.path) as connection:
+            connection.execute(
+                "UPDATE run_work_items SET grant_expires_at=? WHERE run_id=? AND state='pending'",
+                (time.time() - 1, target.run_id),
+            )
+
+        release_blocker.set()
+        deadline = time.monotonic() + 5
+        refreshed = service.get(target.run_id)
+        while (
+            refreshed.status != RunStatus.WAITING_FOR_APPROVAL.value and time.monotonic() < deadline
+        ):
+            time.sleep(0.01)
+            refreshed = service.get(target.run_id)
+    finally:
+        release_blocker.set()
+        service.close()
+
+    assert refreshed.status == RunStatus.WAITING_FOR_APPROVAL.value
+    assert refreshed.pending_approval is not None
+    assert refreshed.pending_approval["challenge_id"] != old_challenge
+    assert refreshed.completed_actions == 0
+    assert any(event.kind == "approval.refreshed" for event in service.runs.events(target.run_id))
+
+
+def test_event_cursor_returns_only_newer_ordered_events(tmp_path: Path) -> None:
+    service = _service(tmp_path / "state")
+    try:
+        created = service.create_run(
+            goal="Record ordered events",
+            workspace=FIXTURES / "django_project",
+            domain=Domain.DJANGO,
+            autonomy_level=AutonomyLevel.ADVISORY,
+        )
+        initial = service.events(created.run_id)
+        completed = service.start(created.run_id)
+        later = service.events(created.run_id, after=initial[-1].sequence)
+    finally:
+        service.close()
+
+    assert completed.status == RunStatus.SUCCEEDED.value
+    assert later
+    assert all(event.sequence > initial[-1].sequence for event in later)
+    assert [event.sequence for event in later] == sorted(event.sequence for event in later)
+
+
+def test_revocation_cancels_active_runs_beyond_default_listing_page(tmp_path: Path) -> None:
+    service = _service(tmp_path / "state")
+    workspace = FIXTURES / "django_project"
+    grant = service.trust_workspace(workspace, trusted_by="tester")
+    service._stop_worker.set()
+    service._wake_worker.set()
+    service._worker.join(timeout=5)
+    created_ids: list[str] = []
+    try:
+        for index in range(501):
+            record = service.create_run(
+                goal=f"Queued run {index}",
+                workspace=workspace,
+                domain=Domain.DJANGO,
+            )
+            created_ids.append(record.run_id)
+            service.runs.enqueue_start(
+                record.run_id,
+                scope_generations={"code_execution": grant["generation"]},
+                endpoint_fingerprint=service.planner_fingerprint,
+            )
+
+        assert service.revoke_workspace(
+            workspace,
+            scope=AttestationScope.CODE_EXECUTION,
+        )
+    finally:
+        service.close()
+
+    assert all(
+        service.runs.require(run_id).status == RunStatus.CANCELLED.value for run_id in created_ids
+    )
+
+
+def test_regrant_cancels_runs_bound_to_the_previous_generation(tmp_path: Path) -> None:
+    service = _service(tmp_path / "state")
+    service._stop_worker.set()
+    service._wake_worker.set()
+    service._worker.join(timeout=5)
+    try:
+        first_grant = service.trust_workspace(
+            FIXTURES / "django_project",
+            trusted_by="first-operator",
+        )
+        created = service.create_run(
+            goal="Queued under the first consent generation",
+            workspace=FIXTURES / "django_project",
+            domain=Domain.DJANGO,
+        )
+        queued = service.start(created.run_id, wait=False)
+        second_grant = service.trust_workspace(
+            FIXTURES / "django_project",
+            trusted_by="second-operator",
+        )
+        cancelled = service.get(created.run_id)
+    finally:
+        service.close()
+
+    assert queued.status == RunStatus.QUEUED.value
+    assert second_grant["generation"] > first_grant["generation"]
+    assert cancelled.status == RunStatus.CANCELLED.value
+
+
 def test_workflow_resumes_after_service_restart(tmp_path: Path) -> None:
     state_dir = tmp_path / "state"
     first_service = _service(state_dir)
@@ -304,6 +510,53 @@ def test_workflow_resumes_after_service_restart(tmp_path: Path) -> None:
         resumed_service.close()
     assert resumed.status == RunStatus.WAITING_FOR_APPROVAL.value
     assert resumed.pending_approval["rule"] == "django-test"
+
+
+def test_restart_requeues_claimed_start_before_first_checkpoint(tmp_path: Path) -> None:
+    state_dir = tmp_path / "state"
+    first = _service(state_dir)
+    first.trust_workspace(FIXTURES / "django_project", trusted_by="tester")
+    first._stop_worker.set()
+    first._wake_worker.set()
+    first._worker.join(timeout=5)
+    created = first.create_run(
+        goal="Recover a claimed start",
+        workspace=FIXTURES / "django_project",
+        domain=Domain.DJANGO,
+    )
+    generations = first.trust.capture_generations(
+        FIXTURES / "django_project",
+        (AttestationScope.CODE_EXECUTION,),
+    )
+    first.runs.enqueue_start(
+        created.run_id,
+        scope_generations=generations,
+        endpoint_fingerprint=first.planner_fingerprint,
+    )
+    item = first.runs.claim_next_work()
+    assert item is not None
+    first.runs.set_running(created.run_id, expected_status=RunStatus.STARTING)
+    first.runs.mark_work_started(item.work_id)
+    first.close()
+
+    restarted = _service(state_dir)
+    try:
+        deadline = time.monotonic() + 5
+        recovered = restarted.get(created.run_id)
+        while (
+            recovered.status
+            not in {
+                RunStatus.WAITING_FOR_APPROVAL.value,
+                RunStatus.FAILED.value,
+            }
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.01)
+            recovered = restarted.get(created.run_id)
+    finally:
+        restarted.close()
+
+    assert recovered.status == RunStatus.WAITING_FOR_APPROVAL.value
 
 
 def test_legacy_checkpoint_without_challenge_id_resumes_after_upgrade(
@@ -454,7 +707,7 @@ def test_state_directory_refuses_concurrent_service_writer(tmp_path: Path) -> No
     replacement.close()
 
 
-def test_missing_checkpoint_marks_incomplete_run_failed(tmp_path: Path) -> None:
+def test_missing_checkpoint_database_fails_mixed_vector_closed(tmp_path: Path) -> None:
     state_dir = tmp_path / "state"
     first_service = _service(state_dir)
     first_service.trust_workspace(FIXTURES / "django_project", trusted_by="tester")
@@ -468,13 +721,8 @@ def test_missing_checkpoint_marks_incomplete_run_failed(tmp_path: Path) -> None:
     assert waiting.status == RunStatus.WAITING_FOR_APPROVAL.value
     (state_dir / "checkpoints.sqlite").unlink()
 
-    restarted = _service(state_dir)
-    try:
-        recovered = restarted.get(created.run_id)
-    finally:
-        restarted.close()
-    assert recovered.status == RunStatus.FAILED.value
-    assert recovered.error and "workflow recovery failed" in recovered.error
+    with pytest.raises(RuntimeError, match="mixed schema-version vector"):
+        _service(state_dir)
 
 
 def test_malformed_checkpoint_marks_only_affected_run_failed(
@@ -715,6 +963,62 @@ def test_concurrent_stale_approvals_cannot_advance_two_actions(tmp_path: Path) -
     assert sorted(outcomes) == ["accepted", "refused"]
     assert current.status == RunStatus.WAITING_FOR_APPROVAL.value
     assert current.pending_approval["rule"] == "django-test"
+
+
+def test_scope_revocation_linearizes_against_approved_command_dispatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = _service(tmp_path / "state")
+    workspace = FIXTURES / "django_project"
+    service.trust_workspace(workspace, trusted_by="tester")
+    created = service.create_run(
+        goal="Race revocation with dispatch",
+        workspace=workspace,
+        domain=Domain.DJANGO,
+    )
+    waiting = service.start(created.run_id)
+    dispatch_boundary = threading.Event()
+    release_dispatch = threading.Event()
+    original_invoke = service._invoke_verification_workflow
+
+    def blocked_invoke(running, item, *, grant_expires_at):
+        dispatch_boundary.set()
+        if not release_dispatch.wait(timeout=10):
+            raise RuntimeError("test dispatch was not released")
+        return original_invoke(
+            running,
+            item,
+            grant_expires_at=grant_expires_at,
+        )
+
+    monkeypatch.setattr(service, "_invoke_verification_workflow", blocked_invoke)
+    executor = ThreadPoolExecutor(max_workers=1)
+    try:
+        service.approve_and_resume(
+            created.run_id,
+            approved_by="tester",
+            expected_action_digest=waiting.pending_approval["action_digest"],
+            expected_challenge_id=waiting.pending_approval["challenge_id"],
+            wait=False,
+        )
+        assert dispatch_boundary.wait(timeout=5)
+        revocation = executor.submit(
+            service.revoke_workspace,
+            workspace,
+            scope=AttestationScope.CODE_EXECUTION,
+        )
+        time.sleep(0.1)
+        assert not revocation.done()
+        release_dispatch.set()
+        assert revocation.result(timeout=10)
+        current = service.get(created.run_id)
+    finally:
+        release_dispatch.set()
+        executor.shutdown()
+        service.close()
+
+    assert current.status == RunStatus.CANCELLED.value
 
 
 def test_cli_profile_outputs_json(capsys) -> None:

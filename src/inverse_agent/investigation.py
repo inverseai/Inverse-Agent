@@ -14,12 +14,12 @@ from __future__ import annotations
 import math
 import time
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from enum import StrEnum
 from pathlib import Path, PurePosixPath
 from typing import Protocol
 
-from inverse_agent.attestations import AttestationScope, ScopedTrustStore
+from inverse_agent.attestations import AttestationScope
 from inverse_agent.fs_tools import (
     FsToolError,
     PolicyViolationError,
@@ -56,11 +56,13 @@ __all__ = [
 class InvestigationVerdict(StrEnum):
     PASS = "pass"
     INCOMPLETE = "incomplete"
+    CANCELLED = "cancelled"
     FAILED = "failed"
 
 
 class StopReason(StrEnum):
     FINISHED = "finished"
+    CANCELLED = "cancelled"
     BUDGET_EXHAUSTED = "budget_exhausted"
     MALFORMED_ANSWER = "malformed_answer"
     UNSUPPORTED_CITATION = "unsupported_citation"
@@ -213,6 +215,10 @@ class InvestigationPlanner(Protocol):
         goal: str,
         catalog: tuple[ToolObservation, ...],
     ) -> Decision: ...
+
+
+class ScopeGuard(Protocol):
+    def has_scope(self, workspace: Path, scope: AttestationScope) -> bool: ...
 
 
 @dataclass(frozen=True)
@@ -474,19 +480,27 @@ class InvestigationLoop:
         self,
         *,
         planner: InvestigationPlanner,
-        trust: ScopedTrustStore,
+        trust: ScopeGuard,
         budget: AgentBudget | None = None,
         command_executor: CommandExecutor | None = None,
+        event_sink: Callable[[str, dict[str, object]], None] | None = None,
+        cancel_requested: Callable[[], bool] | None = None,
+        evidence_identity_key: bytes | None = None,
     ) -> None:
         self.planner = planner
         self.trust = trust
         self.budget = budget or AgentBudget()
         self.command_executor = command_executor
+        self.event_sink = event_sink
+        self.cancel_requested = cancel_requested
+        self.evidence_identity_key = evidence_identity_key
         self.budget.validate()
         self._started_at: float | None = None
         self._paused_seconds = 0.0
         self._command_calls_used = 0
         self._observation_bytes_used = 0
+        self._prior_usage: dict[str, int | float] = {}
+        self._prior_model_calls: tuple[ModelCallRecord, ...] = ()
         # If the planner makes real client requests, bound its total to the
         # physical-request budget so retries cannot exceed it, and count actual
         # requests rather than one-per-decision.
@@ -501,42 +515,158 @@ class InvestigationLoop:
         """Actual client requests so far, from the planner when it tracks them."""
 
         made = getattr(self.planner, "requests_made", None)
-        return int(made) if isinstance(made, int) else fallback
+        prior = int(self._prior_usage.get("physical_requests_used", 0))
+        return prior + int(made) if isinstance(made, int) else max(prior, fallback)
 
     def _completion_charged(self) -> int:
         charged = getattr(self.planner, "completion_tokens_charged", None)
-        return int(charged) if isinstance(charged, int) else 0
+        return int(self._prior_usage.get("completion_tokens_charged", 0)) + (
+            int(charged) if isinstance(charged, int) else 0
+        )
 
     def _completion_reported(self) -> int:
         reported = getattr(self.planner, "completion_tokens_reported", None)
-        return int(reported) if isinstance(reported, int) else 0
+        return int(self._prior_usage.get("completion_tokens_used", 0)) + (
+            int(reported) if isinstance(reported, int) else 0
+        )
 
     def _completion_requested(self) -> int:
         requested = getattr(self.planner, "completion_tokens_requested", None)
-        return int(requested) if isinstance(requested, int) else 0
+        return int(self._prior_usage.get("completion_tokens_requested", 0)) + (
+            int(requested) if isinstance(requested, int) else 0
+        )
 
     def _model_calls(self) -> tuple[ModelCallRecord, ...]:
         calls = getattr(self.planner, "model_calls", ())
         if not isinstance(calls, list | tuple) or not all(
             isinstance(call, ModelCallRecord) for call in calls
         ):
-            return ()
-        return tuple(calls)
+            return self._prior_model_calls
+        prior_requests = int(self._prior_usage.get("physical_requests_used", 0))
+        prior_decisions = int(self._prior_usage.get("decisions_used", 0))
+        rebased = tuple(
+            replace(
+                call,
+                request_index=prior_requests + call.request_index,
+                logical_decision=prior_decisions + call.logical_decision,
+            )
+            for call in calls
+        )
+        return self._prior_model_calls + rebased
 
     def _active_seconds(self) -> float:
         if self._started_at is None:
-            return 0.0
-        return max(0.0, time.monotonic() - self._started_at - self._paused_seconds)
+            return float(self._prior_usage.get("active_seconds", 0.0))
+        return float(self._prior_usage.get("active_seconds", 0.0)) + max(
+            0.0, time.monotonic() - self._started_at - self._paused_seconds
+        )
 
     def _active_budget_exhausted(self) -> bool:
         return self._active_seconds() >= self.budget.max_active_seconds
 
-    def run(self, *, run_id: str, goal: str, workspace: Path) -> InvestigationReport:
+    def _progress_snapshot(
+        self,
+        *,
+        decisions: int,
+        tool_calls: int,
+        physical: int,
+        command_calls: int,
+    ) -> dict[str, object]:
+        return {
+            "decisions_used": decisions,
+            "tool_calls_used": tool_calls,
+            "physical_requests_used": physical,
+            "command_calls_used": command_calls,
+            "completion_tokens_used": self._completion_reported(),
+            "completion_tokens_charged": self._completion_charged(),
+            "completion_tokens_requested": self._completion_requested(),
+            "observation_bytes_used": self._observation_bytes_used,
+            "active_seconds": self._active_seconds(),
+            "transport_retries": int(self._prior_usage.get("transport_retries", 0))
+            + int(getattr(self.planner, "transport_retries", 0)),
+            "schema_retries": int(self._prior_usage.get("schema_retries", 0))
+            + int(getattr(self.planner, "schema_retries", 0)),
+            "model_calls": [asdict(call) for call in self._model_calls()],
+        }
+
+    @staticmethod
+    def _validated_prior_usage(
+        prior_usage: dict[str, int | float] | None,
+    ) -> dict[str, int | float]:
+        usage = dict(prior_usage or {})
+        integer_fields = (
+            "decisions_used",
+            "tool_calls_used",
+            "physical_requests_used",
+            "command_calls_used",
+            "completion_tokens_used",
+            "completion_tokens_charged",
+            "completion_tokens_requested",
+            "observation_bytes_used",
+            "transport_retries",
+            "schema_retries",
+        )
+        for name in integer_fields:
+            value = usage.get(name, 0)
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                raise ValueError(f"persisted investigation usage {name} is invalid")
+        active_seconds = usage.get("active_seconds", 0.0)
+        if (
+            not isinstance(active_seconds, int | float)
+            or isinstance(active_seconds, bool)
+            or not math.isfinite(float(active_seconds))
+            or active_seconds < 0
+        ):
+            raise ValueError("persisted investigation usage active_seconds is invalid")
+        return usage
+
+    def run(
+        self,
+        *,
+        run_id: str,
+        goal: str,
+        workspace: Path,
+        initial_catalog: tuple[ToolObservation, ...] = (),
+        prior_usage: dict[str, int | float] | None = None,
+        initial_evidence_identities: dict[str, str] | None = None,
+        prior_tool_calls: tuple[ToolCall, ...] = (),
+        resume_decision: Decision | None = None,
+        initial_model_calls: tuple[ModelCallRecord, ...] = (),
+        initial_transport_retries_used: int = 0,
+        initial_schema_retries_used: int = 0,
+        initial_physical_attempts_used: int = 0,
+    ) -> InvestigationReport:
+        if not 0 <= initial_transport_retries_used <= 1:
+            raise ValueError("persisted logical transport-retry state is invalid")
+        if not 0 <= initial_schema_retries_used <= 1:
+            raise ValueError("persisted logical schema-retry state is invalid")
+        if not 0 <= initial_physical_attempts_used <= 3:
+            raise ValueError("persisted logical physical-attempt state is invalid")
+        self._prior_usage = self._validated_prior_usage(prior_usage)
+        self._prior_model_calls = tuple(initial_model_calls)
         self._started_at = time.monotonic()
         self._paused_seconds = 0.0
-        self._command_calls_used = 0
-        self._observation_bytes_used = 0
-        active_deadline = self._started_at + self.budget.max_active_seconds
+        self._command_calls_used = int(self._prior_usage.get("command_calls_used", 0))
+        catalog_bytes = sum(len(item.text.encode("utf-8")) for item in initial_catalog)
+        self._observation_bytes_used = max(
+            catalog_bytes,
+            int(self._prior_usage.get("observation_bytes_used", 0)),
+        )
+        remaining_active = max(0.0, self.budget.max_active_seconds - self._active_seconds())
+        active_deadline = self._started_at + remaining_active
+        prior_physical = int(self._prior_usage.get("physical_requests_used", 0))
+        prior_decisions = int(self._prior_usage.get("decisions_used", 0))
+        prior_completion = int(self._prior_usage.get("completion_tokens_charged", 0))
+        if hasattr(self.planner, "max_total_requests"):
+            self.planner.max_total_requests = max(
+                0, self.budget.max_physical_requests - prior_physical
+            )
+        if hasattr(self.planner, "max_logical_decisions"):
+            self.planner.max_logical_decisions = max(0, self.budget.max_decisions - prior_decisions)
+        if hasattr(self.planner, "max_completion_tokens"):
+            self.planner.max_completion_tokens = max(
+                0, self.budget.max_completion_tokens - prior_completion
+            )
         if hasattr(self.planner, "active_deadline"):
             self.planner.active_deadline = active_deadline
         resolved = workspace.resolve()
@@ -546,23 +676,31 @@ class InvestigationLoop:
                 InvestigationVerdict.INCOMPLETE,
                 StopReason.NOT_ATTESTED,
                 None,
-                [],
-                0,
-                0,
-                0,
+                list(initial_catalog),
+                prior_decisions,
+                int(self._prior_usage.get("tool_calls_used", 0)),
+                prior_physical,
                 error="workspace is not attested for source_read",
             )
         if hasattr(self.planner, "source_read_guard"):
             self.planner.source_read_guard = lambda: self.trust.has_scope(
                 resolved, AttestationScope.SOURCE_READ
             )
-        reader = WorkspaceReader.open(resolved, active_deadline=active_deadline)
-        catalog: list[ToolObservation] = []
+        reader = WorkspaceReader.open(
+            resolved,
+            active_deadline=active_deadline,
+            identity_key=self.evidence_identity_key,
+        )
+        catalog: list[ToolObservation] = list(initial_catalog)
+        durable_identities = dict(initial_evidence_identities or {})
 
         def evidence_identity(observation_id: str) -> str | None:
             source_identity = reader.evidence_identity(observation_id)
             if source_identity is not None:
                 return source_identity
+            durable_identity = durable_identities.get(observation_id)
+            if durable_identity is not None:
+                return durable_identity
             for observed in catalog:
                 if observed.observation_id != observation_id:
                     continue
@@ -570,14 +708,89 @@ class InvestigationLoop:
                 return identity if isinstance(identity, str) and identity else None
             return None
 
-        decisions = 0
-        tool_calls = 0
-        command_calls = 0
-        physical = 0
+        decisions = prior_decisions
+        tool_calls = int(self._prior_usage.get("tool_calls_used", 0))
+        command_calls = self._command_calls_used
+        physical = prior_physical
         seen_calls: set[tuple[object, ...]] = set()
         no_progress_repeats = 0
+        for prior_call in prior_tool_calls:
+            signature = _call_signature(prior_call)
+            if signature in seen_calls:
+                no_progress_repeats += 1
+            else:
+                no_progress_repeats = 0
+                seen_calls.add(signature)
+        pending_decision = resume_decision
+
+        def model_request_started(
+            request: dict[str, int | float | str | None],
+        ) -> None:
+            if self.event_sink is None:
+                return
+            request_index = request.get("request_index")
+            logical_decision = request.get("logical_decision")
+            if (
+                not isinstance(request_index, int)
+                or isinstance(request_index, bool)
+                or not isinstance(logical_decision, int)
+                or isinstance(logical_decision, bool)
+            ):
+                raise ValueError("model request-start accounting is invalid")
+            durable_request = dict(request)
+            durable_request["request_index"] = (
+                int(self._prior_usage.get("physical_requests_used", 0)) + request_index
+            )
+            durable_request["logical_decision"] = (
+                int(self._prior_usage.get("decisions_used", 0)) + logical_decision
+            )
+            snapshot = self._progress_snapshot(
+                decisions=decisions,
+                tool_calls=tool_calls,
+                physical=self._physical_count(decisions + 1),
+                command_calls=command_calls,
+            )
+            if request["retry_kind"] == "transport":
+                snapshot["transport_retries"] = max(
+                    int(self._prior_usage.get("transport_retries", 0))
+                    + int(getattr(self.planner, "transport_retries", 0)),
+                    int(self._prior_usage.get("transport_retries", 0)) + 1,
+                )
+            if request["retry_kind"] == "schema":
+                snapshot["schema_retries"] = max(
+                    int(self._prior_usage.get("schema_retries", 0))
+                    + int(getattr(self.planner, "schema_retries", 0)),
+                    int(self._prior_usage.get("schema_retries", 0)) + 1,
+                )
+            self.event_sink(
+                "investigation.model_request_started",
+                {
+                    **snapshot,
+                    "request": durable_request,
+                },
+            )
+
+        if self.event_sink is not None and hasattr(self.planner, "request_event_sink"):
+            self.planner.request_event_sink = model_request_started
+        if hasattr(self.planner, "resume_transport_retries_used"):
+            self.planner.resume_transport_retries_used = initial_transport_retries_used
+        if hasattr(self.planner, "resume_schema_retries_used"):
+            self.planner.resume_schema_retries_used = initial_schema_retries_used
+        if hasattr(self.planner, "resume_physical_attempts_used"):
+            self.planner.resume_physical_attempts_used = initial_physical_attempts_used
 
         while True:
+            if self.cancel_requested is not None and self.cancel_requested():
+                return self._finish(
+                    run_id,
+                    InvestigationVerdict.CANCELLED,
+                    StopReason.CANCELLED,
+                    None,
+                    catalog,
+                    decisions,
+                    tool_calls,
+                    physical,
+                )
             if self._active_budget_exhausted():
                 return self._finish(
                     run_id,
@@ -590,7 +803,7 @@ class InvestigationLoop:
                     physical,
                     error="active-time budget exhausted",
                 )
-            if decisions >= self.budget.max_decisions:
+            if pending_decision is None and decisions >= self.budget.max_decisions:
                 return self._finish(
                     run_id,
                     InvestigationVerdict.INCOMPLETE,
@@ -617,53 +830,78 @@ class InvestigationLoop:
             # real client requests as the physical budget allows. ``physical``
             # tracks actual requests (from the planner when it exposes a counter),
             # so retries inside a single decision are charged, not hidden.
-            physical = self._physical_count(decisions + 1)
-            if physical >= self.budget.max_physical_requests:
-                return self._finish(
-                    run_id,
-                    InvestigationVerdict.INCOMPLETE,
-                    StopReason.BUDGET_EXHAUSTED,
-                    None,
-                    catalog,
-                    decisions,
-                    tool_calls,
-                    physical,
-                )
-            try:
-                decision = self.planner.decide(goal=goal, catalog=tuple(catalog))
-            except Exception as exc:  # planner/model protocol failure
+            if pending_decision is None:
                 physical = self._physical_count(decisions + 1)
-                attestation_stop = isinstance(exc, PlannerAttestationError)
-                budget_stop = isinstance(exc, PlannerBudgetError)
-                return self._finish(
-                    run_id,
-                    (
-                        InvestigationVerdict.INCOMPLETE
-                        if attestation_stop or budget_stop
-                        else InvestigationVerdict.FAILED
-                    ),
-                    (
-                        StopReason.NOT_ATTESTED
-                        if attestation_stop
-                        else (
-                            StopReason.BUDGET_EXHAUSTED
-                            if budget_stop
-                            else StopReason.PROTOCOL_FAILURE
-                        )
-                    ),
-                    None,
-                    catalog,
-                    decisions,
-                    tool_calls,
-                    physical,
-                    error=str(exc),
-                )
-            physical = self._physical_count(decisions + 1)
-            # A planner request that returned a decision consumed one logical
-            # decision even when the active deadline expired during that request.
-            # Count it before the deadline/type exits so the model call ledger and
-            # report cannot disagree on an otherwise compliant budget stop.
-            decisions += 1
+                if physical >= self.budget.max_physical_requests:
+                    return self._finish(
+                        run_id,
+                        InvestigationVerdict.INCOMPLETE,
+                        StopReason.BUDGET_EXHAUSTED,
+                        None,
+                        catalog,
+                        decisions,
+                        tool_calls,
+                        physical,
+                    )
+            if pending_decision is not None:
+                decision = pending_decision
+                pending_decision = None
+            else:
+                try:
+                    decision = self.planner.decide(goal=goal, catalog=tuple(catalog))
+                except Exception as exc:  # planner/model protocol failure
+                    physical = self._physical_count(decisions + 1)
+                    attestation_stop = isinstance(exc, PlannerAttestationError)
+                    budget_stop = isinstance(exc, PlannerBudgetError)
+                    return self._finish(
+                        run_id,
+                        (
+                            InvestigationVerdict.INCOMPLETE
+                            if attestation_stop or budget_stop
+                            else InvestigationVerdict.FAILED
+                        ),
+                        (
+                            StopReason.NOT_ATTESTED
+                            if attestation_stop
+                            else (
+                                StopReason.BUDGET_EXHAUSTED
+                                if budget_stop
+                                else StopReason.PROTOCOL_FAILURE
+                            )
+                        ),
+                        None,
+                        catalog,
+                        decisions,
+                        tool_calls,
+                        physical,
+                        error=str(exc),
+                    )
+                physical = self._physical_count(decisions + 1)
+                # A planner request that returned a decision consumed one logical
+                # decision even when the active deadline expired during that request.
+                # Count it before the deadline/type exits so the model call ledger and
+                # report cannot disagree on an otherwise compliant budget stop.
+                decisions += 1
+                if self.event_sink is not None:
+                    self.event_sink(
+                        "investigation.decision",
+                        {
+                            **self._progress_snapshot(
+                                decisions=decisions,
+                                tool_calls=tool_calls,
+                                physical=physical,
+                                command_calls=command_calls,
+                            ),
+                            "decision_kind": (
+                                "answer" if isinstance(decision, AgentAnswer) else "tool"
+                            ),
+                            "decision": (
+                                asdict(decision)
+                                if isinstance(decision, ToolCall | AgentAnswer)
+                                else None
+                            ),
+                        },
+                    )
             if self._active_budget_exhausted():
                 return self._finish(
                     run_id,
@@ -987,6 +1225,41 @@ class InvestigationLoop:
                 )
             self._observation_bytes_used += observation_bytes
             catalog.append(observation)
+            source_identity = reader.evidence_identity(observation.observation_id)
+            if source_identity is None:
+                metadata_identity = observation.metadata.get("evidence_identity")
+                source_identity = (
+                    metadata_identity
+                    if isinstance(metadata_identity, str) and metadata_identity
+                    else None
+                )
+            if source_identity is not None:
+                durable_identities[observation.observation_id] = source_identity
+            if self.event_sink is not None:
+                self.event_sink(
+                    "investigation.observation",
+                    {
+                        "observation": asdict(observation),
+                        "evidence_identity": source_identity,
+                        **self._progress_snapshot(
+                            decisions=decisions,
+                            tool_calls=tool_calls,
+                            physical=physical,
+                            command_calls=command_calls,
+                        ),
+                    },
+                )
+            if self.cancel_requested is not None and self.cancel_requested():
+                return self._finish(
+                    run_id,
+                    InvestigationVerdict.CANCELLED,
+                    StopReason.CANCELLED,
+                    None,
+                    catalog,
+                    decisions,
+                    tool_calls,
+                    physical,
+                )
             if self._active_budget_exhausted():
                 return self._finish(
                     run_id,
@@ -1013,7 +1286,7 @@ class InvestigationLoop:
         *,
         error: str = "",
     ) -> InvestigationReport:
-        return InvestigationReport(
+        report = InvestigationReport(
             run_id=run_id,
             verdict=verdict,
             stop_reason=stop_reason,
@@ -1028,11 +1301,36 @@ class InvestigationLoop:
             completion_tokens_requested=self._completion_requested(),
             observation_bytes_used=self._observation_bytes_used,
             active_seconds=self._active_seconds(),
-            transport_retries=int(getattr(self.planner, "transport_retries", 0)),
-            schema_retries=int(getattr(self.planner, "schema_retries", 0)),
+            transport_retries=int(self._prior_usage.get("transport_retries", 0))
+            + int(getattr(self.planner, "transport_retries", 0)),
+            schema_retries=int(self._prior_usage.get("schema_retries", 0))
+            + int(getattr(self.planner, "schema_retries", 0)),
             model_calls=self._model_calls(),
             error=error,
         )
+        if self.event_sink is not None:
+            self.event_sink(
+                "investigation.result",
+                {
+                    "verdict": report.verdict.value,
+                    "stop_reason": report.stop_reason.value,
+                    "decisions_used": report.decisions_used,
+                    "tool_calls_used": report.tool_calls_used,
+                    "physical_requests_used": report.physical_requests_used,
+                    "command_calls_used": report.command_calls_used,
+                    "completion_tokens_charged": report.completion_tokens_charged,
+                    "completion_tokens_used": report.completion_tokens_used,
+                    "completion_tokens_requested": report.completion_tokens_requested,
+                    "observation_bytes_used": report.observation_bytes_used,
+                    "active_seconds": report.active_seconds,
+                    "transport_retries": report.transport_retries,
+                    "schema_retries": report.schema_retries,
+                    "model_calls": [asdict(call) for call in report.model_calls],
+                    "answer": asdict(report.answer) if report.answer is not None else None,
+                    "error": report.error,
+                },
+            )
+        return report
 
 
 AnswerBuilder = Callable[[tuple[ToolObservation, ...]], AgentAnswer]

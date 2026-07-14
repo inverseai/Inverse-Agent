@@ -349,12 +349,18 @@ class WorkspaceReader:
         workspace: Path,
         *,
         active_deadline: float | None = None,
+        identity_key: bytes | None = None,
     ) -> WorkspaceReader:
         try:
             secure = SecureWorkspace.open(workspace)
         except SecureFsError as exc:
             raise _tool_error(exc) from exc
-        return cls(secure.workspace, secure, active_deadline=active_deadline)
+        return cls(
+            secure.workspace,
+            secure,
+            active_deadline=active_deadline,
+            _identity_key=identity_key or secrets.token_bytes(32),
+        )
 
     def evidence_identity(self, observation_id: str) -> str | None:
         """Return a run-local opaque file identity that is never model-visible."""

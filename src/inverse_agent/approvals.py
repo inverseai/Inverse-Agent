@@ -110,6 +110,7 @@ class ApprovalAuthority:
         challenge_id: str,
         ttl_seconds: int = 300,
         now: int | None = None,
+        expires_at: int | None = None,
     ) -> tuple[str, ApprovalClaims]:
         if ttl_seconds <= 0 or ttl_seconds > 3600:
             raise ValueError("approval ttl must be between 1 and 3600 seconds")
@@ -118,6 +119,9 @@ class ApprovalAuthority:
         ):
             raise ValueError("approval challenge_id must be 32 lowercase hexadecimal characters")
         issued_at = int(time.time() if now is None else now)
+        resolved_expires_at = issued_at + ttl_seconds if expires_at is None else expires_at
+        if resolved_expires_at <= issued_at or resolved_expires_at > issued_at + 3600:
+            raise ValueError("approval expiry must be after issuance and at most 3600 seconds")
         claims = ApprovalClaims(
             approval_id=token_hex(16),
             challenge_id=challenge_id,
@@ -132,7 +136,7 @@ class ApprovalAuthority:
             domain=domain.value,
             approved_by=approved_by,
             issued_at=issued_at,
-            expires_at=issued_at + ttl_seconds,
+            expires_at=resolved_expires_at,
         )
         payload = json.dumps(asdict(claims), sort_keys=True, separators=(",", ":")).encode()
         signature = hmac.new(self._secret, payload, hashlib.sha256).digest()
