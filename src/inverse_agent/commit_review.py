@@ -18,13 +18,16 @@ from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from pathlib import Path, PurePosixPath
 from typing import Any, BinaryIO, Protocol, cast
-from unicodedata import category, normalize
 
 from inverse_agent.environments import discover_trusted_git
 from inverse_agent.models import RunnerPolicy
 from inverse_agent.planner import MAX_MODEL_COMPLETION_TOKENS
 from inverse_agent.policies import GIT_SAFE_PREFIX
-from inverse_agent.redaction import redact_text
+from inverse_agent.redaction import (
+    SOURCE_INSTRUCTION_REDACTION_MARKER,
+    neutralize_source_instructions,
+    redact_text,
+)
 from inverse_agent.runner import build_safe_subprocess_env
 
 COMMIT_ID_PATTERN = re.compile(r"[0-9A-Fa-f]{7,64}")
@@ -32,18 +35,6 @@ DIFF_HUNK_PATTERN = re.compile(
     r"^@@ -(?P<old_start>\d+)(?:,(?P<old_count>\d+))? "
     r"\+(?P<new_start>\d+)(?:,(?P<new_count>\d+))? @@"
 )
-SOURCE_INSTRUCTION_PATTERNS = (
-    re.compile(
-        r"(?i)\b(?:reviewer|assistant|system|model|prompt)\b.{0,160}"
-        r"\b(?:ignore|disregard|override|return|output|respond|pass|finding|instruction)\b"
-    ),
-    re.compile(
-        r"(?i)\b(?:ignore|disregard|override|return|output|respond)\b.{0,160}"
-        r"\b(?:reviewer|assistant|system|model|prompt|finding|pass)\b"
-    ),
-)
-SOURCE_COMMENT_MARKERS = ("//", "#", "/*", "<!--", "-- ")
-SOURCE_INSTRUCTION_REDACTION_MARKER = "[untrusted source instruction redacted]"
 MAX_CHANGED_FILES = 64
 MAX_FILE_BYTES = 128 * 1024
 MAX_DIFF_CHARACTERS = 48_000
@@ -1359,41 +1350,8 @@ class GitCommitReader:
         *,
         source: bool = False,
     ) -> tuple[str, bool, bool]:
-        redacted = False
-        incomplete = False
-        lines: list[str] = []
-        for line in value.splitlines():
-            probe = normalize("NFKC", line)
-            probe = "".join(character for character in probe if category(character) != "Cf")
-            if not any(pattern.search(probe) for pattern in SOURCE_INSTRUCTION_PATTERNS):
-                lines.append(line)
-                continue
-            redacted = True
-            diff_prefix = line[:1] if line[:1] in {"+", "-", " "} else ""
-            content = line[len(diff_prefix) :]
-            if not source:
-                lines.append(f"{diff_prefix}{SOURCE_INSTRUCTION_REDACTION_MARKER}")
-                continue
-            comment_positions = sorted(
-                (position, marker)
-                for marker in SOURCE_COMMENT_MARKERS
-                if (position := content.find(marker)) >= 0
-                and any(
-                    pattern.search(normalize("NFKC", content[position:]))
-                    for pattern in SOURCE_INSTRUCTION_PATTERNS
-                )
-            )
-            if not comment_positions:
-                lines.append(f"{diff_prefix}[untrusted source instruction line omitted]")
-                incomplete = True
-                continue
-            position, marker = comment_positions[0]
-            code_prefix = content[:position]
-            lines.append(
-                f"{diff_prefix}{code_prefix}{marker} {SOURCE_INSTRUCTION_REDACTION_MARKER}"
-            )
-            incomplete = incomplete or bool(code_prefix.strip())
-        return "\n".join(lines), redacted, incomplete
+        result = neutralize_source_instructions(value, source=source)
+        return result.text, result.redacted, result.incomplete
 
     @staticmethod
     def _changed_line_numbers(diff: str) -> tuple[int, ...]:

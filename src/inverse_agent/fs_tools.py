@@ -25,7 +25,7 @@ from dataclasses import dataclass, field, replace
 from fnmatch import fnmatchcase
 from pathlib import Path, PurePosixPath
 
-from inverse_agent.redaction import secret_spans
+from inverse_agent.redaction import neutralize_source_instructions, secret_spans
 from inverse_agent.secure_fs import (
     SecureFsDeadlineError,
     SecureFsError,
@@ -317,6 +317,42 @@ def _sanitize_line_preserving(
     return "".join(output_pieces), True, tuple(sorted(redacted_lines))
 
 
+def _sanitize_source_line_preserving(
+    text: str,
+    *,
+    deadline: float,
+    redacted_line_window: tuple[int, int] | None = None,
+    track_redacted_lines: bool = False,
+) -> tuple[str, bool, bool, bool, tuple[int, ...]]:
+    """Apply secret redaction and source-instruction neutralization in one contract."""
+
+    secret_sanitized, secret_redacted, secret_lines = _sanitize_line_preserving(
+        text,
+        deadline=deadline,
+        redacted_line_window=redacted_line_window if track_redacted_lines else None,
+    )
+
+    def check_deadline() -> None:
+        if time.monotonic() > deadline:
+            raise FsToolError("source sanitization exceeded its deadline")
+
+    neutralized = neutralize_source_instructions(
+        secret_sanitized,
+        source=True,
+        check=check_deadline,
+        track_redacted_lines=track_redacted_lines,
+        redacted_line_window=redacted_line_window,
+    )
+    non_citable_lines = tuple(sorted({*secret_lines, *neutralized.redacted_lines}))
+    return (
+        neutralized.text,
+        secret_redacted,
+        neutralized.redacted,
+        neutralized.incomplete,
+        non_citable_lines,
+    )
+
+
 def _tool_error(exc: SecureFsError) -> FsToolError:
     if isinstance(exc, SecureFsPolicyError):
         return PolicyViolationError(str(exc))
@@ -432,11 +468,19 @@ class WorkspaceReader:
         decoded = _decode_strict(data)
         # Sanitize the WHOLE file before slicing so a window starting inside a
         # multi-line secret cannot leak the body, and redaction is line-preserving.
-        sanitized_full, redacted, redacted_lines = _sanitize_line_preserving(
+        (
+            sanitized_full,
+            secret_redacted,
+            instruction_neutralized,
+            instruction_line_omitted,
+            redacted_lines,
+        ) = _sanitize_source_line_preserving(
             decoded,
             deadline=deadline,
             redacted_line_window=(start_line, start_line + max_lines - 1),
+            track_redacted_lines=True,
         )
+        sanitized = secret_redacted or instruction_neutralized
         sanitized_hash = hashlib.sha256(sanitized_full.encode("utf-8")).hexdigest()
         window_salt = f"{sanitized_hash}:{start_line}:{max_lines}"
         all_lines = sanitized_full.split("\n")
@@ -464,11 +508,14 @@ class WorkspaceReader:
             lines=numbered,
             start_line=start_line,
             truncated=truncated,
-            incomplete=redacted,
-            redacted=redacted,
+            incomplete=sanitized,
+            redacted=sanitized,
             metadata={
                 "total_lines": total_lines,
                 "redacted_lines": redacted_lines,
+                "secret_redacted": secret_redacted,
+                "instruction_neutralized": instruction_neutralized,
+                "instruction_line_omitted": instruction_line_omitted,
             },
         )
         self._remember_identity(observation.observation_id, entry.identity)
@@ -637,6 +684,7 @@ class WorkspaceReader:
         files_scanned = 0
         bytes_scanned = 0
         redacted_any = False
+        instruction_neutralized_any = False
         decode_refused = False
         read_refused = False
         oversized_skipped = 0
@@ -700,11 +748,20 @@ class WorkspaceReader:
                 continue
             # Sanitize the WHOLE file before matching so a match inside a secret
             # body cannot leak it, and search only the sanitized representation.
-            sanitized_full, redacted, _redacted_lines = _sanitize_line_preserving(
-                decoded, deadline=deadline
+            (
+                sanitized_full,
+                secret_redacted,
+                instruction_neutralized,
+                _instruction_line_omitted,
+                _redacted_lines,
+            ) = _sanitize_source_line_preserving(
+                decoded,
+                deadline=deadline,
             )
-            if redacted:
+            if secret_redacted:
                 redacted_any = True
+            if instruction_neutralized:
+                instruction_neutralized_any = True
             for line_number, line in enumerate(sanitized_full.split("\n"), start=1):
                 if needle in line.lower():
                     snippet = line.strip()[:SNIPPET_MAX_CHARS]
@@ -737,6 +794,7 @@ class WorkspaceReader:
             ),
             incomplete=(
                 redacted_any
+                or instruction_neutralized_any
                 or decode_refused
                 or walk_incomplete
                 or read_refused
@@ -744,7 +802,7 @@ class WorkspaceReader:
                 or binary_skipped > 0
                 or sensitive_skipped > 0
             ),
-            redacted=redacted_any,
+            redacted=redacted_any or instruction_neutralized_any,
             metadata={
                 "match_count": len(matches),
                 "files_scanned": files_scanned,
@@ -754,6 +812,8 @@ class WorkspaceReader:
                 "binary_skipped": binary_skipped,
                 "policy_race_refused": policy_race_refused,
                 "sensitive_skipped": sensitive_skipped,
+                "secret_redacted": redacted_any,
+                "instruction_neutralized": instruction_neutralized_any,
                 "walk_omitted_entry_count": omitted_count,
                 "query": query,
                 "glob": glob,

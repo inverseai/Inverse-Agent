@@ -1229,6 +1229,7 @@ class _InFlightModelRequest:
     transport_retries_used: int
     schema_retries_used: int
     physical_attempts_used: int
+    request_kind: str
 
 
 @dataclass(frozen=True)
@@ -1242,6 +1243,9 @@ class _InvestigationRecovery:
     resume_transport_retries_used: int
     resume_schema_retries_used: int
     resume_physical_attempts_used: int
+    resume_request_kind: str
+    compaction_notes: str
+    compacted_observation_ids: tuple[str, ...]
     result: InvestigationReport | None
 
 
@@ -1963,6 +1967,9 @@ class AgentService:
             outcome = cls._event_string(item, "outcome")
             if not outcome:
                 raise ValueError("durable investigation model-call outcome is invalid")
+            request_kind = item.get("request_kind", "decision")
+            if request_kind not in {"decision", "compaction"}:
+                raise ValueError("durable investigation model-call request kind is invalid")
             calls.append(
                 ModelCallRecord(
                     request_index=request_index,
@@ -1974,6 +1981,7 @@ class AgentService:
                     reported_model=reported_model,
                     latency_seconds=float(latency),
                     outcome=outcome,
+                    request_kind=request_kind,
                 )
             )
         return tuple(calls)
@@ -2010,6 +2018,9 @@ class AgentService:
             raise ValueError("durable transport retry state is inconsistent")
         if retry_kind == "schema" and schema_retries_used != 1:
             raise ValueError("durable schema retry state is inconsistent")
+        request_kind = raw.get("request_kind", "decision")
+        if request_kind not in {"decision", "compaction"}:
+            raise ValueError("durable in-flight model request kind is invalid")
         return _InFlightModelRequest(
             request_index=request_index,
             logical_decision=logical_decision,
@@ -2020,6 +2031,7 @@ class AgentService:
             transport_retries_used=transport_retries_used,
             schema_retries_used=schema_retries_used,
             physical_attempts_used=physical_attempts_used,
+            request_kind=request_kind,
         )
 
     @classmethod
@@ -2075,6 +2087,9 @@ class AgentService:
         resume_transport_retries_used = 0
         resume_schema_retries_used = 0
         resume_physical_attempts_used = 0
+        resume_request_kind = "decision"
+        compaction_notes = ""
+        compacted_observation_ids: tuple[str, ...] = ()
         result: InvestigationReport | None = None
         cursor = 0
         while True:
@@ -2097,6 +2112,29 @@ class AgentService:
                     resume_transport_retries_used = 0
                     resume_schema_retries_used = 0
                     resume_physical_attempts_used = 0
+                    resume_request_kind = "decision"
+                elif event.kind == "investigation.compaction":
+                    if result is not None or pending_decision is not None:
+                        raise ValueError("durable investigation compaction ordering is invalid")
+                    notes = event.payload.get("pinned_notes")
+                    raw_ids = event.payload.get("compacted_observation_ids")
+                    if not isinstance(notes, str) or not notes.strip() or len(notes) > 4096:
+                        raise ValueError("durable investigation compaction notes are invalid")
+                    if not isinstance(raw_ids, list) or any(
+                        not isinstance(item, str) or not item for item in raw_ids
+                    ):
+                        raise ValueError("durable compacted observation IDs are invalid")
+                    compacted = tuple(raw_ids)
+                    if len(set(compacted)) != len(compacted) or not set(compacted).issubset(
+                        {observation.observation_id for observation in catalog}
+                    ):
+                        raise ValueError("durable compaction references unknown observations")
+                    compaction_notes = notes
+                    compacted_observation_ids = compacted
+                    resume_transport_retries_used = 0
+                    resume_schema_retries_used = 0
+                    resume_physical_attempts_used = 0
+                    resume_request_kind = "decision"
                 elif event.kind == "investigation.observation":
                     if result is not None or isinstance(pending_decision, AgentAnswer):
                         raise ValueError("durable investigation observation ordering is invalid")
@@ -2126,6 +2164,7 @@ class AgentService:
                     resume_transport_retries_used = in_flight_request.transport_retries_used
                     resume_schema_retries_used = in_flight_request.schema_retries_used
                     resume_physical_attempts_used = in_flight_request.physical_attempts_used
+                    resume_request_kind = in_flight_request.request_kind
                 elif event.kind == "investigation.model_request_abandoned":
                     in_flight_request = None
             if len(events) < 500:
@@ -2140,6 +2179,9 @@ class AgentService:
             resume_transport_retries_used=resume_transport_retries_used,
             resume_schema_retries_used=resume_schema_retries_used,
             resume_physical_attempts_used=resume_physical_attempts_used,
+            resume_request_kind=resume_request_kind,
+            compaction_notes=compaction_notes,
+            compacted_observation_ids=compacted_observation_ids,
             result=result,
         )
 
@@ -2190,6 +2232,7 @@ class AgentService:
                 reported_model=None,
                 latency_seconds=interrupted_seconds,
                 outcome="process_interrupted",
+                request_kind=request.request_kind,
             ),
         )
         self.runs.update_investigation_progress(
@@ -2202,6 +2245,7 @@ class AgentService:
                 "resume_transport_retries_used": request.transport_retries_used,
                 "resume_schema_retries_used": request.schema_retries_used,
                 "resume_physical_attempts_used": request.physical_attempts_used,
+                "resume_request_kind": request.request_kind,
                 "model_calls": [asdict(call) for call in model_calls],
             },
         )
@@ -2280,6 +2324,9 @@ class AgentService:
             initial_transport_retries_used=recovery.resume_transport_retries_used,
             initial_schema_retries_used=recovery.resume_schema_retries_used,
             initial_physical_attempts_used=recovery.resume_physical_attempts_used,
+            initial_resume_request_kind=recovery.resume_request_kind,
+            initial_compaction_notes=recovery.compaction_notes,
+            initial_compacted_observation_ids=recovery.compacted_observation_ids,
         )
         current = self.runs.require(running.run_id)
         if (

@@ -5,8 +5,18 @@ from __future__ import annotations
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
+from unicodedata import category, normalize
 
-__all__ = ["RedactionResult", "SecretSpan", "private_key_spans", "redact_text", "secret_spans"]
+__all__ = [
+    "SOURCE_INSTRUCTION_REDACTION_MARKER",
+    "RedactionResult",
+    "SecretSpan",
+    "SourceInstructionResult",
+    "neutralize_source_instructions",
+    "private_key_spans",
+    "redact_text",
+    "secret_spans",
+]
 
 _PEM_TOKEN = re.compile(
     r"(?=(?P<token>-----(?P<kind>BEGIN|END) |-----))",
@@ -14,6 +24,19 @@ _PEM_TOKEN = re.compile(
 )
 _PRIVATE_KEY_LABEL = re.compile(r"PRIVATE KEY", re.IGNORECASE | re.ASCII)
 _PEM_MARKER_CLOSE_LENGTH = 5
+
+_SOURCE_INSTRUCTION_PATTERNS = (
+    re.compile(
+        r"(?i)\b(?:reviewer|assistant|system|model|prompt)\b.{0,160}"
+        r"\b(?:ignore|disregard|override|return|output|respond|pass|finding|instruction)\b"
+    ),
+    re.compile(
+        r"(?i)\b(?:ignore|disregard|override|return|output|respond)\b.{0,160}"
+        r"\b(?:reviewer|assistant|system|model|prompt|finding|pass)\b"
+    ),
+)
+_SOURCE_COMMENT_MARKERS = ("//", "#", "/*", "<!--", "-- ")
+SOURCE_INSTRUCTION_REDACTION_MARKER = "[untrusted source instruction redacted]"
 
 _SECRET_PATTERNS = (
     (
@@ -51,6 +74,121 @@ class SecretSpan:
     kind: str
     start: int
     end: int
+
+
+@dataclass(frozen=True)
+class SourceInstructionResult:
+    text: str
+    redacted: bool
+    incomplete: bool
+    redacted_lines: tuple[int, ...] = ()
+
+
+def _instruction_probe(value: str) -> str:
+    normalized = normalize("NFKC", value)
+    return "".join(character for character in normalized if category(character) != "Cf")
+
+
+def _instruction_line_indexes(lines: list[str]) -> set[int]:
+    """Find single-line and short split-line instruction payloads."""
+
+    probes = [_instruction_probe(line) for line in lines]
+    matched = {
+        index
+        for index, probe in enumerate(probes)
+        if any(pattern.search(probe) for pattern in _SOURCE_INSTRUCTION_PATTERNS)
+    }
+    # Prompt injections commonly split the authority claim and directive across
+    # adjacent comments. Match bounded two/three-line windows while retaining the
+    # original records for line-preserving replacement.
+    for width in (2, 3):
+        for start in range(0, len(probes) - width + 1):
+            indexes = range(start, start + width)
+            if any(index in matched for index in indexes):
+                continue
+            window = " ".join(probes[start : start + width])
+            if any(pattern.search(window) for pattern in _SOURCE_INSTRUCTION_PATTERNS):
+                matched.update(indexes)
+    return matched
+
+
+def neutralize_source_instructions(
+    value: str,
+    *,
+    source: bool = False,
+    check: Callable[[], None] | None = None,
+    track_redacted_lines: bool = False,
+    redacted_line_window: tuple[int, int] | None = None,
+) -> SourceInstructionResult:
+    """Neutralize reviewer-directed source text without changing line boundaries.
+
+    ``source=True`` preserves executable text before a recognized comment marker.
+    A matching executable line with no comment boundary is omitted in full because
+    retaining only selected tokens would silently reinterpret untrusted source.
+    """
+
+    if check is not None:
+        check()
+    records = value.splitlines(keepends=True)
+    line_values = [
+        record[:-2]
+        if record.endswith("\r\n")
+        else record[:-1]
+        if record.endswith(("\r", "\n"))
+        else record
+        for record in records
+    ]
+    instruction_lines = _instruction_line_indexes(line_values)
+    redacted = False
+    incomplete = False
+    redacted_lines: list[int] = []
+    output: list[str] = []
+    for line_number, (record, line) in enumerate(zip(records, line_values, strict=True), start=1):
+        if check is not None and line_number % 128 == 0:
+            check()
+        if record.endswith("\r\n"):
+            ending = "\r\n"
+        elif record.endswith(("\r", "\n")):
+            ending = record[-1:]
+        else:
+            ending = ""
+        if line_number - 1 not in instruction_lines:
+            output.append(record)
+            continue
+        redacted = True
+        if track_redacted_lines and (
+            redacted_line_window is None
+            or redacted_line_window[0] <= line_number <= redacted_line_window[1]
+        ):
+            redacted_lines.append(line_number)
+        diff_prefix = line[:1] if line[:1] in {"+", "-", " "} else ""
+        content = line[len(diff_prefix) :]
+        if not source:
+            output.append(f"{diff_prefix}{SOURCE_INSTRUCTION_REDACTION_MARKER}{ending}")
+            continue
+        comment_positions = sorted(
+            (position, marker)
+            for marker in _SOURCE_COMMENT_MARKERS
+            if (position := content.find(marker)) >= 0
+        )
+        if not comment_positions:
+            output.append(f"{diff_prefix}[untrusted source instruction line omitted]{ending}")
+            incomplete = True
+            continue
+        position, marker = comment_positions[0]
+        code_prefix = content[:position]
+        output.append(
+            f"{diff_prefix}{code_prefix}{marker} {SOURCE_INSTRUCTION_REDACTION_MARKER}{ending}"
+        )
+        incomplete = incomplete or bool(code_prefix.strip())
+    if check is not None:
+        check()
+    return SourceInstructionResult(
+        text="".join(output),
+        redacted=redacted,
+        incomplete=incomplete,
+        redacted_lines=tuple(redacted_lines),
+    )
 
 
 def private_key_spans(

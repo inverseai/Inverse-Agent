@@ -1047,6 +1047,7 @@ def _integrity_failures(
     allowed_outcomes = {
         "client_error",
         "planner_error",
+        "process_interrupted",
         "protocol_error",
         "schema_error",
         "success",
@@ -1055,7 +1056,12 @@ def _integrity_failures(
     for call in calls:
         if (
             call.logical_decision < 1
-            or call.logical_decision > report.decisions_used
+            or (call.request_kind == "decision" and call.logical_decision > report.decisions_used)
+            or (
+                call.request_kind == "compaction"
+                and call.logical_decision > report.decisions_used + 1
+            )
+            or call.request_kind not in {"decision", "compaction"}
             or call.requested_completion_tokens < 1
             or call.charged_completion_tokens < 0
             or call.charged_completion_tokens > call.requested_completion_tokens
@@ -1080,23 +1086,37 @@ def _integrity_failures(
     invalid_retry_transition = False
     schema_retry_outcomes = {"client_error", "planner_error", "protocol_error", "schema_error"}
     for logical_decision in sorted(set(logical_sequence)):
-        decision_calls = [call for call in calls if call.logical_decision == logical_decision]
-        success_count = sum(call.outcome == "success" for call in decision_calls)
-        if success_count > 1 or (success_count == 1 and decision_calls[-1].outcome != "success"):
-            failures.add("model_call_sequence_invalid")
-        if (
-            len(decision_calls) > 3
-            or sum(call.outcome == "transport_error" for call in decision_calls) > 1
-            or sum(call.outcome in schema_retry_outcomes for call in decision_calls) > 1
+        logical_calls = [call for call in calls if call.logical_decision == logical_decision]
+        kinds = [call.request_kind for call in logical_calls]
+        if "decision" in kinds and kinds != sorted(
+            kinds, key=lambda kind: 0 if kind == "compaction" else 1
         ):
-            invalid_retry_transition = True
+            failures.add("model_call_sequence_invalid")
+        for request_kind in ("compaction", "decision"):
+            request_calls = [call for call in logical_calls if call.request_kind == request_kind]
+            if not request_calls:
+                continue
+            success_count = sum(call.outcome == "success" for call in request_calls)
+            if success_count > 1 or (success_count == 1 and request_calls[-1].outcome != "success"):
+                failures.add("model_call_sequence_invalid")
+            if (
+                len(request_calls) > 3
+                or sum(call.outcome == "transport_error" for call in request_calls) > 1
+                or sum(call.outcome in schema_retry_outcomes for call in request_calls) > 1
+            ):
+                invalid_retry_transition = True
     for previous, current in zip(calls, calls[1:], strict=False):
-        if current.logical_decision != previous.logical_decision:
+        if (
+            current.logical_decision != previous.logical_decision
+            or current.request_kind != previous.request_kind
+        ):
             continue
         if previous.outcome == "transport_error":
             derived_transport_retries += 1
         elif previous.outcome in schema_retry_outcomes:
             derived_schema_retries += 1
+        elif previous.outcome == "process_interrupted":
+            continue
         else:
             invalid_retry_transition = True
     if (
@@ -1129,7 +1149,9 @@ def _integrity_failures(
         successful_decisions = {
             call.logical_decision
             for call in calls
-            if call.outcome == "success" and call.reported_model == normalized_expected_model
+            if call.request_kind == "decision"
+            and call.outcome == "success"
+            and call.reported_model == normalized_expected_model
         }
         if successful_decisions != set(range(1, report.decisions_used + 1)):
             failures.add("model_decision_coverage_invalid")

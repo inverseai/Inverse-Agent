@@ -1188,6 +1188,116 @@ def test_transport_audit_reconciles_schema_error_response_envelopes() -> None:
     assert "model_decision_coverage_invalid" not in failures
 
 
+def test_compaction_calls_are_accounted_without_faking_extra_logical_decisions() -> None:
+    case = default_cases()[0]
+    calls = (
+        ModelCallRecord(
+            1,
+            1,
+            100,
+            10,
+            20,
+            10,
+            "requested-model",
+            0.1,
+            "success",
+            "compaction",
+        ),
+        ModelCallRecord(
+            2,
+            1,
+            100,
+            10,
+            20,
+            10,
+            "requested-model",
+            0.1,
+            "success",
+            "decision",
+        ),
+    )
+    report = _report(
+        model_calls=calls,
+        physical_requests_used=2,
+        completion_tokens_requested=200,
+        completion_tokens_charged=20,
+        completion_tokens_used=20,
+    )
+    audit = ModelEndpointAudit(
+        trusted_planner=True,
+        configured_model="requested-model",
+        successful_responses=2,
+        attributed_responses=2,
+        reported_models=("requested-model", "requested-model"),
+    )
+
+    failures = _integrity_failures(
+        case,
+        report,
+        AgentBudget(),
+        expected_model="requested-model",
+        model_endpoint_audit=audit,
+    )
+
+    assert "model_call_sequence_invalid" not in failures
+    assert "model_decision_coverage_invalid" not in failures
+    assert "retry_accounting_invalid" not in failures
+
+
+def test_interrupted_model_call_is_a_valid_recovery_ledger_transition() -> None:
+    case = default_cases()[0]
+    calls = (
+        ModelCallRecord(
+            1,
+            1,
+            100,
+            100,
+            None,
+            None,
+            None,
+            0.1,
+            "process_interrupted",
+        ),
+        ModelCallRecord(
+            2,
+            1,
+            100,
+            10,
+            20,
+            10,
+            "requested-model",
+            0.1,
+            "success",
+        ),
+    )
+    report = _report(
+        model_calls=calls,
+        physical_requests_used=2,
+        completion_tokens_requested=200,
+        completion_tokens_charged=110,
+        completion_tokens_used=10,
+    )
+    audit = ModelEndpointAudit(
+        trusted_planner=True,
+        configured_model="requested-model",
+        successful_responses=1,
+        attributed_responses=1,
+        reported_models=("requested-model",),
+    )
+
+    failures = _integrity_failures(
+        case,
+        report,
+        AgentBudget(),
+        expected_model="requested-model",
+        model_endpoint_audit=audit,
+    )
+
+    assert "model_call_accounting_invalid" not in failures
+    assert "model_call_sequence_invalid" not in failures
+    assert "retry_accounting_invalid" not in failures
+
+
 def test_endpoint_audit_uses_per_variant_response_model_delta() -> None:
     client = OpenAICompatibleClient(
         base_url="http://127.0.0.1:1234/v1",

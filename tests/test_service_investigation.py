@@ -558,3 +558,224 @@ def test_restart_conservatively_charges_an_in_flight_model_request(
         "transport_error",
         "schema_error",
     ]
+
+
+def test_durable_compaction_state_rehydrates_without_orphaning_catalog(
+    tmp_path: Path,
+) -> None:
+    workspace_root = tmp_path / "workspaces"
+    workspace = workspace_root / "project"
+    workspace.mkdir(parents=True)
+    state_dir = tmp_path / "state"
+    service = AgentService(
+        workspace_root=workspace_root,
+        state_dir=state_dir,
+        approval_secret=SECRET,
+        investigation_planner_factory=lambda _record: ScriptedInvestigationPlanner(),
+    )
+    try:
+        service.trust_workspace(
+            workspace,
+            trusted_by="tester",
+            scope=AttestationScope.SOURCE_READ,
+        )
+        created = service.create_run(
+            goal="Inspect durable history",
+            workspace=workspace,
+            domain=Domain.GENERIC,
+            kind=RunKind.INVESTIGATION,
+            autonomy_level=AutonomyLevel.ADVISORY,
+        )
+        service._stop_worker.set()
+        service._wake_worker.set()
+        service._worker.join(timeout=5)
+        service.start(created.run_id, wait=False)
+        item = service.runs.claim_next_work()
+        assert item is not None
+        service.runs.set_running(created.run_id, expected_status=RunStatus.STARTING)
+        service.runs.mark_work_started(item.work_id)
+        observation = ToolObservation(
+            observation_id="obs_durable_history",
+            tool="read_file",
+            path="app.py",
+            content_hash="a" * 64,
+            text="value = 42",
+            lines=("1: value = 42",),
+        )
+        usage: dict[str, int | float] = {
+            "decisions_used": 0,
+            "tool_calls_used": 0,
+            "physical_requests_used": 1,
+            "command_calls_used": 0,
+            "completion_tokens_used": 12,
+            "completion_tokens_charged": 12,
+            "completion_tokens_requested": 1024,
+            "observation_bytes_used": len(observation.text),
+            "active_seconds": 0.1,
+            "transport_retries": 0,
+            "schema_retries": 0,
+        }
+        call = ModelCallRecord(
+            request_index=1,
+            logical_decision=1,
+            requested_completion_tokens=1024,
+            charged_completion_tokens=12,
+            reported_prompt_tokens=500,
+            reported_completion_tokens=12,
+            reported_model="local-model",
+            latency_seconds=0.1,
+            outcome="success",
+            request_kind="compaction",
+        )
+        service.runs.update_investigation_progress(
+            created.run_id,
+            usage=usage,
+            event_kind="investigation.observation",
+            event_payload={"observation": asdict(observation), **usage, "model_calls": []},
+        )
+        service.runs.update_investigation_progress(
+            created.run_id,
+            usage=usage,
+            event_kind="investigation.compaction",
+            event_payload={
+                **usage,
+                "pinned_notes": "Non-authoritative durable notes.",
+                "compacted_observation_ids": [observation.observation_id],
+                "model_calls": [asdict(call)],
+            },
+        )
+
+        recovery = service._investigation_recovery(created.run_id)
+    finally:
+        service.close()
+
+    assert recovery.catalog == (observation,)
+    assert recovery.compaction_notes == "Non-authoritative durable notes."
+    assert recovery.compacted_observation_ids == (observation.observation_id,)
+    assert recovery.model_calls == (call,)
+    assert recovery.resume_request_kind == "decision"
+
+
+def test_interrupted_compaction_is_precharged_and_resumes_as_compaction(
+    tmp_path: Path,
+) -> None:
+    workspace_root = tmp_path / "workspaces"
+    workspace = workspace_root / "project"
+    workspace.mkdir(parents=True)
+    service = AgentService(
+        workspace_root=workspace_root,
+        state_dir=tmp_path / "state",
+        approval_secret=SECRET,
+        investigation_planner_factory=lambda _record: ScriptedInvestigationPlanner(),
+    )
+
+    class SimulatedProcessCrash(BaseException):
+        pass
+
+    class CrashingCompactionClient:
+        last_response_metadata = None
+
+        def complete_structured_json(self, **kwargs: object) -> dict[str, object]:
+            assert kwargs["schema_name"] == "investigation_compaction"
+            raise SimulatedProcessCrash
+
+    try:
+        service.trust_workspace(
+            workspace,
+            trusted_by="tester",
+            scope=AttestationScope.SOURCE_READ,
+        )
+        created = service.create_run(
+            goal="Compact durable history",
+            workspace=workspace,
+            domain=Domain.GENERIC,
+            kind=RunKind.INVESTIGATION,
+            autonomy_level=AutonomyLevel.ADVISORY,
+        )
+        service._stop_worker.set()
+        service._wake_worker.set()
+        service._worker.join(timeout=5)
+        service.start(created.run_id, wait=False)
+        item = service.runs.claim_next_work()
+        assert item is not None
+        service.runs.set_running(created.run_id, expected_status=RunStatus.STARTING)
+        service.runs.mark_work_started(item.work_id)
+        catalog = tuple(
+            ToolObservation(
+                observation_id=f"obs_precompact_{index}",
+                tool="read_file",
+                path=f"history_{index}.py",
+                content_hash=str(index) * 64,
+                text="source",
+                lines=tuple(f"{line}: " + "x" * 80 for line in range(1, 101)),
+            )
+            for index in range(3)
+        )
+        baseline: dict[str, int | float] = {
+            "decisions_used": 0,
+            "tool_calls_used": 0,
+            "physical_requests_used": 0,
+            "command_calls_used": 0,
+            "completion_tokens_used": 0,
+            "completion_tokens_charged": 0,
+            "completion_tokens_requested": 0,
+            "observation_bytes_used": sum(len(item.text) for item in catalog),
+            "active_seconds": 0.0,
+            "transport_retries": 0,
+            "schema_retries": 0,
+        }
+        for observation in catalog:
+            service.runs.update_investigation_progress(
+                created.run_id,
+                usage=baseline,
+                event_kind="investigation.observation",
+                event_payload={
+                    "observation": asdict(observation),
+                    **baseline,
+                    "model_calls": [],
+                },
+            )
+
+        def persist(kind: str, payload: dict[str, object]) -> None:
+            usage = dict(baseline)
+            for name, value in payload.items():
+                if isinstance(value, int | float) and not isinstance(value, bool):
+                    usage[name] = value
+            service.runs.update_investigation_progress(
+                created.run_id,
+                usage=usage,
+                event_kind=kind,
+                event_payload=payload,
+            )
+
+        with pytest.raises(SimulatedProcessCrash):
+            InvestigationLoop(
+                planner=ModelInvestigationPlanner(
+                    client=CrashingCompactionClient(),
+                    context_tokens=24_576,
+                ),
+                trust=service.trust,
+                event_sink=persist,
+            ).run(
+                run_id=created.run_id,
+                goal=created.goal,
+                workspace=workspace,
+                initial_catalog=catalog,
+                prior_usage=baseline,
+            )
+
+        interrupted = service._investigation_recovery(created.run_id)
+        assert interrupted.in_flight_request is not None
+        assert interrupted.in_flight_request.request_kind == "compaction"
+        resumed = service._record_interrupted_model_request(
+            service.runs.require(created.run_id),
+            interrupted,
+        )
+    finally:
+        service.close()
+
+    assert resumed.in_flight_request is None
+    assert resumed.resume_request_kind == "compaction"
+    assert resumed.resume_physical_attempts_used == 1
+    assert resumed.model_calls[-1].request_kind == "compaction"
+    assert resumed.model_calls[-1].outcome == "process_interrupted"

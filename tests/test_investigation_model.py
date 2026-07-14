@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -107,6 +108,8 @@ def test_parse_read_file_decision() -> None:
     assert decision.path == "src/app.py"
     assert decision.start_line == 5
     assert decision.max_lines == 20
+    assert "observation text" in client.system_prompts[0]
+    assert "untrusted data" in client.system_prompts[0]
 
 
 def test_parse_search_maps_empty_glob_to_none() -> None:
@@ -197,6 +200,26 @@ def test_schema_retry_then_success() -> None:
     assert planner.requests_made == 2
     assert client.max_tokens_requested == [2048, 1877]
     assert planner.completion_tokens_charged == sum(client.max_tokens_requested)
+    first_prompt = json.loads(client.prompts[0])
+    retry_prompt = json.loads(client.prompts[1])
+    assert first_prompt["retry_correction"] == ""
+    assert "previous response violated" in retry_prompt["retry_correction"]
+    assert "bad json" not in client.prompts[1]
+
+
+def test_transport_retry_after_schema_failure_keeps_corrective_message() -> None:
+    good = _base("list_files", path=".")
+    client = FakeClient([PlannerProtocolError("bad json"), PlannerTransportError("net"), good])
+    planner = ModelInvestigationPlanner(client=client)
+
+    decision = planner.decide(goal="x", catalog=())
+
+    assert isinstance(decision, ToolCall)
+    assert planner.schema_retries == 1
+    assert planner.transport_retries == 1
+    assert client.calls == 3
+    assert json.loads(client.prompts[1])["retry_correction"]
+    assert json.loads(client.prompts[2])["retry_correction"]
 
 
 def test_second_same_class_failure_is_not_retried() -> None:
@@ -605,6 +628,207 @@ def test_calibrated_context_bounds_full_prompt() -> None:
         + safety_margin
         <= planner.context_tokens
     )
+
+
+def _compaction_history(count: int = 3) -> tuple[ToolObservation, ...]:
+    return tuple(
+        ToolObservation(
+            observation_id=f"obs_history_{index}",
+            tool="read_file",
+            path=f"src/history_{index}.py",
+            content_hash=str(index) * 64,
+            text="bounded source",
+            lines=tuple(f"{line}: " + "x" * 80 for line in range(1, 101)),
+            start_line=1,
+        )
+        for index in range(count)
+    )
+
+
+def test_history_compaction_keeps_runtime_catalog_and_non_citable_notes() -> None:
+    catalog = _compaction_history()
+    client = FakeClient(
+        [
+            {"notes": "Older source windows were inspected; continue from the recent read."},
+            _base("list_files", path="."),
+        ]
+    )
+    planner = ModelInvestigationPlanner(client=client, context_tokens=24_576)
+    compacted_events: list[dict[str, object]] = []
+    request_events: list[dict[str, int | float | str | None]] = []
+    planner.compaction_event_sink = compacted_events.append
+    planner.request_event_sink = request_events.append
+
+    decision = planner.decide(goal="inspect", catalog=catalog)
+
+    assert isinstance(decision, ToolCall)
+    assert [call.request_kind for call in planner.model_calls] == ["compaction", "decision"]
+    assert [event["request_kind"] for event in request_events] == ["compaction", "decision"]
+    assert compacted_events == [
+        {
+            "pinned_notes": planner.pinned_notes,
+            "compacted_observation_ids": [
+                "obs_history_0",
+                "obs_history_1",
+            ],
+        }
+    ]
+    decision_prompt = json.loads(client.prompts[-1])
+    assert [item["id"] for item in decision_prompt["observation_catalog"]] == [
+        observation.observation_id for observation in catalog
+    ]
+    assert decision_prompt["pinned_investigation_notes"] == planner.pinned_notes
+    assert "non-authoritative and never citable" in decision_prompt["notes_authority"]
+    assert "obs_history_0" not in decision_prompt["observations"]
+    assert "obs_history_2" in decision_prompt["observations"]
+
+
+def test_compaction_schema_retry_is_corrective_and_fully_accounted() -> None:
+    metadata = [
+        ModelResponseMetadata("local-model", 100, 8, 108),
+        ModelResponseMetadata("local-model", 100, 8, 108),
+        ModelResponseMetadata("local-model", 100, 8, 108),
+    ]
+    client = FakeClient(
+        [
+            {"notes": ""},
+            {"notes": "Concise replacement notes."},
+            _base("list_files", path="."),
+        ],
+        metadata=metadata,
+    )
+    planner = ModelInvestigationPlanner(client=client, context_tokens=24_576)
+
+    decision = planner.decide(goal="inspect", catalog=_compaction_history())
+
+    assert isinstance(decision, ToolCall)
+    assert planner.schema_retries == 1
+    assert [call.request_kind for call in planner.model_calls] == [
+        "compaction",
+        "compaction",
+        "decision",
+    ]
+    assert [call.outcome for call in planner.model_calls] == [
+        "schema_error",
+        "success",
+        "success",
+    ]
+    assert json.loads(client.prompts[0])["retry_correction"] == ""
+    assert "previous response violated" in json.loads(client.prompts[1])["retry_correction"]
+    assert "non-empty notes" in json.loads(client.prompts[1])["retry_correction"]
+
+
+def test_compaction_retry_admission_preserves_original_protocol_failure() -> None:
+    client = FakeClient([{"notes": ""}])
+    planner = ModelInvestigationPlanner(
+        client=client,
+        context_tokens=24_576,
+        max_logical_decisions=20,
+        max_completion_tokens=24_576,
+    )
+
+    with pytest.raises(ValueError, match="non-empty string"):
+        planner.decide(goal="inspect", catalog=_compaction_history())
+
+    assert client.calls == 1
+    assert planner.schema_retries == 0
+    assert planner.model_calls[0].request_kind == "compaction"
+    assert planner.model_calls[0].outcome == "schema_error"
+
+
+def test_restored_compaction_state_skips_old_detail_but_keeps_every_index_entry() -> None:
+    catalog = _compaction_history()
+    client = FakeClient([_base("list_files", path=".")])
+    planner = ModelInvestigationPlanner(client=client, context_tokens=24_576)
+    planner.pinned_notes = "Durably restored non-authoritative notes."
+    planner.compacted_observation_ids = {"obs_history_0", "obs_history_1"}
+
+    planner.decide(goal="inspect", catalog=catalog)
+
+    prompt = json.loads(client.prompts[0])
+    assert client.calls == 1
+    assert len(prompt["observation_catalog"]) == 3
+    assert prompt["pinned_investigation_notes"] == planner.pinned_notes
+    assert "obs_history_0" not in prompt["observations"]
+    assert "obs_history_2" in prompt["observations"]
+
+
+def test_twenty_plus_step_loop_preserves_citation_across_repeated_compaction(
+    tmp_path: Path,
+) -> None:
+    file_count = 16
+    for index in range(file_count):
+        (tmp_path / f"history_{index}.py").write_text(
+            "\n".join([f"evidence_{index} = True", *("x" * 80 for _ in range(99))]),
+            encoding="utf-8",
+        )
+
+    class AdaptiveCompactionClient:
+        def __init__(self) -> None:
+            self.decisions = 0
+            self.last_response_metadata: ModelResponseMetadata | None = None
+
+        def complete_structured_json(
+            self,
+            *,
+            system: str,
+            prompt: str,
+            schema_name: str,
+            schema: Mapping[str, Any],
+            max_tokens: int = 4096,
+            timeout_seconds: float | None = None,
+        ) -> dict[str, Any]:
+            del system, schema, max_tokens, timeout_seconds
+            self.last_response_metadata = ModelResponseMetadata(
+                model="local-model",
+                prompt_tokens=1_000,
+                completion_tokens=8,
+                total_tokens=1_008,
+            )
+            request = json.loads(prompt)
+            if schema_name == "investigation_compaction":
+                return {"notes": "Older reads completed; continue with the remaining files."}
+            if self.decisions < file_count:
+                path = f"history_{self.decisions}.py"
+                self.decisions += 1
+                return _base("read_file", path=path)
+            first = request["observation_catalog"][0]
+            return _base(
+                "final_answer",
+                summary="The first history file contains the expected evidence.",
+                findings=["history_0.py sets evidence_0 to true."],
+                next_actions=["Keep the evidence assignment."],
+                citations=[
+                    {
+                        "observation_id": first["id"],
+                        "path": first["path"],
+                        "start_line": 1,
+                        "end_line": 1,
+                    }
+                ],
+            )
+
+    trust = ScopedTrustStore(tmp_path / "trust.sqlite")
+    trust.grant(tmp_path, AttestationScope.SOURCE_READ, granted_by="test")
+    client = AdaptiveCompactionClient()
+    planner = ModelInvestigationPlanner(client=client, context_tokens=24_576)
+    events: list[tuple[str, dict[str, object]]] = []
+    report = InvestigationLoop(
+        planner=planner,
+        trust=trust,
+        event_sink=lambda kind, payload: events.append((kind, payload)),
+    ).run(run_id="compaction-loop", goal="inspect history", workspace=tmp_path)
+
+    assert report.verdict is InvestigationVerdict.PASS
+    assert report.decisions_used == file_count + 1
+    assert report.tool_calls_used == file_count
+    assert len(report.catalog) == file_count
+    assert report.answer is not None
+    assert report.answer.citations[0].observation_id == report.catalog[0].observation_id
+    assert report.catalog[0].observation_id in planner.compacted_observation_ids
+    assert sum(kind == "investigation.compaction" for kind, _payload in events) >= 2
+    assert report.physical_requests_used > report.decisions_used
+    assert sum(call.request_kind == "compaction" for call in report.model_calls) >= 2
 
 
 def test_json_escape_heavy_maximum_read_remains_citable_at_safe_context(

@@ -138,6 +138,7 @@ class ModelCallRecord:
     reported_model: str | None
     latency_seconds: float
     outcome: str
+    request_kind: str = "decision"
 
 
 @dataclass(frozen=True)
@@ -635,6 +636,9 @@ class InvestigationLoop:
         initial_transport_retries_used: int = 0,
         initial_schema_retries_used: int = 0,
         initial_physical_attempts_used: int = 0,
+        initial_resume_request_kind: str = "decision",
+        initial_compaction_notes: str = "",
+        initial_compacted_observation_ids: tuple[str, ...] = (),
     ) -> InvestigationReport:
         if not 0 <= initial_transport_retries_used <= 1:
             raise ValueError("persisted logical transport-retry state is invalid")
@@ -642,6 +646,16 @@ class InvestigationLoop:
             raise ValueError("persisted logical schema-retry state is invalid")
         if not 0 <= initial_physical_attempts_used <= 3:
             raise ValueError("persisted logical physical-attempt state is invalid")
+        if initial_resume_request_kind not in {"decision", "compaction"}:
+            raise ValueError("persisted model request kind is invalid")
+        if not isinstance(initial_compaction_notes, str):
+            raise ValueError("persisted compaction notes are invalid")
+        if len(initial_compaction_notes) > 4096:
+            raise ValueError("persisted compaction notes exceed the schema limit")
+        if len(set(initial_compacted_observation_ids)) != len(
+            initial_compacted_observation_ids
+        ) or any(not item for item in initial_compacted_observation_ids):
+            raise ValueError("persisted compacted observation IDs are invalid")
         self._prior_usage = self._validated_prior_usage(prior_usage)
         self._prior_model_calls = tuple(initial_model_calls)
         self._started_at = time.monotonic()
@@ -692,6 +706,10 @@ class InvestigationLoop:
             identity_key=self.evidence_identity_key,
         )
         catalog: list[ToolObservation] = list(initial_catalog)
+        if not set(initial_compacted_observation_ids).issubset(
+            {observation.observation_id for observation in catalog}
+        ) or (initial_compacted_observation_ids and not initial_compaction_notes.strip()):
+            raise ValueError("persisted compaction state is inconsistent")
         durable_identities = dict(initial_evidence_identities or {})
 
         def evidence_identity(observation_id: str) -> str | None:
@@ -770,8 +788,41 @@ class InvestigationLoop:
                 },
             )
 
+        def model_compaction_completed(compaction: dict[str, object]) -> None:
+            if self.event_sink is None:
+                return
+            notes = compaction.get("pinned_notes")
+            compacted_ids = compaction.get("compacted_observation_ids")
+            if (
+                not isinstance(notes, str)
+                or not isinstance(compacted_ids, list)
+                or any(not isinstance(item, str) or not item for item in compacted_ids)
+            ):
+                raise ValueError("model compaction accounting is invalid")
+            self.event_sink(
+                "investigation.compaction",
+                {
+                    **self._progress_snapshot(
+                        decisions=decisions,
+                        tool_calls=tool_calls,
+                        physical=self._physical_count(decisions + 1),
+                        command_calls=command_calls,
+                    ),
+                    "pinned_notes": notes,
+                    "compacted_observation_ids": compacted_ids,
+                },
+            )
+
         if self.event_sink is not None and hasattr(self.planner, "request_event_sink"):
             self.planner.request_event_sink = model_request_started
+        if self.event_sink is not None and hasattr(self.planner, "compaction_event_sink"):
+            self.planner.compaction_event_sink = model_compaction_completed
+        if hasattr(self.planner, "pinned_notes"):
+            self.planner.pinned_notes = initial_compaction_notes
+        if hasattr(self.planner, "compacted_observation_ids"):
+            self.planner.compacted_observation_ids = set(initial_compacted_observation_ids)
+        if hasattr(self.planner, "resume_request_kind"):
+            self.planner.resume_request_kind = initial_resume_request_kind
         if hasattr(self.planner, "resume_transport_retries_used"):
             self.planner.resume_transport_retries_used = initial_transport_retries_used
         if hasattr(self.planner, "resume_schema_retries_used"):
