@@ -93,8 +93,7 @@ _SOURCE_STANDALONE_INSTRUCTION_PATTERN = re.compile(
     r"\b(?:instructions?|system\s+(?:message|prompt)|developer\s+message)\b"
 )
 _SOURCE_STANDALONE_FRAGMENT_PATTERN = re.compile(
-    r"(?i)^(?:"
-    r"(?:please\s+)?(?:ignore|disregard|override)\b(?!\s*[:=])"
+    r"(?i)^(?:(?:please\s+)?(?:ignore|disregard|override)\b(?!\s*[:=])"
     r"(?:\s+(?:all|any|previous|prior|above))?\s*[.!:]?$|"
     r"(?:(?:all|any|previous|prior|above)\s+)?"
     r"(?:instructions?|system\s+(?:message|prompt)|developer\s+message)\b"
@@ -181,9 +180,19 @@ class _InstructionLexicalLine:
     member: bool
 
 
-def _instruction_probe(value: str) -> str:
+def _instruction_probe(
+    value: str,
+    *,
+    check: Callable[[], None] | None = None,
+) -> str:
     normalized = normalize("NFKC", value)
-    return "".join(character for character in normalized if category(character) != "Cf")
+    output: list[str] = []
+    for index, character in enumerate(normalized):
+        if check is not None and index % 16384 == 0:
+            check()
+        if category(character) != "Cf":
+            output.append(character)
+    return "".join(output)
 
 
 def _instruction_has_diff_prefix(value: str) -> bool:
@@ -235,8 +244,16 @@ def _instruction_has_line_continuation(value: str) -> bool:
     return backslashes % 2 == 1
 
 
-def _instruction_mask_range(output: list[str], start: int, end: int) -> None:
+def _instruction_mask_range(
+    output: list[str],
+    start: int,
+    end: int,
+    *,
+    check: Callable[[], None] | None = None,
+) -> None:
     for index in range(start, end):
+        if check is not None and (index - start) % 16384 == 0:
+            check()
         output[index] = " "
 
 
@@ -244,7 +261,11 @@ def _instruction_token_boundary(value: str, index: int) -> bool:
     return index == 0 or not (value[index - 1].isalnum() or value[index - 1] == "_")
 
 
-def _instruction_lexical_lines(values: list[str]) -> tuple[_InstructionLexicalLine, ...]:
+def _instruction_lexical_lines(
+    values: list[str],
+    *,
+    check: Callable[[], None] | None = None,
+) -> tuple[_InstructionLexicalLine, ...]:
     """Scan comments and mask literals once, carrying multiline lexical state."""
 
     lines: list[_InstructionLexicalLine] = []
@@ -252,12 +273,15 @@ def _instruction_lexical_lines(values: list[str]) -> tuple[_InstructionLexicalLi
     literal_closer: str | None = None
     literal_escape_aware = False
     literal_doubled_closer = False
-    for value in values:
+    for line_index, value in enumerate(values):
+        if check is not None and line_index % 128 == 0:
+            check()
         content = _instruction_record_content(value)
         unquoted = list(content)
         member = not content.strip()
         comment_spans: list[_InstructionCommentSpan] = []
         index = 0
+        next_character_check = 0
 
         if block_closer is not None:
             member = True
@@ -280,6 +304,9 @@ def _instruction_lexical_lines(values: list[str]) -> tuple[_InstructionLexicalLi
             index = comment_end
 
         while index < len(content):
+            if check is not None and index >= next_character_check:
+                check()
+                next_character_check = index + 16384
             if literal_closer is not None:
                 if literal_doubled_closer:
                     literal_close = _instruction_find_verbatim_close(content, index)
@@ -289,11 +316,11 @@ def _instruction_lexical_lines(values: list[str]) -> tuple[_InstructionLexicalLi
                     raw_close = content.find(literal_closer, index)
                     literal_close = raw_close if raw_close >= 0 else None
                 if literal_close is None:
-                    _instruction_mask_range(unquoted, index, len(content))
+                    _instruction_mask_range(unquoted, index, len(content), check=check)
                     index = len(content)
                     break
                 literal_end = literal_close + len(literal_closer)
-                _instruction_mask_range(unquoted, index, literal_end)
+                _instruction_mask_range(unquoted, index, literal_end, check=check)
                 index = literal_end
                 literal_closer = None
                 literal_escape_aware = False
@@ -304,14 +331,14 @@ def _instruction_lexical_lines(values: list[str]) -> tuple[_InstructionLexicalLi
             if csharp_verbatim is not None and _instruction_token_boundary(content, index):
                 verbatim_close = _instruction_find_verbatim_close(content, csharp_verbatim.end())
                 if verbatim_close is None:
-                    _instruction_mask_range(unquoted, index, len(content))
+                    _instruction_mask_range(unquoted, index, len(content), check=check)
                     literal_closer = '"'
                     literal_escape_aware = False
                     literal_doubled_closer = True
                     index = len(content)
                     break
                 literal_end = verbatim_close + 1
-                _instruction_mask_range(unquoted, index, literal_end)
+                _instruction_mask_range(unquoted, index, literal_end, check=check)
                 index = literal_end
                 continue
 
@@ -320,14 +347,14 @@ def _instruction_lexical_lines(values: list[str]) -> tuple[_InstructionLexicalLi
                 closer = f'"{rust_raw.group("hashes")}'
                 close = content.find(closer, rust_raw.end())
                 if close < 0:
-                    _instruction_mask_range(unquoted, index, len(content))
+                    _instruction_mask_range(unquoted, index, len(content), check=check)
                     literal_closer = closer
                     literal_escape_aware = False
                     literal_doubled_closer = False
                     index = len(content)
                     break
                 literal_end = close + len(closer)
-                _instruction_mask_range(unquoted, index, literal_end)
+                _instruction_mask_range(unquoted, index, literal_end, check=check)
                 index = literal_end
                 continue
 
@@ -336,14 +363,14 @@ def _instruction_lexical_lines(values: list[str]) -> tuple[_InstructionLexicalLi
                 closer = f'){cpp_raw.group("delimiter")}"'
                 close = content.find(closer, cpp_raw.end())
                 if close < 0:
-                    _instruction_mask_range(unquoted, index, len(content))
+                    _instruction_mask_range(unquoted, index, len(content), check=check)
                     literal_closer = closer
                     literal_escape_aware = False
                     literal_doubled_closer = False
                     index = len(content)
                     break
                 literal_end = close + len(closer)
-                _instruction_mask_range(unquoted, index, literal_end)
+                _instruction_mask_range(unquoted, index, literal_end, check=check)
                 index = literal_end
                 continue
 
@@ -354,14 +381,14 @@ def _instruction_lexical_lines(values: list[str]) -> tuple[_InstructionLexicalLi
             if triple is not None:
                 triple_close = _instruction_find_unescaped(content, triple, index + len(triple))
                 if triple_close is None:
-                    _instruction_mask_range(unquoted, index, len(content))
+                    _instruction_mask_range(unquoted, index, len(content), check=check)
                     literal_closer = triple
                     literal_escape_aware = True
                     literal_doubled_closer = False
                     index = len(content)
                     break
                 literal_end = triple_close + len(triple)
-                _instruction_mask_range(unquoted, index, literal_end)
+                _instruction_mask_range(unquoted, index, literal_end, check=check)
                 index = literal_end
                 continue
 
@@ -376,14 +403,14 @@ def _instruction_lexical_lines(values: list[str]) -> tuple[_InstructionLexicalLi
                     if character == "'" and not continued:
                         index += 1
                         continue
-                    _instruction_mask_range(unquoted, index, len(content))
+                    _instruction_mask_range(unquoted, index, len(content), check=check)
                     if character == "`" or continued:
                         literal_closer = character
                         literal_escape_aware = True
                         literal_doubled_closer = False
                     index = len(content)
                     break
-                _instruction_mask_range(unquoted, index, quote_close + 1)
+                _instruction_mask_range(unquoted, index, quote_close + 1, check=check)
                 index = quote_close + 1
                 continue
 
@@ -458,12 +485,77 @@ def _instruction_directive_window(values: tuple[str, ...]) -> str:
     return " ".join(parts)
 
 
-def _instruction_executable_text(lexical: _InstructionLexicalLine) -> str:
+def _instruction_has_standalone_match(
+    pattern: re.Pattern[str],
+    values: tuple[str, ...],
+    *,
+    check: Callable[[], None] | None = None,
+) -> bool:
+    """Match an anchored directive directly or after any colon-delimited label."""
+
+    if check is not None:
+        check()
+    window = _instruction_directive_window(values)
+    # Both standalone patterns have fixed, bounded tails. Limiting each candidate
+    # prevents a colon-heavy source line from turning label checks quadratic.
+    candidate_limit = 512
+    if pattern.search(window[:candidate_limit]) is not None:
+        return True
+
+    awaiting_label_payload = False
+    for index, character in enumerate(window):
+        if check is not None and index % 16384 == 0:
+            check()
+        if character == ":":
+            awaiting_label_payload = True
+            continue
+        if not awaiting_label_payload or character.isspace():
+            continue
+        if pattern.search(window[index : index + candidate_limit]) is not None:
+            return True
+        awaiting_label_payload = False
+    return False
+
+
+def _instruction_has_standalone_instruction(
+    values: tuple[str, ...],
+    *,
+    check: Callable[[], None] | None = None,
+) -> bool:
+    return _instruction_has_standalone_match(
+        _SOURCE_STANDALONE_INSTRUCTION_PATTERN,
+        values,
+        check=check,
+    )
+
+
+def _instruction_has_standalone_fragment(
+    values: tuple[str, ...],
+    *,
+    check: Callable[[], None] | None = None,
+) -> bool:
+    return _instruction_has_standalone_match(
+        _SOURCE_STANDALONE_FRAGMENT_PATTERN,
+        values,
+        check=check,
+    )
+
+
+def _instruction_executable_text(
+    lexical: _InstructionLexicalLine,
+    *,
+    check: Callable[[], None] | None = None,
+) -> str:
     """Return quote-masked source with every recognized comment span masked."""
 
     output = list(lexical.unquoted_text)
     for span in lexical.comment_spans:
-        _instruction_mask_range(output, span.start, span.end or len(output))
+        _instruction_mask_range(
+            output,
+            span.start,
+            span.end or len(output),
+            check=check,
+        )
     return "".join(output)
 
 
@@ -491,6 +583,8 @@ def _instruction_executable_match_indexes(
 
 def _instruction_line_indexes(
     lines: list[str],
+    *,
+    check: Callable[[], None] | None = None,
 ) -> tuple[
     set[int],
     tuple[_InstructionLexicalLine, ...],
@@ -498,59 +592,96 @@ def _instruction_line_indexes(
 ]:
     """Find single-line and short split-line instruction payloads."""
 
-    lexical_lines = _instruction_lexical_lines(lines)
-    probes = [_instruction_probe(line) for line in lines]
+    lexical_lines = _instruction_lexical_lines(lines, check=check)
+    probes: list[str] = []
+    for index, line in enumerate(lines):
+        if check is not None and index % 128 == 0:
+            check()
+        probes.append(_instruction_probe(line, check=check))
     comment_membership = tuple(line.member for line in lexical_lines)
-    comment_span_texts = tuple(
-        tuple(
-            _instruction_probe(
-                _instruction_record_content(lines[index])[span.start : span.end].strip()
+    comment_span_texts_list: list[tuple[str, ...]] = []
+    for index, lexical in enumerate(lexical_lines):
+        if check is not None and index % 128 == 0:
+            check()
+        span_texts: list[str] = []
+        record_content = _instruction_record_content(lines[index])
+        for span_index, span in enumerate(lexical.comment_spans):
+            if check is not None and span_index % 128 == 0:
+                check()
+            span_texts.append(
+                _instruction_probe(
+                    record_content[span.start : span.end].strip(),
+                    check=check,
+                )
             )
-            for span in lexical.comment_spans
+        comment_span_texts_list.append(tuple(span_texts))
+    comment_span_texts = tuple(comment_span_texts_list)
+    comment_texts_list: list[str | None] = []
+    contextual_probes_list: list[str] = []
+    for index, (probe, lexical) in enumerate(zip(probes, lexical_lines, strict=True)):
+        if check is not None and index % 128 == 0:
+            check()
+        comment_text = (
+            " ".join(comment_span_texts[index])
+            if lexical.comment_spans
+            else probe.strip()
+            if lexical.member
+            else None
         )
-        for index, lexical in enumerate(lexical_lines)
-    )
-    comment_texts = tuple(
-        " ".join(comment_span_texts[index])
-        if lexical.comment_spans
-        else probe.strip()
-        if lexical.member
-        else None
-        for index, (probe, lexical) in enumerate(zip(probes, lexical_lines, strict=True))
-    )
-    contextual_probes = tuple(
-        comment_text if comment_text is not None else _instruction_probe(lexical.unquoted_text)
-        for lexical, comment_text in zip(lexical_lines, comment_texts, strict=True)
-    )
-    executable_probes = tuple(
-        _instruction_probe(_instruction_executable_text(lexical)) for lexical in lexical_lines
-    )
+        comment_texts_list.append(comment_text)
+        contextual_probes_list.append(
+            comment_text
+            if comment_text is not None
+            else _instruction_probe(lexical.unquoted_text, check=check)
+        )
+    comment_texts = tuple(comment_texts_list)
+    contextual_probes = tuple(contextual_probes_list)
+    executable_probes_list: list[str] = []
+    for index, lexical in enumerate(lexical_lines):
+        if check is not None and index % 128 == 0:
+            check()
+        executable_probes_list.append(
+            _instruction_probe(
+                _instruction_executable_text(lexical, check=check),
+                check=check,
+            )
+        )
+    executable_probes = tuple(executable_probes_list)
     executable_matches: set[int] = set()
     for width in (1, 2, 3):
         for start in range(0, len(executable_probes) - width + 1):
+            if check is not None and start % 128 == 0:
+                check()
             indexes = tuple(range(start, start + width))
             executable_matches.update(
                 _instruction_executable_match_indexes(executable_probes, indexes)
             )
-    single_contextual_matches = {
-        index
-        for index, probe in enumerate(contextual_probes)
-        if any(pattern.search(probe) for pattern in _SOURCE_CONTEXT_INSTRUCTION_PATTERNS)
-    }
-    single_standalone_matches = {
-        index
-        for index, probe in enumerate(contextual_probes)
-        if _SOURCE_STANDALONE_INSTRUCTION_PATTERN.search(
-            _instruction_directive_window(((comment_texts[index] or probe),))
-        )
-        is not None
-    }
+    single_contextual_matches: set[int] = set()
+    single_standalone_matches: set[int] = set()
+    for index, probe in enumerate(contextual_probes):
+        if check is not None and index % 128 == 0:
+            check()
+        for pattern_index, pattern in enumerate(_SOURCE_CONTEXT_INSTRUCTION_PATTERNS):
+            if check is not None and pattern_index % 8 == 0:
+                check()
+            if pattern.search(probe) is not None:
+                single_contextual_matches.add(index)
+                break
+        if check is not None:
+            check()
+        if _instruction_has_standalone_instruction(
+            ((comment_texts[index] or probe),),
+            check=check,
+        ):
+            single_standalone_matches.add(index)
     matched = single_contextual_matches | single_standalone_matches | executable_matches
     # Prompt injections commonly split the authority claim and directive across
     # adjacent comments. Match bounded two/three-line windows while retaining the
     # original records for line-preserving replacement.
     for width in (2, 3):
         for start in range(0, len(probes) - width + 1):
+            if check is not None and start % 128 == 0:
+                check()
             indexes = tuple(range(start, start + width))
             single_indexes = tuple(index for index in indexes if index in single_contextual_matches)
             if single_indexes:
@@ -586,22 +717,26 @@ def _instruction_line_indexes(
                 if use_label_authority
                 else _SOURCE_STRONG_CONTEXT_INSTRUCTION_PATTERNS
             )
-            has_context = any(pattern.search(window) for pattern in context_patterns)
+            has_context = False
+            for pattern_index, pattern in enumerate(context_patterns):
+                if check is not None and pattern_index % 8 == 0:
+                    check()
+                if pattern.search(window) is not None:
+                    has_context = True
+                    break
             nonblank_indexes = tuple(
                 index for index in indexes if _instruction_content(probes[index]).strip()
             )
             standalone_comment_indexes = tuple(index for index in indexes if comment_texts[index])
             standalone_indexes = standalone_comment_indexes or nonblank_indexes
-            has_standalone = bool(standalone_indexes) and (
-                _SOURCE_STANDALONE_INSTRUCTION_PATTERN.search(
-                    _instruction_directive_window(
-                        tuple(
-                            (comment_texts[index] or contextual_probes[index])
-                            for index in standalone_indexes
-                        )
-                    )
-                )
-                is not None
+            if check is not None:
+                check()
+            has_standalone = bool(standalone_indexes) and _instruction_has_standalone_instruction(
+                tuple(
+                    (comment_texts[index] or contextual_probes[index])
+                    for index in standalone_indexes
+                ),
+                check=check,
             )
             if not has_context:
                 if not has_standalone:
@@ -616,12 +751,10 @@ def _instruction_line_indexes(
                         if index not in single_standalone_matches
                     )
                     if not any(
-                        _SOURCE_STANDALONE_FRAGMENT_PATTERN.search(
-                            _instruction_directive_window(
-                                ((comment_texts[index] or contextual_probes[index]),)
-                            )
+                        _instruction_has_standalone_fragment(
+                            ((comment_texts[index] or contextual_probes[index]),),
+                            check=check,
                         )
-                        is not None
                         for index in standalone_complements
                     ):
                         continue
@@ -638,12 +771,10 @@ def _instruction_line_indexes(
                         is not None
                         or (
                             has_standalone
-                            and _SOURCE_STANDALONE_FRAGMENT_PATTERN.search(
-                                _instruction_directive_window(
-                                    ((comment_texts[index] or contextual_probes[index]),)
-                                )
+                            and _instruction_has_standalone_fragment(
+                                ((comment_texts[index] or contextual_probes[index]),),
+                                check=check,
                             )
-                            is not None
                         )
                     )
                 )
@@ -652,12 +783,10 @@ def _instruction_line_indexes(
                     index
                     for index in standalone_comment_indexes
                     if index in single_standalone_matches
-                    or _SOURCE_STANDALONE_FRAGMENT_PATTERN.search(
-                        _instruction_directive_window(
-                            ((comment_texts[index] or contextual_probes[index]),)
-                        )
+                    or _instruction_has_standalone_fragment(
+                        ((comment_texts[index] or contextual_probes[index]),),
+                        check=check,
                     )
-                    is not None
                 )
             else:
                 payload_indexes = tuple(
@@ -667,32 +796,52 @@ def _instruction_line_indexes(
                 continue
             matched.update(payload_indexes)
     selected_spans: list[tuple[int, ...]] = []
-    for index, span_texts in enumerate(comment_span_texts):
-        if index not in matched or not span_texts:
+    for index, line_span_texts in enumerate(comment_span_texts):
+        if check is not None and index % 128 == 0:
+            check()
+        if index not in matched or not line_span_texts:
             selected_spans.append(())
             continue
         if index in executable_matches:
             selected_spans.append(())
             continue
-        direct = tuple(
-            span_index
-            for span_index, text in enumerate(span_texts)
-            if any(pattern.search(text) for pattern in _SOURCE_CONTEXT_INSTRUCTION_PATTERNS)
-            or _SOURCE_STANDALONE_INSTRUCTION_PATTERN.search(_instruction_directive_window((text,)))
-            is not None
-        )
+        direct_list: list[int] = []
+        for span_index, text in enumerate(line_span_texts):
+            if check is not None and span_index % 128 == 0:
+                check()
+            contextual_match = False
+            for pattern_index, pattern in enumerate(_SOURCE_CONTEXT_INSTRUCTION_PATTERNS):
+                if check is not None and pattern_index % 8 == 0:
+                    check()
+                if pattern.search(text) is not None:
+                    contextual_match = True
+                    break
+            if contextual_match or _instruction_has_standalone_instruction(
+                (text,),
+                check=check,
+            ):
+                direct_list.append(span_index)
+        direct = tuple(direct_list)
         if direct:
             selected_spans.append(direct)
             continue
-        fragments = tuple(
-            span_index
-            for span_index, text in enumerate(span_texts)
-            if _instruction_has_authority(text)
-            or _SOURCE_CONTEXT_PAYLOAD_FRAGMENT_PATTERN.search(text) is not None
-            or _SOURCE_STANDALONE_FRAGMENT_PATTERN.search(_instruction_directive_window((text,)))
-            is not None
-        )
-        selected_spans.append(fragments or tuple(range(len(span_texts))))
+        fragments_list: list[int] = []
+        for span_index, text in enumerate(line_span_texts):
+            if check is not None and span_index % 128 == 0:
+                check()
+            if (
+                _instruction_has_authority(text)
+                or _SOURCE_CONTEXT_PAYLOAD_FRAGMENT_PATTERN.search(text) is not None
+                or _instruction_has_standalone_fragment(
+                    (text,),
+                    check=check,
+                )
+            ):
+                fragments_list.append(span_index)
+        fragments = tuple(fragments_list)
+        selected_spans.append(fragments or tuple(range(len(line_span_texts))))
+    if check is not None:
+        check()
     return matched, lexical_lines, tuple(selected_spans)
 
 
@@ -714,15 +863,21 @@ def neutralize_source_instructions(
     if check is not None:
         check()
     records = value.splitlines(keepends=True)
-    line_values = [
-        record[:-2]
-        if record.endswith("\r\n")
-        else record[:-1]
-        if record.endswith(("\r", "\n"))
-        else record
-        for record in records
-    ]
-    instruction_lines, lexical_lines, selected_spans = _instruction_line_indexes(line_values)
+    line_values: list[str] = []
+    for index, record in enumerate(records):
+        if check is not None and index % 128 == 0:
+            check()
+        line_values.append(
+            record[:-2]
+            if record.endswith("\r\n")
+            else record[:-1]
+            if record.endswith(("\r", "\n"))
+            else record
+        )
+    instruction_lines, lexical_lines, selected_spans = _instruction_line_indexes(
+        line_values,
+        check=check,
+    )
     redacted = False
     incomplete = False
     redacted_lines: list[int] = []
