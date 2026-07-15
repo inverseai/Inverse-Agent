@@ -174,7 +174,6 @@ class StructuredReviewClient(Protocol):
         schema_name: str,
         schema: Mapping[str, Any],
         max_tokens: int = MAX_MODEL_COMPLETION_TOKENS,
-        reasoning_effort: str | None = None,
     ) -> dict[str, Any]: ...
 
 
@@ -1589,16 +1588,15 @@ class CommitReviewer:
         schema_name: str,
         schema: Mapping[str, Any],
     ) -> dict[str, Any]:
-        # GPT-OSS reasoning tokens share the completion allowance. Prefer low
-        # effort and retry one fresh strict response when reasoning crowds out
-        # the JSON object; never repair or extract a malformed response.
+        # GPT-OSS reasoning tokens share the completion allowance. Retry one
+        # fresh strict response when reasoning crowds out the JSON object;
+        # never repair or extract a malformed response.
         try:
             return self.client.complete_structured_json(
                 system=system,
                 prompt=prompt,
                 schema_name=schema_name,
                 schema=schema,
-                reasoning_effort="low",
             )
         except PlannerProtocolError:
             return self.client.complete_structured_json(
@@ -1606,7 +1604,6 @@ class CommitReviewer:
                 prompt=prompt,
                 schema_name=schema_name,
                 schema=schema,
-                reasoning_effort="low",
             )
 
     @staticmethod

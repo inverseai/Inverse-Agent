@@ -45,7 +45,6 @@ class FakeReviewClient:
         schema_name: str,
         schema: Mapping[str, Any],
         max_tokens: int = 4096,
-        reasoning_effort: str | None = None,
     ) -> dict[str, Any]:
         self.calls.append(
             {
@@ -54,7 +53,6 @@ class FakeReviewClient:
                 "schema_name": schema_name,
                 "schema": schema,
                 "max_tokens": max_tokens,
-                "reasoning_effort": reasoning_effort,
             }
         )
         response = self.responses.pop(0)
@@ -978,7 +976,6 @@ def test_reviewer_uses_two_scouts_and_adjudicates_validated_findings() -> None:
     ]
     assert all(call["schema"] == REVIEW_RESPONSE_SCHEMA for call in client.calls[:2])
     assert client.calls[2]["schema"]["required"] == ["summary", "decisions"]
-    assert all(call["reasoning_effort"] == "low" for call in client.calls)
 
 
 def test_reviewer_retries_one_protocol_invalid_response_without_repair() -> None:
@@ -1004,7 +1001,6 @@ def test_reviewer_retries_one_protocol_invalid_response_without_repair() -> None
     ]
     assert REVIEW_PROTOCOL_RETRY_PROMPT not in str(client.calls[0]["system"])
     assert REVIEW_PROTOCOL_RETRY_PROMPT in str(client.calls[1]["system"])
-    assert all(call["reasoning_effort"] == "low" for call in client.calls)
 
 
 def test_reviewer_fails_closed_after_second_protocol_invalid_response() -> None:

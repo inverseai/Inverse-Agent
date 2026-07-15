@@ -340,7 +340,6 @@ def test_openai_compatible_client_round_trip_and_authorization() -> None:
     assert server.authorization == "Bearer secret-model-key"
     assert server.request_payload and server.request_payload["temperature"] == 0
     assert server.request_payload["max_tokens"] == 4096
-    assert "reasoning_effort" not in server.request_payload
     assert server.request_payload["response_format"] == {
         "type": "json_schema",
         "json_schema": {
@@ -376,14 +375,12 @@ def test_openai_compatible_client_accepts_a_bounded_custom_schema() -> None:
             schema_name="commit_review",
             schema=schema,
             max_tokens=512,
-            reasoning_effort="low",
         )
     finally:
         _stop(server, thread)
 
     assert result == {"verdict": "PASS"}
     assert server.request_payload and server.request_payload["max_tokens"] == 512
-    assert server.request_payload["reasoning_effort"] == "low"
     response_format = server.request_payload["response_format"]
     assert isinstance(response_format, dict)
     assert response_format["json_schema"] == {
@@ -621,14 +618,6 @@ def test_openai_compatible_client_rejects_invalid_custom_schema_controls() -> No
             schema_name="valid_name",
             schema={},
             timeout_seconds=0,
-        )
-    with pytest.raises(ValueError, match="reasoning effort"):
-        client.complete_structured_json(
-            system="system",
-            prompt="prompt",
-            schema_name="valid_name",
-            schema={},
-            reasoning_effort="ultracode",
         )
 
 

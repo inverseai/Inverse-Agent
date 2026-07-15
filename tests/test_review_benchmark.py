@@ -58,9 +58,8 @@ class FakeReviewClient:
         schema_name: str,
         schema: Mapping[str, Any],
         max_tokens: int = 4096,
-        reasoning_effort: str | None = None,
     ) -> dict[str, Any]:
-        del system, prompt, schema_name, schema, max_tokens, reasoning_effort
+        del system, prompt, schema_name, schema, max_tokens
         self.calls += 1
         return self.responses[min(self.calls - 1, len(self.responses) - 1)]
 
