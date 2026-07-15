@@ -990,6 +990,15 @@ def _integrity_failures(
                 report.answer.summary,
                 *report.answer.findings,
                 *report.answer.next_actions,
+                *(
+                    value
+                    for citation in report.answer.citations
+                    for value in (
+                        citation.observation_id,
+                        citation.path,
+                        citation.note,
+                    )
+                ),
             )
         )
     if any(secret and secret in model_visible for secret in case.forbidden_secrets):

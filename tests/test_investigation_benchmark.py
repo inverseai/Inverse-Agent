@@ -1059,6 +1059,18 @@ def test_integrity_failures_cover_policy_protocol_secret_model_and_budgets() -> 
         budget,
         expected_model=None,
     )
+    leaking_citation_note = AgentAnswer(
+        summary="Evidence was inspected.",
+        findings=("A supported finding.",),
+        next_actions=(),
+        citations=(SourceCitation("obs", "x.py", 1, 1, note="secret-canary"),),
+    )
+    assert "unredacted_secret" in _integrity_failures(
+        secret_case,
+        _report(answer=leaking_citation_note),
+        budget,
+        expected_model=None,
+    )
     call = ModelCallRecord(
         request_index=1,
         logical_decision=1,
