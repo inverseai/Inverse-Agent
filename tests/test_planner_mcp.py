@@ -5,8 +5,14 @@ from typing import Any
 import pytest
 
 from inverse_agent.adapters.registry import detect_workspace
-from inverse_agent.mcp_server import create_mcp_server
-from inverse_agent.models import Domain
+from inverse_agent.mcp_server import (
+    _mcp_plan_view,
+    _mcp_profile_view,
+    _mcp_run_view,
+    _mcp_trace_view,
+    create_mcp_server,
+)
+from inverse_agent.models import AutonomyLevel, Domain
 from inverse_agent.planner import StructuredPlanner
 from inverse_agent.service import AgentService
 
@@ -77,7 +83,15 @@ def test_mcp_lists_and_calls_policy_backed_tools(tmp_path: Path) -> None:
     async def exercise() -> None:
         tools = await server.list_tools()
         names = {tool.name for tool in tools}
-        assert {"profile_workspace", "create_run", "start_run", "get_run"} <= names
+        assert {
+            "profile_workspace",
+            "create_run",
+            "start_run",
+            "get_run",
+            "list_runs",
+            "get_plan",
+            "get_trace",
+        } <= names
         assert "approve_run" not in names
         result = await server.call_tool(
             "profile_workspace",
@@ -89,3 +103,82 @@ def test_mcp_lists_and_calls_policy_backed_tools(tmp_path: Path) -> None:
         asyncio.run(exercise())
     finally:
         service.close()
+
+
+def test_mcp_projections_exclude_absolute_paths_approvals_source_and_output(
+    tmp_path: Path,
+) -> None:
+    service = AgentService(
+        workspace_root=FIXTURES,
+        state_dir=tmp_path / "state",
+        approval_secret=SECRET,
+    )
+    try:
+        workspace = FIXTURES / "django_project"
+        profile = _mcp_profile_view(service, detect_workspace(workspace))
+        created = service.create_run(
+            goal="Inspect api_key=secret-model-input",
+            workspace=workspace,
+            domain=Domain.DJANGO,
+            autonomy_level=AutonomyLevel.ADVISORY,
+        )
+        run = _mcp_run_view(service, created)
+    finally:
+        service.close()
+
+    serialized_profile = str(profile)
+    serialized_run = str(run)
+    assert profile["workspace"] == "django_project"
+    assert str(FIXTURES) not in serialized_profile
+    assert "manage.py" not in serialized_profile
+    assert str(FIXTURES) not in serialized_run
+    assert "secret-model-input" not in serialized_run
+    assert {
+        "pending_approval",
+        "trace_path",
+        "answer",
+        "error",
+        "scope_generations",
+        "endpoint_fingerprint",
+    }.isdisjoint(run)
+
+    plan = _mcp_plan_view(
+        {
+            "run_id": "run",
+            "status": "planned",
+            "plan": ["django.check"],
+            "rationale": "Use token=secret-plan-value",
+            "completed_actions": 0,
+        }
+    )
+    assert "secret-plan-value" not in str(plan)
+    assert "[REDACTED_SECRET]" in plan["rationale"]
+
+    trace = _mcp_trace_view(
+        {
+            "run_id": "run",
+            "status": "succeeded",
+            "duration_seconds": 1.5,
+            "actions": [
+                {
+                    "name": "django.check",
+                    "status": "succeeded",
+                    "rule": "django-check",
+                    "returncode": 0,
+                    "reason": "source-bearing reason",
+                    "stdout": "source-bearing output",
+                    "stderr": "private path",
+                }
+            ],
+        }
+    )
+    assert trace["output_omitted"] is True
+    assert trace["actions"] == [
+        {
+            "name": "django.check",
+            "status": "succeeded",
+            "rule": "django-check",
+            "returncode": 0,
+        }
+    ]
+    assert "source-bearing" not in str(trace)

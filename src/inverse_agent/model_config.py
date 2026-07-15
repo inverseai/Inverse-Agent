@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from hashlib import sha256
+from ipaddress import ip_address
 from typing import Any
+from urllib.parse import urlsplit
 
 from inverse_agent.planner import (
     DeterministicPlanner,
@@ -40,6 +43,20 @@ class PlannerConfig:
     timeout_seconds: int = 60
     max_actions: int = 8
     allow_remote: bool = False
+    context_tokens: int | None = None
+    estimator_bytes_per_token: float | None = None
+
+    @property
+    def investigation_available(self) -> bool:
+        if self.context_tokens is None or self.estimator_bytes_per_token is None:
+            return False
+        hostname = urlsplit(self.base_url or "").hostname
+        if hostname is None:
+            return False
+        try:
+            return ip_address(hostname).is_loopback
+        except ValueError:
+            return False
 
     @property
     def fingerprint(self) -> str:
@@ -52,11 +69,13 @@ class PlannerConfig:
             "max_actions": self.max_actions,
             "model": self.model,
             "timeout_seconds": self.timeout_seconds,
+            "context_tokens": self.context_tokens,
+            "estimator_bytes_per_token": self.estimator_bytes_per_token,
         }
         canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
         return f"{self.kind}:sha256:{sha256(canonical.encode()).hexdigest()}"
 
-    def safe_summary(self) -> dict[str, str | int | bool | None]:
+    def safe_summary(self) -> dict[str, str | int | float | bool | None]:
         return {
             "kind": self.kind,
             "model": self.model,
@@ -65,6 +84,9 @@ class PlannerConfig:
             "max_actions": self.max_actions,
             "allow_remote": self.allow_remote,
             "api_key_set": bool(self.api_key),
+            "investigation_available": self.investigation_available,
+            "context_tokens": self.context_tokens,
+            "estimator_bytes_per_token": self.estimator_bytes_per_token,
         }
 
 
@@ -123,6 +145,37 @@ def resolve_planner(
     allow_remote = env_allows_remote and flag_allows_remote
     normalized_url = validate_model_endpoint(base_url, allow_remote=allow_remote)
     api_key = values.get("INVERSE_AGENT_MODEL_API_KEY") or None
+    raw_context = _number_override(
+        args,
+        "model_context_tokens",
+        values.get("INVERSE_AGENT_MODEL_CONTEXT_TOKENS"),
+    )
+    raw_estimator = _float_override(
+        args,
+        "model_estimator_bytes_per_token",
+        values.get("INVERSE_AGENT_MODEL_ESTIMATOR_BYTES_PER_TOKEN"),
+    )
+    if (raw_context is None) != (raw_estimator is None):
+        raise ValueError(
+            "model context tokens and estimator bytes per token must be configured together"
+        )
+    context_tokens: int | None = None
+    estimator_bytes_per_token: float | None = None
+    if raw_context is not None and raw_estimator is not None:
+        context_tokens = _bounded_int(
+            raw_context,
+            name="model context tokens",
+            minimum=16_384,
+            maximum=49_152,
+        )
+        if context_tokens not in {16_384, 24_576, 32_768, 49_152}:
+            raise ValueError("model context tokens must be one of 16384, 24576, 32768, or 49152")
+        estimator_bytes_per_token = float(raw_estimator)
+        if (
+            not math.isfinite(estimator_bytes_per_token)
+            or not 1.0 <= estimator_bytes_per_token <= 4.0
+        ):
+            raise ValueError("model estimator bytes per token must be between 1.0 and 4.0")
     config = PlannerConfig(
         kind="openai-compatible",
         base_url=normalized_url,
@@ -131,6 +184,8 @@ def resolve_planner(
         timeout_seconds=timeout_seconds,
         max_actions=max_actions,
         allow_remote=allow_remote,
+        context_tokens=context_tokens,
+        estimator_bytes_per_token=estimator_bytes_per_token,
     )
     client = OpenAICompatibleClient(
         base_url=normalized_url,
@@ -158,6 +213,16 @@ def _number_override(args: Any | None, name: str, fallback: str | None) -> str |
         if value is not None:
             if not isinstance(value, (str, int)):
                 raise ValueError(f"{name.replace('_', ' ')} must be an integer")
+            return value
+    return fallback
+
+
+def _float_override(args: Any | None, name: str, fallback: str | None) -> str | float | None:
+    if args is not None:
+        value: object = getattr(args, name, None)
+        if value is not None:
+            if not isinstance(value, str | int | float) or isinstance(value, bool):
+                raise ValueError(f"{name.replace('_', ' ')} must be numeric")
             return value
     return fallback
 

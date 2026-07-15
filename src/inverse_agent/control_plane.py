@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import asdict
 from importlib.resources import files
 from pathlib import Path
@@ -12,11 +13,13 @@ from typing import Any, cast
 from pydantic import BaseModel, Field
 
 from inverse_agent.adapters.registry import detect_workspace
+from inverse_agent.attestations import AttestationScope
 from inverse_agent.eval import json_default
-from inverse_agent.models import AutonomyLevel, Domain
+from inverse_agent.models import AutonomyLevel, Domain, RunKind
+from inverse_agent.run_state import is_terminal
 from inverse_agent.service import AgentService, RunRecord
 
-API_VERSION = "2026-07-13.v2"
+API_VERSION = "2026-07-15.v3"
 UI_ASSETS = {
     "app.css": "text/css",
     "app.js": "text/javascript",
@@ -35,17 +38,31 @@ SECURITY_HEADERS = {
     "Cache-Control": "no-store",
     "Permissions-Policy": "camera=(), microphone=(), geolocation=(), payment=(), usb=()",
 }
+_BROWSER_EVENT_PRIVATE_KEYS = frozenset(
+    {
+        "action_digest",
+        "approval_id",
+        "argv",
+        "challenge_id",
+        "evidence_identity",
+        "grant_expires_at",
+        "rule",
+    }
+)
 
 
 class RunCreate(BaseModel):
     goal: str = Field(min_length=1, max_length=4000)
     workspace: str
     domain: Domain
+    kind: RunKind = RunKind.VERIFICATION
     autonomy_level: AutonomyLevel = AutonomyLevel.ASSISTED
+    budget: dict[str, int | float] | None = None
 
 
 class WorkspaceTrustCreate(BaseModel):
     workspace: str
+    scope: AttestationScope = AttestationScope.CODE_EXECUTION
 
 
 class ApprovalCreate(BaseModel):
@@ -58,7 +75,7 @@ def create_app(
     service: AgentService,
     api_token: str,
     approver_tokens: dict[str, str],
-    planner_summary: dict[str, str | int | bool | None] | None = None,
+    planner_summary: dict[str, str | int | float | bool | None] | None = None,
 ) -> Any:
     if not api_token:
         raise ValueError("control-plane API token is required")
@@ -137,6 +154,9 @@ def create_app(
                 "max_actions",
                 "allow_remote",
                 "api_key_set",
+                "investigation_available",
+                "context_tokens",
+                "estimator_bytes_per_token",
             }
         }
         return {
@@ -174,7 +194,9 @@ def create_app(
                 goal=body.goal,
                 workspace=Path(body.workspace),
                 domain=body.domain,
+                kind=body.kind,
                 autonomy_level=body.autonomy_level,
+                budget=body.budget,
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -186,9 +208,29 @@ def create_app(
         approver: str = Depends(require_approver),
     ) -> dict[str, Any]:
         try:
-            return service.trust_workspace(Path(body.workspace), trusted_by=approver)
+            return service.trust_workspace(
+                Path(body.workspace),
+                trusted_by=approver,
+                scope=body.scope,
+            )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.delete("/workspaces/trust")
+    def revoke_workspace(
+        body: WorkspaceTrustCreate,
+        _approver: str = Depends(require_approver),
+    ) -> dict[str, Any]:
+        try:
+            workspace = _resolve_workspace(Path(body.workspace), service.workspace_root)
+            revoked = service.revoke_workspace(workspace, scope=body.scope)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {
+            "workspace": str(workspace),
+            "scope": body.scope.value,
+            "revoked": revoked,
+        }
 
     @app.get("/runs", dependencies=[Depends(require_auth)])
     def list_runs(
@@ -216,15 +258,41 @@ def create_app(
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
-    @app.post("/runs/{run_id}/start", dependencies=[Depends(require_auth)])
+    @app.get("/runs/{run_id}/events", dependencies=[Depends(require_auth)])
+    def get_events(
+        run_id: str,
+        after: int = Query(default=0, ge=0),
+        wait_seconds: float = Query(default=0.0, ge=0.0, le=30.0),
+        limit: int = Query(default=200, ge=1, le=200),
+    ) -> dict[str, Any]:
+        _require_run(service, run_id, HTTPException)
+        deadline = time.monotonic() + wait_seconds
+        events = service.events(run_id, after=after, limit=limit)
+        while not events and time.monotonic() < deadline:
+            if is_terminal(service.get(run_id).status):
+                break
+            time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
+            events = service.events(run_id, after=after, limit=limit)
+        payload = [_browser_event_view(asdict(event)) for event in events]
+        return {
+            "events": payload,
+            "next_cursor": events[-1].sequence if events else after,
+            "has_more": len(events) == limit,
+        }
+
+    @app.post(
+        "/runs/{run_id}/start",
+        dependencies=[Depends(require_auth)],
+        status_code=202,
+    )
     def start_run(run_id: str) -> dict[str, Any]:
         _require_run(service, run_id, HTTPException)
         try:
-            return _run_view(service.start(run_id))
+            return _run_view(service.start(run_id, wait=False))
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
-    @app.post("/runs/{run_id}/approvals")
+    @app.post("/runs/{run_id}/approvals", status_code=202)
     def approve(
         run_id: str,
         body: ApprovalCreate,
@@ -238,8 +306,17 @@ def create_app(
                     approved_by=approver,
                     expected_action_digest=body.action_digest,
                     expected_challenge_id=body.challenge_id,
+                    wait=False,
                 )
             )
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/runs/{run_id}/cancel", dependencies=[Depends(require_auth)])
+    def cancel(run_id: str) -> dict[str, Any]:
+        _require_run(service, run_id, HTTPException)
+        try:
+            return _run_view(service.cancel(run_id))
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
@@ -287,6 +364,23 @@ def _require_run(service: AgentService, run_id: str, exception_type: Any) -> Any
 
 def _json_safe(value: Any) -> dict[str, Any]:
     return cast(dict[str, Any], json.loads(json.dumps(value, default=json_default)))
+
+
+def _strip_browser_event_private(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            str(key): _strip_browser_event_private(item)
+            for key, item in value.items()
+            if str(key) not in _BROWSER_EVENT_PRIVATE_KEYS
+        }
+    if isinstance(value, list):
+        return [_strip_browser_event_private(item) for item in value]
+    return value
+
+
+def _browser_event_view(value: Any) -> dict[str, Any]:
+    safe = _json_safe(value)
+    return cast(dict[str, Any], _strip_browser_event_private(safe))
 
 
 def _load_ui_assets() -> dict[str, bytes]:

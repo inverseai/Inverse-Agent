@@ -1238,6 +1238,17 @@ def test_budget_validation_rejects_inconsistent() -> None:
         AgentBudget(max_decisions=5, max_tool_calls=6).validate()
 
 
+@pytest.mark.parametrize("value", [True, 2.5])
+def test_budget_validation_rejects_non_integer_caps(value: object) -> None:
+    with pytest.raises(ValueError, match="max_decisions must be an integer"):
+        AgentBudget(max_decisions=value).validate()  # type: ignore[arg-type]
+
+
+def test_budget_validation_rejects_non_finite_active_time() -> None:
+    with pytest.raises(ValueError, match="finite number"):
+        AgentBudget(max_active_seconds=float("nan")).validate()
+
+
 def test_physical_budget_counts_real_requests(
     trusted_workspace: tuple[Path, ScopedTrustStore],
 ) -> None:

@@ -2,6 +2,10 @@ param(
     [string]$WorkspaceRoot = (Get-Location).Path,
     [int]$Port = 8765,
     [string]$ApproverId = "$([Environment]::UserName)@local",
+    [ValidateSet(0, 16384, 24576, 32768, 49152)]
+    [int]$ModelContextTokens = 0,
+    [ValidateRange(0.0, 4.0)]
+    [double]$ModelEstimatorBytesPerToken = 0.0,
     [switch]$SkipModelStart
 )
 
@@ -28,8 +32,31 @@ if (-not (Test-Path -LiteralPath $python -PathType Leaf)) {
 }
 
 $resolvedWorkspace = (Resolve-Path -LiteralPath $WorkspaceRoot -ErrorAction Stop).Path
+$hasContextCalibration = $ModelContextTokens -ne 0
+$hasEstimatorCalibration = $ModelEstimatorBytesPerToken -ne 0.0
+if ($hasContextCalibration -ne $hasEstimatorCalibration) {
+    throw "ModelContextTokens and ModelEstimatorBytesPerToken must be supplied together."
+}
+if ($hasEstimatorCalibration -and $ModelEstimatorBytesPerToken -lt 1.0) {
+    throw "ModelEstimatorBytesPerToken must be between 1.0 and 4.0."
+}
 if (-not $SkipModelStart) {
-    & (Join-Path $PSScriptRoot "start-local-model.ps1")
+    if ($hasContextCalibration) {
+        & (Join-Path $PSScriptRoot "start-local-model.ps1") `
+            -ContextLength $ModelContextTokens
+    }
+    else {
+        & (Join-Path $PSScriptRoot "start-local-model.ps1")
+    }
+}
+if ($hasContextCalibration) {
+    $env:INVERSE_AGENT_MODEL_CONTEXT_TOKENS = [string]$ModelContextTokens
+    $env:INVERSE_AGENT_MODEL_ESTIMATOR_BYTES_PER_TOKEN = `
+        [string]$ModelEstimatorBytesPerToken
+}
+else {
+    $env:INVERSE_AGENT_MODEL_CONTEXT_TOKENS = $null
+    $env:INVERSE_AGENT_MODEL_ESTIMATOR_BYTES_PER_TOKEN = $null
 }
 
 $approvalSecret = $env:INVERSE_AGENT_APPROVAL_SECRET

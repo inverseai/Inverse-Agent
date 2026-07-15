@@ -28,7 +28,7 @@ class CommandRequest:
     domain: Domain
     approval_token: str | None = None
     approval_challenge_id: str | None = None
-    timeout_seconds: int | None = None
+    timeout_seconds: float | None = None
 
 
 @dataclass(frozen=True)
@@ -41,6 +41,10 @@ class CommandResult:
     rule: str | None = None
     reason: str = ""
     approval_id: str | None = None
+    stdout_redacted: bool = False
+    stderr_redacted: bool = False
+    stdout_truncated: bool = False
+    stderr_truncated: bool = False
 
 
 @dataclass(frozen=True)
@@ -231,6 +235,10 @@ class LocalRunner:
                 rule=prepared.rule.name,
                 reason=reason,
                 approval_id=approval_id,
+                stdout_redacted=stdout_redaction.blocked,
+                stderr_redacted=stderr_redaction.blocked,
+                stdout_truncated=stdout_truncated,
+                stderr_truncated=stderr_truncated,
             )
 
         status = RunStatus.SUCCEEDED if returncode == 0 else RunStatus.FAILED
@@ -254,6 +262,10 @@ class LocalRunner:
             rule=prepared.rule.name,
             reason=reason,
             approval_id=approval_id,
+            stdout_redacted=stdout_redaction.blocked,
+            stderr_redacted=stderr_redaction.blocked,
+            stdout_truncated=stdout_truncated,
+            stderr_truncated=stderr_truncated,
         )
 
     def _prepare(

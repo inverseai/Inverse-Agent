@@ -23,6 +23,15 @@ FIXTURES = Path(__file__).parent / "fixtures"
 SECRET = b"test-workflow-secret-that-is-at-least-32-bytes"
 
 
+def test_workbench_launcher_clears_omitted_calibration_pair() -> None:
+    script = (Path(__file__).parents[1] / "scripts" / "start-workbench.ps1").read_text(
+        encoding="utf-8"
+    )
+    assert "$hasContextCalibration -ne $hasEstimatorCalibration" in script
+    assert "$env:INVERSE_AGENT_MODEL_CONTEXT_TOKENS = $null" in script
+    assert "$env:INVERSE_AGENT_MODEL_ESTIMATOR_BYTES_PER_TOKEN = $null" in script
+
+
 def _service(
     state_dir: Path,
     planner_fingerprint: str = "deterministic",
@@ -1061,6 +1070,76 @@ def test_cli_start_returns_waiting_status(tmp_path: Path, monkeypatch, capsys) -
     assert code == 2
     assert payload["status"] == RunStatus.WAITING_FOR_APPROVAL.value
 
+    assert (
+        main(
+            [
+                "list-runs",
+                "--workspace-root",
+                str(FIXTURES),
+                "--state-dir",
+                str(state_dir),
+            ]
+        )
+        == 0
+    )
+    listed = json.loads(capsys.readouterr().out)
+    assert [record["run_id"] for record in listed] == [payload["run_id"]]
+
+    assert (
+        main(
+            [
+                "get-plan",
+                payload["run_id"],
+                "--workspace-root",
+                str(FIXTURES),
+                "--state-dir",
+                str(state_dir),
+            ]
+        )
+        == 0
+    )
+    plan = json.loads(capsys.readouterr().out)
+    assert plan["plan"] == ["django.check", "django.test"]
+
+    assert (
+        main(
+            [
+                "events",
+                payload["run_id"],
+                "--workspace-root",
+                str(FIXTURES),
+                "--state-dir",
+                str(state_dir),
+            ]
+        )
+        == 0
+    )
+    events = json.loads(capsys.readouterr().out)
+    assert events["events"]
+    assert events["next_cursor"] == events["events"][-1]["sequence"]
+
+    assert (
+        main(
+            [
+                "decline",
+                payload["run_id"],
+                "--declined-by",
+                "tester",
+                "--action-digest",
+                payload["pending_approval"]["action_digest"],
+                "--challenge-id",
+                payload["pending_approval"]["challenge_id"],
+                "--workspace-root",
+                str(FIXTURES),
+                "--state-dir",
+                str(state_dir),
+            ]
+        )
+        == 0
+    )
+    declined = json.loads(capsys.readouterr().out)
+    assert declined["status"] == RunStatus.REFUSED.value
+
 
 def test_cli_start_allows_state_directory_beside_workspace(
     tmp_path: Path, monkeypatch, capsys
@@ -1098,3 +1177,87 @@ def test_cli_start_allows_state_directory_beside_workspace(
     payload = json.loads(capsys.readouterr().out)
     assert code == 2
     assert payload["status"] == RunStatus.WAITING_FOR_APPROVAL.value
+
+
+def test_cli_scoped_trust_revoke_cancel_and_trace(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv("INVERSE_AGENT_APPROVAL_SECRET", SECRET.decode())
+    state_dir = tmp_path / "state"
+    workspace = FIXTURES / "django_project"
+    common = [
+        "--workspace-root",
+        str(FIXTURES),
+        "--state-dir",
+        str(state_dir),
+    ]
+    assert (
+        main(
+            [
+                "trust-workspace",
+                str(workspace),
+                "--trusted-by",
+                "tester",
+                "--scope",
+                AttestationScope.SOURCE_READ.value,
+                *common,
+            ]
+        )
+        == 0
+    )
+    assert json.loads(capsys.readouterr().out)["scope"] == "source_read"
+    assert (
+        main(
+            [
+                "revoke-workspace",
+                str(workspace),
+                "--scope",
+                AttestationScope.SOURCE_READ.value,
+                *common,
+            ]
+        )
+        == 0
+    )
+    assert json.loads(capsys.readouterr().out)["revoked"] is True
+
+    service = _service(state_dir)
+    try:
+        planned = service.create_run(
+            goal="Cancel before start",
+            workspace=workspace,
+            domain=Domain.DJANGO,
+        )
+        completed = service.create_run(
+            goal="Create a trace",
+            workspace=workspace,
+            domain=Domain.DJANGO,
+            autonomy_level=AutonomyLevel.ADVISORY,
+        )
+        completed = service.start(completed.run_id)
+        assert completed.status == RunStatus.SUCCEEDED.value
+    finally:
+        service.close()
+
+    assert main(["cancel", planned.run_id, *common]) == 0
+    assert json.loads(capsys.readouterr().out)["status"] == RunStatus.CANCELLED.value
+    assert main(["get-trace", completed.run_id, *common]) == 0
+    trace = json.loads(capsys.readouterr().out)
+    assert trace["run_id"] == completed.run_id
+    assert trace["actions"] == []
+
+
+def test_direct_cli_no_wait_is_refused_before_execution(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="running control plane"):
+        main(
+            [
+                "start",
+                str(FIXTURES / "django_project"),
+                "--domain",
+                "django",
+                "--state-dir",
+                str(tmp_path / "state"),
+                "--no-wait",
+            ]
+        )

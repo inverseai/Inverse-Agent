@@ -374,6 +374,7 @@ def test_runner_caps_output(tmp_path: Path) -> None:
     assert result.status == RunStatus.SUCCEEDED
     assert "[OUTPUT_TRUNCATED]" in result.stdout
     assert "truncated stdout" in result.reason
+    assert result.stdout_truncated is True
 
 
 def test_runner_redacts_secret_that_crosses_output_limit(tmp_path: Path) -> None:
@@ -387,6 +388,8 @@ def test_runner_redacts_secret_that_crosses_output_limit(tmp_path: Path) -> None
     assert secret[:20] not in result.stdout
     assert "[REDACTED_SECRET]" in result.stdout
     assert "[OUTPUT_TRUNCATED]" in result.stdout
+    assert result.stdout_redacted is True
+    assert result.stdout_truncated is True
 
 
 def test_runner_does_not_inherit_secret_environment(

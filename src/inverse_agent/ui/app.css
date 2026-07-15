@@ -235,8 +235,10 @@ button:disabled {
 
 .run-status-dot.waiting_for_approval,
 .run-status-dot.approving,
+.run-status-dot.queued,
 .run-status-dot.starting,
-.run-status-dot.running {
+.run-status-dot.running,
+.run-status-dot.cancel_requested {
   background: #d69258;
 }
 
@@ -245,6 +247,8 @@ button:disabled {
 }
 
 .run-status-dot.failed,
+.run-status-dot.incomplete,
+.run-status-dot.cancelled,
 .run-status-dot.refused {
   background: #d26c5a;
 }
@@ -396,6 +400,10 @@ button:disabled {
   border-radius: 5px;
   color: var(--text);
   background: var(--surface-raised);
+}
+
+.kind-wrap select {
+  width: 126px;
 }
 
 .segmented-control {
@@ -571,14 +579,18 @@ button:disabled {
 
 .status-badge.waiting_for_approval,
 .status-badge.approving,
+.status-badge.queued,
 .status-badge.starting,
-.status-badge.running {
+.status-badge.running,
+.status-badge.cancel_requested {
   color: #824124;
   border-color: #e4b89f;
   background: #fff1e8;
 }
 
 .status-badge.failed,
+.status-badge.incomplete,
+.status-badge.cancelled,
 .status-badge.refused {
   color: #843838;
   border-color: #e0adad;
@@ -633,6 +645,113 @@ button:disabled {
   border: 1px solid #e2aa8c;
   border-radius: 8px;
   background: var(--warning-soft);
+}
+
+.answer-panel,
+.budget-panel,
+.activity-panel {
+  margin-top: 18px;
+  padding-top: 16px;
+  border-top: 1px solid var(--line);
+}
+
+.answer-panel h3,
+.budget-panel h3,
+.activity-panel h3 {
+  margin: 0 0 10px;
+  font-size: 14px;
+}
+
+.answer-panel h4 {
+  margin: 16px 0 6px;
+  font-size: 12px;
+}
+
+.finding-list,
+.next-action-list {
+  margin: 11px 0 0;
+  padding-left: 21px;
+  line-height: 1.55;
+}
+
+.finding-list li + li,
+.next-action-list li + li {
+  margin-top: 9px;
+}
+
+.citation {
+  display: grid;
+  gap: 3px;
+  margin-top: 6px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.citation code {
+  color: #245f4b;
+  font-family: "Cascadia Code", "SFMono-Regular", Consolas, monospace;
+}
+
+.budget-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.budget-item {
+  display: grid;
+  gap: 3px;
+  padding: 9px 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface-raised);
+}
+
+.budget-item span {
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.budget-item strong {
+  overflow-wrap: anywhere;
+  font-size: 12px;
+}
+
+.activity-list {
+  display: grid;
+  max-height: 330px;
+  overflow-y: auto;
+  border-top: 1px solid var(--line);
+}
+
+.activity-item {
+  display: grid;
+  grid-template-columns: 42px minmax(0, 1fr);
+  gap: 8px;
+  padding: 9px 0;
+  border-bottom: 1px solid var(--line);
+}
+
+.activity-sequence {
+  color: var(--muted);
+  font-family: "Cascadia Code", "SFMono-Regular", Consolas, monospace;
+  font-size: 10px;
+}
+
+.activity-detail {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.activity-detail strong {
+  font-size: 11px;
+}
+
+.activity-detail span {
+  overflow-wrap: anywhere;
+  color: var(--muted);
+  font-size: 11px;
 }
 
 .approval-panel h3,
@@ -858,6 +977,43 @@ button:disabled {
 .tool-list {
   display: grid;
   gap: 6px;
+}
+
+.consent-list {
+  display: grid;
+  gap: 8px;
+}
+
+.consent-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  padding: 9px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #fafaf8;
+}
+
+.consent-row-copy {
+  display: grid;
+  min-width: 0;
+  gap: 3px;
+}
+
+.consent-row-copy strong {
+  font-size: 11px;
+}
+
+.consent-row-copy span {
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.consent-row button {
+  min-height: 30px;
+  padding: 0 8px;
+  font-size: 10px;
 }
 
 .tool-item {
@@ -1088,9 +1244,12 @@ button:disabled {
   }
 
   .workspace-path,
-  .select-wrap,
-  .inspector-toggle {
+  .domain-wrap {
     display: none;
+  }
+
+  .kind-wrap select {
+    width: 112px;
   }
 
   .segmented-control {
@@ -1138,16 +1297,28 @@ button:disabled {
     flex-wrap: wrap;
   }
 
+  .budget-grid {
+    grid-template-columns: 1fr;
+  }
+
   .approval-actions button {
     flex: 1;
   }
 
   .inspector {
-    display: none;
+    width: min(304px, 88vw);
   }
 }
 
 @media (max-width: 430px) {
+  .workspace-button {
+    display: none;
+  }
+
+  .kind-wrap select {
+    width: 108px;
+  }
+
   .segmented-control {
     width: 122px;
   }

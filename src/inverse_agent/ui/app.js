@@ -2,17 +2,26 @@
 
 const OPERATOR_KEY = "inverse-agent.operator-token";
 const WORKSPACE_KEY = "inverse-agent.workspace";
-const TRANSIENT_STATUSES = new Set(["starting", "running", "approving"]);
-const TERMINAL_STATUSES = new Set(["succeeded", "failed", "refused"]);
+const TRANSIENT_STATUSES = new Set(["queued", "starting", "running", "approving", "cancel_requested"]);
+const TERMINAL_STATUSES = new Set(["succeeded", "incomplete", "cancelled", "failed", "refused"]);
 const STATUS_LABELS = {
   planned: "Planned",
+  queued: "Queued",
   starting: "Starting",
   running: "Running",
   waiting_for_approval: "Waiting for approval",
   approving: "Executing approved action",
+  cancel_requested: "Cancellation requested",
   succeeded: "Succeeded",
+  incomplete: "Incomplete",
+  cancelled: "Cancelled",
   failed: "Failed",
   refused: "Declined"
+};
+
+const SCOPE_LABELS = {
+  source_read: "Local model source access",
+  code_execution: "Approved command execution"
 };
 
 function runStatusLabel(run) {
@@ -40,11 +49,17 @@ const state = {
   runs: [],
   selectedRun: null,
   trace: null,
+  events: [],
+  eventCursor: 0,
+  eventRunId: "",
   mode: 1,
+  kind: "verification",
   domain: "",
   busy: false,
   pendingGoal: "",
   pendingRunId: "",
+  pendingTrustScope: "",
+  pendingRevokeScope: "",
   navigationEpoch: 0,
   pollTimer: 0
 };
@@ -63,6 +78,7 @@ const elements = {
   workspaceButton: document.getElementById("workspace-button"),
   workspaceName: document.getElementById("workspace-name"),
   workspacePath: document.getElementById("workspace-path"),
+  kindSelect: document.getElementById("kind-select"),
   domainSelect: document.getElementById("domain-select"),
   modeButtons: Array.from(document.querySelectorAll("[data-mode]")),
   conversation: document.getElementById("conversation"),
@@ -71,6 +87,8 @@ const elements = {
   sendButton: document.getElementById("send-button"),
   runtimeDetails: document.getElementById("runtime-details"),
   workspaceDetails: document.getElementById("workspace-details"),
+  consentList: document.getElementById("consent-list"),
+  budgetDetails: document.getElementById("budget-details"),
   toolList: document.getElementById("tool-list"),
   settingsDialog: document.getElementById("settings-dialog"),
   settingsClose: document.getElementById("settings-close"),
@@ -82,19 +100,22 @@ const elements = {
   connectButton: document.getElementById("connect-button"),
   forgetButton: document.getElementById("forget-button"),
   trustDialog: document.getElementById("trust-dialog"),
+  trustTitle: document.getElementById("trust-title"),
   trustPath: document.getElementById("trust-path"),
+  trustCopy: document.getElementById("trust-copy"),
   trustStatus: document.getElementById("trust-status"),
   trustCancel: document.getElementById("trust-cancel"),
   trustConfirm: document.getElementById("trust-confirm"),
   toastRegion: document.getElementById("toast-region")
 };
+const mobileInspectorQuery = window.matchMedia("(max-width: 760px)");
 
 function authScope(method, path) {
   const pathname = path.split("?", 1)[0];
   if (pathname === "/approver/session") {
     return "approver";
   }
-  if (method === "POST" && pathname === "/workspaces/trust") {
+  if ((method === "POST" || method === "DELETE") && pathname === "/workspaces/trust") {
     return "approver";
   }
   if (method === "POST" && /\/runs\/[^/]+\/(approvals|decline)$/.test(pathname)) {
@@ -211,10 +232,19 @@ function closeSettings() {
   elements.approverInput.value = "";
 }
 
+function cancelSettings() {
+  state.pendingGoal = "";
+  state.pendingRunId = "";
+  state.pendingTrustScope = "";
+  state.pendingRevokeScope = "";
+  closeSettings();
+}
+
 async function connectFromSettings() {
   const operatorCandidate = elements.operatorInput.value.trim() || state.operatorToken;
   const approverCandidate = elements.approverInput.value.trim();
   const workspaceCandidate = elements.workspaceInput.value.trim();
+  const pendingRevokeCandidate = state.pendingRevokeScope;
   if (!operatorCandidate) {
     elements.settingsStatus.textContent = "Operator token is required";
     return;
@@ -223,6 +253,7 @@ async function connectFromSettings() {
   setBusy(true);
   const previousOperator = state.operatorToken;
   const previousApprover = state.approverToken;
+  let revokeAfterConnect = "";
   state.operatorToken = operatorCandidate;
   try {
     const runtime = await request("/runtime");
@@ -242,9 +273,15 @@ async function connectFromSettings() {
     closeSettings();
     await refreshWorkspace();
     await refreshRuns();
+    chooseRuntimeDefaultKind();
     renderAll();
-    if ((state.pendingGoal || state.pendingRunId) && state.profile && !state.profile.trust.trusted) {
-      openTrustDialog();
+    if (pendingRevokeCandidate) {
+      revokeAfterConnect = pendingRevokeCandidate;
+      state.pendingRevokeScope = "";
+    } else if (state.pendingGoal || state.pendingRunId) {
+      await continuePendingStart();
+    } else if (state.pendingTrustScope) {
+      openTrustDialog(state.pendingTrustScope);
     }
   } catch (error) {
     state.operatorToken = previousOperator;
@@ -253,6 +290,12 @@ async function connectFromSettings() {
   } finally {
     setBusy(false);
     updateConnectionState();
+    if (state.runtime) {
+      renderAll();
+    }
+  }
+  if (revokeAfterConnect) {
+    await revokeWorkspaceScope(revokeAfterConnect);
   }
 }
 
@@ -268,8 +311,11 @@ function forgetAccess() {
   state.runs = [];
   state.selectedRun = null;
   state.trace = null;
+  resetEvents();
   state.pendingGoal = "";
   state.pendingRunId = "";
+  state.pendingTrustScope = "";
+  state.pendingRevokeScope = "";
   state.navigationEpoch += 1;
   closeSettings();
   updateConnectionState();
@@ -328,6 +374,9 @@ async function refreshRuns() {
 async function selectRun(runId, propagateError = false, navigate = true) {
   clearPoll();
   const epoch = navigate ? ++state.navigationEpoch : state.navigationEpoch;
+  if (navigate || state.eventRunId !== runId) {
+    resetEvents(runId);
+  }
   try {
     if (!navigate && (!state.selectedRun || state.selectedRun.run_id !== runId)) {
       return false;
@@ -350,10 +399,15 @@ async function selectRun(runId, propagateError = false, navigate = true) {
       return false;
     }
     state.selectedRun = selectedRun;
+    state.runs = state.runs.map((run) => run.run_id === runId ? selectedRun : run);
     state.trace = trace;
     state.workspace = selectedRun.workspace;
     sessionStorage.setItem(WORKSPACE_KEY, state.workspace);
     if (!await refreshWorkspace(epoch) || epoch !== state.navigationEpoch) {
+      return false;
+    }
+    await refreshEvents(runId, epoch);
+    if (epoch !== state.navigationEpoch) {
       return false;
     }
     renderAll();
@@ -377,6 +431,7 @@ function newTask() {
   state.navigationEpoch += 1;
   state.selectedRun = null;
   state.trace = null;
+  resetEvents();
   state.pendingGoal = "";
   state.pendingRunId = "";
   elements.goalInput.value = "";
@@ -384,6 +439,39 @@ function newTask() {
   renderAll();
   elements.goalInput.focus();
   closeMobileSidebar();
+}
+
+function resetEvents(runId = "") {
+  state.events = [];
+  state.eventCursor = 0;
+  state.eventRunId = runId;
+}
+
+async function refreshEvents(runId, epoch) {
+  if (state.eventRunId !== runId) {
+    resetEvents(runId);
+  }
+  let hasMore = true;
+  let pages = 0;
+  while (hasMore && pages < 20) {
+    const payload = await request(
+      `/runs/${encodeURIComponent(runId)}/events?after=${state.eventCursor}&wait_seconds=0&limit=200`
+    );
+    if (epoch !== state.navigationEpoch || state.eventRunId !== runId) {
+      return false;
+    }
+    const events = Array.isArray(payload.events) ? payload.events : [];
+    state.events.push(...events);
+    if (state.events.length > 400) {
+      state.events = state.events.slice(-400);
+    }
+    state.eventCursor = Number.isInteger(payload.next_cursor)
+      ? payload.next_cursor
+      : state.eventCursor;
+    hasMore = payload.has_more === true;
+    pages += 1;
+  }
+  return true;
 }
 
 async function startGoal() {
@@ -403,13 +491,16 @@ async function startGoal() {
     openSettings("Choose a valid workspace before starting a task");
     return;
   }
-  state.pendingGoal = goal;
-  state.pendingRunId = "";
-  if (state.mode === 1 && !state.profile.trust.trusted) {
-    openTrustDialog();
+  if (
+    state.kind === "investigation" &&
+    (!state.runtime.planner || state.runtime.planner.investigation_available !== true)
+  ) {
+    showToast("Configure a calibrated loopback model before starting an investigation");
     return;
   }
-  await createAndStartRun(goal);
+  state.pendingGoal = goal;
+  state.pendingRunId = "";
+  await continuePendingStart();
 }
 
 async function createAndStartRun(goal) {
@@ -424,6 +515,7 @@ async function createAndStartRun(goal) {
         goal,
         workspace: state.workspace,
         domain: state.domain,
+        kind: state.kind,
         autonomy_level: state.mode
       }
     });
@@ -466,6 +558,9 @@ async function createAndStartRun(goal) {
     handleRequestError(error);
   } finally {
     setBusy(false);
+    if (selectionMatches(createdRunId, epoch)) {
+      renderAll();
+    }
   }
 }
 
@@ -482,9 +577,11 @@ async function startExistingRun(runId) {
   if (state.busy || !run || run.run_id !== runId || run.status !== "planned") {
     return;
   }
-  if (run.autonomy_level !== 0 && state.profile && !state.profile.trust.trusted) {
+  const missing = firstMissingScope(run.kind || "verification", run.autonomy_level);
+  if (missing) {
     state.pendingRunId = runId;
-    openTrustDialog();
+    state.pendingGoal = "";
+    openTrustDialog(missing);
     return;
   }
 
@@ -524,15 +621,70 @@ async function startExistingRun(runId) {
   }
 }
 
-function openTrustDialog() {
+function requiredScopes(kind, mode) {
+  const scopes = [];
+  if (kind === "investigation") {
+    scopes.push("source_read");
+  }
+  if (Number(mode) !== 0) {
+    scopes.push("code_execution");
+  }
+  return scopes;
+}
+
+function hasScope(scope) {
+  return Boolean(
+    state.profile &&
+    state.profile.trust &&
+    state.profile.trust.scopes &&
+    state.profile.trust.scopes[scope]
+  );
+}
+
+function firstMissingScope(kind, mode) {
+  return requiredScopes(kind, mode).find((scope) => !hasScope(scope)) || "";
+}
+
+async function continuePendingStart() {
   if (!state.profile) {
     return;
   }
+  const run = state.pendingRunId && state.selectedRun && state.selectedRun.run_id === state.pendingRunId
+    ? state.selectedRun
+    : null;
+  const kind = run ? run.kind || "verification" : state.kind;
+  const mode = run ? run.autonomy_level : state.mode;
+  const missing = firstMissingScope(kind, mode);
+  if (missing) {
+    openTrustDialog(missing);
+    return;
+  }
+  if (run) {
+    const runId = state.pendingRunId;
+    state.pendingRunId = "";
+    await startExistingRun(runId);
+  } else if (state.pendingGoal) {
+    await createAndStartRun(state.pendingGoal);
+  }
+}
+
+function openTrustDialog(scope) {
+  if (!state.profile) {
+    return;
+  }
+  state.pendingTrustScope = scope;
   if (!state.approverToken) {
-    openSettings("Enter the approver token to trust this workspace", true);
+    openSettings(`Enter the approver token to grant ${SCOPE_LABELS[scope] || scope}`, true);
     return;
   }
   elements.trustPath.textContent = state.profile.root || state.workspace;
+  if (scope === "source_read") {
+    elements.trustTitle.textContent = "Allow local model source access?";
+    elements.trustCopy.textContent = "This permits bounded, redacted source from this workspace to be disclosed to the configured loopback model process. Loopback is not containment: the model server remains an untrusted peer. You can revoke this consent here.";
+  } else {
+    elements.trustTitle.textContent = "Allow approved command execution?";
+    elements.trustCopy.textContent = "This permits separately approved commands to execute workspace code with your user permissions. Every approval remains action-bound. You can revoke this consent here.";
+  }
   elements.trustStatus.textContent = state.approverIdentity ? `Approver: ${state.approverIdentity}` : "";
   if (!elements.trustDialog.open) {
     elements.trustDialog.showModal();
@@ -541,35 +693,62 @@ function openTrustDialog() {
 }
 
 async function trustWorkspace() {
-  if (!state.profile || !state.approverToken) {
+  const scope = state.pendingTrustScope;
+  if (!state.profile || !state.approverToken || !scope) {
     return;
   }
-  let runToStart = "";
-  let goalToStart = "";
   setBusy(true);
   try {
     await request("/workspaces/trust", {
       method: "POST",
-      body: {workspace: state.profile.root || state.workspace}
+      body: {workspace: state.profile.root || state.workspace, scope}
     });
     elements.trustDialog.close();
+    state.pendingTrustScope = "";
     await refreshWorkspace();
     renderAll();
-    if (state.pendingRunId) {
-      runToStart = state.pendingRunId;
-      state.pendingRunId = "";
-    } else if (state.pendingGoal) {
-      goalToStart = state.pendingGoal;
-    }
   } catch (error) {
     elements.trustStatus.textContent = readableError(error);
   } finally {
     setBusy(false);
+    renderAll();
   }
-  if (runToStart) {
-    await startExistingRun(runToStart);
-  } else if (goalToStart) {
-    await createAndStartRun(goalToStart);
+  if (!elements.trustDialog.open && (state.pendingRunId || state.pendingGoal)) {
+    await continuePendingStart();
+  }
+}
+
+async function revokeWorkspaceScope(scope) {
+  if (!state.profile) {
+    return;
+  }
+  if (!state.approverToken) {
+    state.pendingRevokeScope = scope;
+    openSettings(`Enter the approver token to revoke ${SCOPE_LABELS[scope] || scope}`, true);
+    return;
+  }
+  setBusy(true);
+  try {
+    await request("/workspaces/trust", {
+      method: "DELETE",
+      body: {workspace: state.profile.root || state.workspace, scope}
+    });
+    state.pendingRevokeScope = "";
+    await refreshWorkspace();
+    if (state.selectedRun) {
+      await selectRun(state.selectedRun.run_id, false, false);
+    } else {
+      renderAll();
+    }
+    showToast(`${SCOPE_LABELS[scope] || scope} revoked`);
+  } catch (error) {
+    if (error instanceof ApiError && error.status === 401) {
+      state.pendingRevokeScope = scope;
+    }
+    handleRequestError(error);
+  } finally {
+    setBusy(false);
+    renderAll();
   }
 }
 
@@ -627,6 +806,9 @@ async function resolveApproval(action) {
     }
   } finally {
     setBusy(false);
+    if (selectionMatches(runId, epoch)) {
+      renderAll();
+    }
   }
 }
 
@@ -709,6 +891,10 @@ function renderWorkspace() {
   }
   elements.domainSelect.replaceChildren(options);
   elements.domainSelect.disabled = domains.length === 0;
+  elements.kindSelect.value = state.selectedRun
+    ? state.selectedRun.kind || "verification"
+    : state.kind;
+  elements.kindSelect.disabled = Boolean(state.selectedRun);
 }
 
 function renderPlannerNote() {
@@ -717,10 +903,18 @@ function renderPlannerNote() {
     elements.plannerNote.textContent = "Connect to inspect the planner";
     return;
   }
+  if (state.kind === "investigation" && planner.investigation_available !== true) {
+    elements.plannerNote.textContent = "Investigation requires loopback model context calibration";
+    return;
+  }
   if (planner.kind === "deterministic") {
-    elements.plannerNote.textContent = `Standard ${state.domain || "domain"} verification sequence; the goal is recorded`;
+    elements.plannerNote.textContent = state.kind === "investigation"
+      ? "Investigation requires a configured loopback model"
+      : `Standard ${state.domain || "domain"} verification sequence; the goal is recorded`;
   } else {
-    elements.plannerNote.textContent = `${planner.model || "Local model"} selects registered verification tools`;
+    elements.plannerNote.textContent = state.kind === "investigation"
+      ? `${planner.model || "Local model"} investigates with registered read-only tools`
+      : `${planner.model || "Local model"} selects registered verification tools`;
   }
 }
 
@@ -730,8 +924,11 @@ function renderConversation() {
   if (!run) {
     const empty = node("div", "empty-state");
     empty.append(node("div", "empty-mark", "IA"));
-    empty.append(node("h1", "", "Start a verification task"));
-    empty.append(node("p", "", "Run typed engineering checks with explicit workspace trust and human approval. This workbench does not edit source code."));
+    const investigation = state.kind === "investigation";
+    empty.append(node("h1", "", investigation ? "Start an investigation" : "Start a verification task"));
+    empty.append(node("p", "", investigation
+      ? "Investigate with bounded read-only tools, explicit local-model source consent, durable evidence, and human-approved commands."
+      : "Run typed engineering checks with explicit workspace consent and human approval. This workbench does not edit source code."));
     inner.append(empty);
     elements.conversation.replaceChildren(inner);
     return;
@@ -741,7 +938,7 @@ function renderConversation() {
   const runMessage = node("article", "message run-message");
   runMessage.append(node("div", "message-avatar", "IA"));
   const content = node("div", "message-content");
-  content.append(node("div", "message-label", "Verification run"));
+  content.append(node("div", "message-label", run.kind === "investigation" ? "Investigation run" : "Verification run"));
   const heading = node("div", "run-heading");
   heading.append(node("span", `status-badge ${run.status}`, runStatusLabel(run)));
   heading.append(node("span", "message-text", domainLabel(run.domain)));
@@ -749,8 +946,12 @@ function renderConversation() {
 
   if (run.plan_rationale) {
     content.append(node("p", "message-text", run.plan_rationale));
+  } else if (run.status === "queued") {
+    content.append(node("p", "message-text", "Queued for the local worker. Activity will reconnect from the durable event cursor."));
   } else if (run.status === "starting") {
-    content.append(node("p", "message-text", "Preparing the verification plan..."));
+    content.append(node("p", "message-text", run.kind === "investigation" ? "Starting the investigation..." : "Preparing the verification plan..."));
+  } else if (run.status === "cancel_requested") {
+    content.append(node("p", "message-text", "Cancellation will take effect at the next safe workflow boundary."));
   } else if (run.status === "planned") {
     content.append(node("p", "message-text", "This task is saved and ready to start."));
   }
@@ -763,6 +964,12 @@ function renderConversation() {
   if (run.status === "planned") {
     content.append(plannedRunView(run));
   }
+  if (!TERMINAL_STATUSES.has(run.status) && run.status !== "planned") {
+    content.append(activeRunActions(run));
+  }
+  if (run.answer) {
+    content.append(answerView(run.answer));
+  }
   if (run.error) {
     const errorPanel = node("section", "error-panel");
     errorPanel.append(node("h3", "", run.status === "refused" ? "Task declined" : "Task stopped"));
@@ -771,6 +978,12 @@ function renderConversation() {
   }
   if (state.trace && Array.isArray(state.trace.actions)) {
     content.append(traceView(state.trace));
+  }
+  if (run.kind === "investigation" && (run.budget || run.usage)) {
+    content.append(budgetView(run));
+  }
+  if (state.eventRunId === run.run_id && state.events.length) {
+    content.append(activityView(state.events));
   }
   runMessage.append(content);
   inner.append(runMessage);
@@ -821,8 +1034,184 @@ function plannedRunView(run) {
   start.type = "button";
   start.disabled = state.busy;
   start.addEventListener("click", () => startExistingRun(run.run_id));
-  actions.append(start);
+  const cancel = node("button", "quiet-button", "Cancel run");
+  cancel.type = "button";
+  cancel.disabled = state.busy;
+  cancel.addEventListener("click", () => cancelRun(run.run_id));
+  actions.append(cancel, start);
   return actions;
+}
+
+function activeRunActions(run) {
+  const actions = node("div", "run-actions");
+  const cancel = node("button", "danger-quiet-button", run.status === "cancel_requested" ? "Cancellation requested" : "Cancel run");
+  cancel.type = "button";
+  cancel.disabled = state.busy || run.status === "cancel_requested";
+  cancel.addEventListener("click", () => cancelRun(run.run_id));
+  actions.append(cancel);
+  return actions;
+}
+
+async function cancelRun(runId) {
+  if (state.busy || !state.selectedRun || state.selectedRun.run_id !== runId) {
+    return;
+  }
+  clearPoll();
+  const epoch = state.navigationEpoch;
+  setBusy(true);
+  try {
+    const cancelled = await request(`/runs/${encodeURIComponent(runId)}/cancel`, {method: "POST"});
+    await refreshRuns();
+    if (selectionMatches(runId, epoch)) {
+      state.selectedRun = cancelled;
+      await refreshEvents(runId, epoch);
+      renderAll();
+      schedulePoll();
+    } else {
+      renderRuns();
+    }
+  } catch (error) {
+    handleRequestError(error);
+    schedulePoll(runId);
+  } finally {
+    setBusy(false);
+    if (selectionMatches(runId, epoch)) {
+      renderAll();
+    }
+  }
+}
+
+function answerView(answer) {
+  const panel = node("section", "answer-panel");
+  panel.append(node("h3", "", answer.complete === false ? "Investigation answer / incomplete" : "Investigation answer"));
+  panel.append(node("p", "message-text", answer.summary || "No summary was recorded."));
+  const findings = Array.isArray(answer.findings) ? answer.findings : [];
+  const citations = Array.isArray(answer.citations) ? answer.citations : [];
+  if (findings.length) {
+    const list = node("ol", "finding-list");
+    findings.forEach((finding, index) => {
+      const item = node("li", "", finding);
+      if (citations[index]) {
+        item.append(citationView(citations[index]));
+      }
+      list.append(item);
+    });
+    panel.append(list);
+  }
+  const nextActions = Array.isArray(answer.next_actions) ? answer.next_actions : [];
+  if (nextActions.length) {
+    panel.append(node("h4", "", "Next actions"));
+    const list = node("ul", "next-action-list");
+    nextActions.forEach((item) => list.append(node("li", "", item)));
+    panel.append(list);
+  }
+  return panel;
+}
+
+function citationView(citation) {
+  const start = Number(citation.start_line) || 1;
+  const end = Number(citation.end_line) || start;
+  const suffix = start === end ? `:${start}` : `:${start}-${end}`;
+  const view = node("div", "citation");
+  view.append(node("code", "", `${citation.path || "source"}${suffix}`));
+  if (citation.note) {
+    view.append(node("span", "", citation.note));
+  }
+  return view;
+}
+
+function budgetView(run) {
+  const panel = node("section", "budget-panel");
+  panel.append(node("h3", "", "Budget usage"));
+  const grid = node("div", "budget-grid");
+  const metrics = [
+    ["Decisions", "decisions_used", "max_decisions"],
+    ["Tool calls", "tool_calls_used", "max_tool_calls"],
+    ["Commands", "command_calls_used", "max_command_calls"],
+    ["Model requests", "physical_requests_used", "max_physical_requests"],
+    ["Completion tokens", "completion_tokens_charged", "max_completion_tokens"],
+    ["Evidence bytes", "observation_bytes_used", "max_observation_bytes"],
+    ["Active seconds", "active_seconds", "max_active_seconds"]
+  ];
+  metrics.forEach(([label, usedKey, maxKey]) => {
+    const item = node("div", "budget-item");
+    item.append(node("span", "", label));
+    item.append(node("strong", "", `${formatMetric((run.usage || {})[usedKey])} / ${formatMetric((run.budget || {})[maxKey])}`));
+    grid.append(item);
+  });
+  panel.append(grid);
+  return panel;
+}
+
+function formatMetric(value) {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return "0";
+  }
+  return Number.isInteger(value) ? value.toLocaleString() : value.toFixed(1);
+}
+
+function activityView(events) {
+  const panel = node("section", "activity-panel");
+  panel.append(node("h3", "", "Durable activity"));
+  const list = node("div", "activity-list");
+  events.slice(-100).forEach((event) => {
+    const item = node("div", "activity-item");
+    item.append(node("span", "activity-sequence", `#${event.sequence}`));
+    const detail = node("div", "activity-detail");
+    detail.append(node("strong", "", eventLabel(event)));
+    const summary = eventSummary(event);
+    if (summary) {
+      detail.append(node("span", "", summary));
+    }
+    item.append(detail);
+    list.append(item);
+  });
+  panel.append(list);
+  return panel;
+}
+
+function eventLabel(event) {
+  const labels = {
+    "run.created": "Run created",
+    "run.queued": "Worker queued",
+    "run.status": "Status changed",
+    "run.recovered": "Run recovered",
+    "investigation.model_request_started": "Local model request",
+    "investigation.model_request_abandoned": "Model request recovered",
+    "investigation.decision": "Investigation decision",
+    "investigation.observation": "Evidence observed",
+    "investigation.compaction": "History compacted",
+    "investigation.result": "Result recorded",
+    "investigation.finished": "Investigation finished",
+    "approval.dequeued": "Approval claimed",
+    "approval.refreshed": "Approval refreshed"
+  };
+  return labels[event.kind] || String(event.kind || "Activity");
+}
+
+function eventSummary(event) {
+  const payload = event && event.payload && typeof event.payload === "object" ? event.payload : {};
+  if (event.kind === "run.status") {
+    return runStatusLabel({status: payload.status || "unknown", autonomy_level: 1});
+  }
+  if (event.kind === "run.queued") {
+    return payload.work_kind === "resume" ? "Approved action resume" : "Run start";
+  }
+  if (event.kind === "investigation.decision") {
+    const decision = payload.decision && typeof payload.decision === "object" ? payload.decision : {};
+    return payload.decision_kind === "answer"
+      ? "Final answer selected"
+      : `${decision.tool || "tool"}${decision.path ? ` / ${decision.path}` : ""}`;
+  }
+  if (event.kind === "investigation.observation") {
+    const observation = payload.observation && typeof payload.observation === "object" ? payload.observation : {};
+    const flags = [observation.truncated ? "truncated" : "", observation.incomplete ? "incomplete" : "", observation.redacted ? "redacted" : ""].filter(Boolean);
+    return `${observation.tool || "tool"}${observation.path ? ` / ${observation.path}` : ""}${flags.length ? ` / ${flags.join(", ")}` : ""}`;
+  }
+  if (event.kind === "investigation.result" || event.kind === "investigation.finished") {
+    return payload.stop_reason || payload.status || payload.verdict || "Complete";
+  }
+  return "";
 }
 
 function approvalView(challenge) {
@@ -904,12 +1293,47 @@ function renderInspector() {
   elements.workspaceDetails.replaceChildren();
   if (profile) {
     appendFact(elements.workspaceDetails, "Path", profile.root);
-    appendFact(elements.workspaceDetails, "Trusted", profile.trust.trusted ? "Yes" : "No");
+    appendFact(elements.workspaceDetails, "Code consent", hasScope("code_execution") ? "Granted" : "Not granted");
+    appendFact(elements.workspaceDetails, "Source consent", hasScope("source_read") ? "Granted" : "Not granted");
     appendFact(elements.workspaceDetails, "Domains", (profile.domains || []).join(", "));
     const toolchain = profile.toolchain || {};
     Object.keys(toolchain).slice(0, 6).forEach((key) => appendFact(elements.workspaceDetails, key, toolchain[key]));
   } else {
     appendFact(elements.workspaceDetails, "Status", "No workspace selected");
+  }
+
+  const consent = document.createDocumentFragment();
+  for (const scope of ["source_read", "code_execution"]) {
+    const granted = hasScope(scope);
+    const row = node("div", "consent-row");
+    const copy = node("div", "consent-row-copy");
+    copy.append(node("strong", "", SCOPE_LABELS[scope]));
+    copy.append(node("span", "", granted ? "Granted / revocable" : "Not granted"));
+    const button = node("button", granted ? "danger-quiet-button" : "quiet-button", granted ? "Revoke" : "Grant");
+    button.type = "button";
+    button.disabled = !profile || state.busy;
+    button.addEventListener("click", () => {
+      if (granted) {
+        revokeWorkspaceScope(scope);
+      } else {
+        openTrustDialog(scope);
+      }
+    });
+    row.append(copy, button);
+    consent.append(row);
+  }
+  elements.consentList.replaceChildren(consent);
+
+  elements.budgetDetails.replaceChildren();
+  const run = state.selectedRun;
+  if (run && run.kind === "investigation") {
+    appendFact(elements.budgetDetails, "Decisions", `${formatMetric((run.usage || {}).decisions_used)} / ${formatMetric((run.budget || {}).max_decisions)}`);
+    appendFact(elements.budgetDetails, "Tools", `${formatMetric((run.usage || {}).tool_calls_used)} / ${formatMetric((run.budget || {}).max_tool_calls)}`);
+    appendFact(elements.budgetDetails, "Requests", `${formatMetric((run.usage || {}).physical_requests_used)} / ${formatMetric((run.budget || {}).max_physical_requests)}`);
+    appendFact(elements.budgetDetails, "Tokens", `${formatMetric((run.usage || {}).completion_tokens_charged)} / ${formatMetric((run.budget || {}).max_completion_tokens)}`);
+    appendFact(elements.budgetDetails, "Stop reason", run.stop_reason || "Active");
+  } else {
+    appendFact(elements.budgetDetails, "Status", "No investigation selected");
   }
 
   const tools = document.createDocumentFragment();
@@ -968,6 +1392,22 @@ function closeMobileSidebar() {
   elements.shell.classList.remove("sidebar-open");
 }
 
+function setInspectorHidden(hidden) {
+  elements.shell.classList.toggle("inspector-hidden", hidden);
+  elements.inspectorToggle.setAttribute("aria-expanded", String(!hidden));
+}
+
+function syncResponsiveInspector(event = mobileInspectorQuery) {
+  if (event.matches) {
+    setInspectorHidden(true);
+  } else {
+    elements.inspectorToggle.setAttribute(
+      "aria-expanded",
+      String(!elements.shell.classList.contains("inspector-hidden"))
+    );
+  }
+}
+
 function setMode(mode) {
   state.mode = mode;
   elements.modeButtons.forEach((button) => {
@@ -976,13 +1416,38 @@ function setMode(mode) {
     button.setAttribute("aria-pressed", String(active));
   });
   renderPlannerNote();
+  renderConversation();
+}
+
+function setKind(kind) {
+  state.kind = kind === "investigation" ? "investigation" : "verification";
+  elements.kindSelect.value = state.kind;
+  elements.goalInput.placeholder = state.kind === "investigation"
+    ? "Describe an investigation"
+    : "Describe a verification task";
+  renderPlannerNote();
+  renderConversation();
+}
+
+function chooseRuntimeDefaultKind() {
+  if (state.selectedRun || state.pendingGoal || state.pendingRunId) {
+    return;
+  }
+  const planner = state.runtime && state.runtime.planner ? state.runtime.planner : null;
+  setKind(planner && planner.investigation_available === true ? "investigation" : "verification");
 }
 
 elements.newTask.addEventListener("click", newTask);
 elements.settingsButton.addEventListener("click", () => openSettings());
 elements.workspaceButton.addEventListener("click", () => openSettings("", false));
-elements.settingsClose.addEventListener("click", closeSettings);
-elements.settingsCancel.addEventListener("click", closeSettings);
+elements.settingsClose.addEventListener("click", cancelSettings);
+elements.settingsCancel.addEventListener("click", cancelSettings);
+elements.settingsDialog.addEventListener("cancel", () => {
+  state.pendingGoal = "";
+  state.pendingRunId = "";
+  state.pendingTrustScope = "";
+  state.pendingRevokeScope = "";
+});
 elements.connectButton.addEventListener("click", connectFromSettings);
 elements.forgetButton.addEventListener("click", forgetAccess);
 elements.sendButton.addEventListener("click", startGoal);
@@ -997,12 +1462,14 @@ elements.domainSelect.addEventListener("change", () => {
   state.domain = elements.domainSelect.value;
   renderPlannerNote();
 });
+elements.kindSelect.addEventListener("change", () => setKind(elements.kindSelect.value));
 elements.modeButtons.forEach((button) => {
   button.addEventListener("click", () => setMode(Number(button.dataset.mode)));
 });
 function cancelPendingTrust() {
   state.pendingGoal = "";
   state.pendingRunId = "";
+  state.pendingTrustScope = "";
 }
 
 elements.trustCancel.addEventListener("click", () => {
@@ -1013,11 +1480,15 @@ elements.trustDialog.addEventListener("cancel", cancelPendingTrust);
 elements.trustConfirm.addEventListener("click", trustWorkspace);
 elements.sidebarToggle.addEventListener("click", () => elements.shell.classList.add("sidebar-open"));
 elements.mobileBackdrop.addEventListener("click", closeMobileSidebar);
-elements.inspectorToggle.addEventListener("click", () => elements.shell.classList.toggle("inspector-hidden"));
+elements.inspectorToggle.addEventListener("click", () => {
+  setInspectorHidden(!elements.shell.classList.contains("inspector-hidden"));
+});
+mobileInspectorQuery.addEventListener("change", syncResponsiveInspector);
 
 window.addEventListener("beforeunload", clearPoll);
 
 async function bootstrap() {
+  syncResponsiveInspector();
   setMode(1);
   renderAll();
   if (!new Set(["127.0.0.1", "localhost", "::1", "[::1]"]).has(window.location.hostname)) {
@@ -1031,6 +1502,7 @@ async function bootstrap() {
     state.runtime = await request("/runtime");
     await refreshWorkspace();
     await refreshRuns();
+    chooseRuntimeDefaultKind();
     renderAll();
   } catch (error) {
     handleRequestError(error);

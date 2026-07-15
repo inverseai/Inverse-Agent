@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 import builtins
+import hashlib
 import hmac
 import json
 import math
+import os
 import sqlite3
 import sys
 import threading
 import time
 from collections.abc import Callable
+from contextlib import AbstractContextManager
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from secrets import token_hex
@@ -21,6 +24,7 @@ if sys.platform == "win32":
 else:
     import fcntl
 
+from inverse_agent.adapters.registry import detect_workspace
 from inverse_agent.approvals import (
     ApprovalAuthority,
     SqliteApprovalReplayStore,
@@ -35,9 +39,11 @@ from inverse_agent.attestations import (
     migrate_attestation_database,
 )
 from inverse_agent.eval import load_trace
+from inverse_agent.fs_tools import FsToolError, PolicyViolationError
 from inverse_agent.investigation import (
     AgentAnswer,
     AgentBudget,
+    CommandExecution,
     Decision,
     InvestigationLoop,
     InvestigationPlanner,
@@ -61,8 +67,15 @@ from inverse_agent.migrations import (
 from inverse_agent.models import AutonomyLevel, Domain, RunKind, RunSpec, RunStatus
 from inverse_agent.planner import Planner
 from inverse_agent.policies import default_policy
-from inverse_agent.redaction import redact_text
+from inverse_agent.redaction import neutralize_source_instructions, redact_text
 from inverse_agent.run_state import is_terminal, require_transition
+from inverse_agent.runner import (
+    ApprovalChallenge,
+    ApprovalNotRequired,
+    CommandRequest,
+    CommandResult,
+    LocalRunner,
+)
 from inverse_agent.workflow import DurableAgentWorkflow, WorkflowResult
 
 TRACE_PREVIEW_MAX_ACTIONS = 32
@@ -70,6 +83,8 @@ TRACE_PREVIEW_MAX_CHARS = 200_000
 TRACE_PREVIEW_FIELD_CHARS = 4_096
 TRACE_PREVIEW_STREAM_CHARS = 16_384
 APPROVAL_GRANT_TTL_SECONDS = 300
+COMMAND_OBSERVATION_MAX_BYTES = 12_000
+COMMAND_OBSERVATION_MAX_LINES = 160
 
 
 def _safe_preview_text(value: Any) -> str:
@@ -131,6 +146,225 @@ class WorkItem:
     approved_at: float | None = None
     grant_expires_at: float | None = None
     execution_started_at: float | None = None
+
+
+@dataclass(frozen=True)
+class _InvestigationApprovalRequired(Exception):
+    challenge: ApprovalChallenge
+
+
+@dataclass(frozen=True)
+class _InvestigationApprovalExpired(Exception):
+    challenge: ApprovalChallenge
+
+
+@dataclass
+class _InvestigationCommandExecutor:
+    workspace: Path
+    domain: Domain
+    commands: dict[str, tuple[str, ...]]
+    approval_authority: ApprovalAuthority
+    approval_item: WorkItem | None
+    event_sink: Callable[[str, dict[str, Any]], None]
+    trace_sink: Callable[[str, ApprovalChallenge, CommandResult], None]
+    dispatch_guard: Callable[[], AbstractContextManager[bool]]
+    scope_lease_check: Callable[[], None]
+    evidence_identity_key: bytes
+
+    def execute(
+        self,
+        call: ToolCall,
+        *,
+        run_id: str,
+        active_deadline: float,
+    ) -> CommandExecution:
+        command_name = call.command or ""
+        argv = self.commands.get(command_name)
+        if argv is None:
+            raise PolicyViolationError("model selected an unavailable command tool")
+        runner = LocalRunner(default_policy(self.workspace), self.approval_authority)
+        request = CommandRequest(argv=argv, cwd=self.workspace, domain=self.domain)
+        try:
+            challenge = runner.approval_challenge(request)
+        except ApprovalNotRequired as exc:
+            raise PolicyViolationError("investigation commands require a fresh approval") from exc
+        item = self.approval_item
+        if item is None:
+            raise _InvestigationApprovalRequired(challenge)
+        if (
+            item.actor is None
+            or item.action_digest != challenge.action_digest
+            or item.challenge_id is None
+            or item.grant_expires_at is None
+        ):
+            raise PolicyViolationError(
+                "approved investigation command does not match its challenge"
+            )
+        expires_at = int(item.grant_expires_at)
+        rule = next(
+            (
+                candidate
+                for candidate in default_policy(self.workspace).rules_for(self.domain)
+                if candidate.name == challenge.rule
+            ),
+            None,
+        )
+        if rule is None:
+            raise PolicyViolationError("investigation approval references an unknown rule")
+        with self.dispatch_guard():
+            self.scope_lease_check()
+            now = int(time.time())
+            if expires_at <= now:
+                raise _InvestigationApprovalExpired(challenge)
+            remaining = active_deadline - time.monotonic()
+            if remaining <= 0:
+                raise FsToolError("active-time budget expired before command execution")
+            token, claims = self.approval_authority.issue(
+                workspace=self.workspace,
+                domain=self.domain,
+                rule=rule,
+                argv=challenge.argv,
+                approved_by=item.actor,
+                challenge_id=item.challenge_id,
+                now=now,
+                expires_at=expires_at,
+            )
+            self.event_sink(
+                "approval.dequeued",
+                {
+                    "action_ordinal": item.action_ordinal,
+                    "approval_id": claims.approval_id,
+                    "grant_expires_at": expires_at,
+                },
+            )
+            result = runner.run(
+                CommandRequest(
+                    argv=argv,
+                    cwd=self.workspace,
+                    domain=self.domain,
+                    approval_token=token,
+                    approval_challenge_id=item.challenge_id,
+                    timeout_seconds=min(remaining, 3600.0),
+                )
+            )
+        self.approval_item = None
+        if result.status == RunStatus.REFUSED:
+            raise PolicyViolationError(
+                result.reason or "approved investigation command was refused"
+            )
+        self.trace_sink(command_name, challenge, result)
+        observation = _command_observation(
+            run_id=run_id,
+            command_name=command_name,
+            challenge=challenge,
+            challenge_id=item.challenge_id,
+            approval_id=claims.approval_id,
+            result=result,
+            identity_key=self.evidence_identity_key,
+        )
+        return CommandExecution(observation=observation)
+
+
+def _command_observation(
+    *,
+    run_id: str,
+    command_name: str,
+    challenge: ApprovalChallenge,
+    challenge_id: str,
+    approval_id: str,
+    result: CommandResult,
+    identity_key: bytes,
+) -> ToolObservation:
+    returncode = result.returncode if isinstance(result.returncode, int) else "unavailable"
+    status_summary = (
+        "The command exceeded its compute budget."
+        if result.status == RunStatus.FAILED and "compute budget" in result.reason.casefold()
+        else "The command reported a failure."
+        if result.status == RunStatus.FAILED
+        else "The command completed."
+    )
+    header = (
+        f"Command {command_name} {result.status.value} with exit code {returncode}. "
+        f"{status_summary}"
+    )
+    stdout_lines = [line for line in str(result.stdout).splitlines() if line.strip()]
+    stderr_lines = [line for line in str(result.stderr).splitlines() if line.strip()]
+    raw_lines = [header]
+    raw_lines.extend(f"stdout: {line}" for line in stdout_lines)
+    raw_lines.extend(f"stderr: {line}" for line in stderr_lines)
+    full_redaction = redact_text("\n".join(raw_lines))
+    neutralized = neutralize_source_instructions(full_redaction.text)
+    full_text = neutralized.text
+    full_lines = full_text.splitlines()
+    secret_redacted = result.stdout_redacted or result.stderr_redacted or full_redaction.blocked
+    source_truncated = (
+        result.stdout_truncated
+        or result.stderr_truncated
+        or "[OUTPUT_TRUNCATED]" in result.stdout
+        or "[OUTPUT_TRUNCATED]" in result.stderr
+    )
+    encoded = full_text.encode("utf-8")
+    incomplete = (
+        source_truncated
+        or secret_redacted
+        or neutralized.redacted
+        or neutralized.incomplete
+        or len(encoded) > COMMAND_OBSERVATION_MAX_BYTES
+        or len(full_lines) > COMMAND_OBSERVATION_MAX_LINES
+    )
+    selected = full_lines
+    if incomplete or len(full_lines) > COMMAND_OBSERVATION_MAX_LINES:
+        error_terms = ("error", "failed", "fatal", "exception", "denied", "traceback")
+        classified = [
+            line for line in full_lines[1:] if any(term in line.casefold() for term in error_terms)
+        ][:40]
+        selected = [
+            full_lines[0] if full_lines else "[COMMAND_STATUS_REDACTED]",
+            *full_lines[1:51],
+            *classified,
+            *full_lines[-50:],
+            "[DISTILLED_OUTPUT_OMITTED]",
+        ]
+        selected = list(dict.fromkeys(selected))[:COMMAND_OBSERVATION_MAX_LINES]
+    distilled = "\n".join(selected)
+    raw = distilled.encode("utf-8")
+    if len(raw) > COMMAND_OBSERVATION_MAX_BYTES:
+        distilled = raw[:COMMAND_OBSERVATION_MAX_BYTES].decode("utf-8", errors="ignore")
+        incomplete = True
+    display_lines = tuple(
+        f"{index}: {line}" for index, line in enumerate(distilled.splitlines(), start=1)
+    )
+    content_hash = hashlib.sha256(full_text.encode("utf-8")).hexdigest()
+    evidence_identity = hmac.digest(
+        identity_key,
+        f"{run_id}\0{command_name}\0{challenge.action_digest}\0{content_hash}".encode(),
+        "sha256",
+    ).hex()
+    return ToolObservation(
+        observation_id=f"obs_command_{token_hex(16)}",
+        tool="run_command",
+        path=f"command/{command_name}",
+        content_hash=content_hash,
+        text=distilled,
+        lines=display_lines,
+        truncated=incomplete,
+        incomplete=incomplete,
+        redacted=secret_redacted or neutralized.redacted,
+        metadata={
+            "citable_command": not incomplete and bool(display_lines),
+            "instruction_neutralized": neutralized.redacted,
+            "output_redacted": secret_redacted,
+            "output_truncated": source_truncated,
+            "command_name": command_name,
+            "status": result.status.value,
+            "returncode": result.returncode,
+            "rule": challenge.rule,
+            "approval_id": approval_id,
+            "action_digest": challenge.action_digest,
+            "challenge_id": challenge_id,
+            "evidence_identity": evidence_identity,
+        },
+    )
 
 
 class RunStore:
@@ -775,6 +1009,17 @@ class RunStore:
                     created_at=now,
                 )
 
+    def attach_trace(self, run_id: str, trace_path: Path) -> RunRecord:
+        now = time.time()
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "UPDATE runs SET trace_path=?, updated_at=? WHERE run_id=?",
+                (str(trace_path.resolve()), now, run_id),
+            )
+            if cursor.rowcount != 1:
+                raise KeyError(f"unknown run: {run_id}")
+        return self.require(run_id)
+
     def complete_investigation(
         self,
         run_id: str,
@@ -795,7 +1040,8 @@ class RunStore:
             cursor = connection.execute(
                 """
                 UPDATE runs SET status=?, stop_reason=?, error=?, answer=?, usage=?,
-                    updated_at=?, finished_at=? WHERE run_id=? AND status=?
+                    pending_approval=NULL, updated_at=?, finished_at=?
+                WHERE run_id=? AND status=?
                 """,
                 (
                     target.value,
@@ -1268,6 +1514,7 @@ class AgentService:
             raise ValueError("state directory must be outside the workspace root")
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self._scope_dispatch_lock = threading.RLock()
+        self._trace_write_lock = threading.Lock()
         state_lease = StateDirectoryLease(self.state_dir / "service.lock")
         workflow: DurableAgentWorkflow | None = None
         try:
@@ -1374,7 +1621,10 @@ class AgentService:
         if kind == RunKind.INVESTIGATION:
             defaults = asdict(self.investigation_budget)
             defaults.update(selected_budget)
-            parsed_budget = AgentBudget(**defaults)
+            try:
+                parsed_budget = AgentBudget(**defaults)
+            except TypeError as exc:
+                raise ValueError("investigation budget contains unknown fields") from exc
             parsed_budget.validate()
             selected_budget = asdict(parsed_budget)
         spec = RunSpec(
@@ -1575,6 +1825,71 @@ class AgentService:
             "completed_actions": record.completed_actions,
         }
 
+    def _append_investigation_command_trace(
+        self,
+        run_id: str,
+        command_name: str,
+        challenge: ApprovalChallenge,
+        result: CommandResult,
+    ) -> None:
+        record = self.runs.require(run_id)
+        trace_path = (self.state_dir / "traces" / f"{run_id}.trace.json").resolve()
+        trace_path.parent.mkdir(parents=True, exist_ok=True)
+        with self._trace_write_lock:
+            if trace_path.is_file():
+                trace = load_trace(trace_path)
+            else:
+                trace = {
+                    "task_input": record.goal,
+                    "domain": record.domain,
+                    "baseline": "durable-investigation-workflow-v02",
+                    "run_id": run_id,
+                    "actions": [],
+                    "approvals": [],
+                    "artifacts": [],
+                    "cost": {},
+                    "planner_fingerprint": record.planner_fingerprint,
+                    "plan": list(record.plan),
+                    "plan_rationale": record.plan_rationale,
+                }
+            actions = trace.get("actions")
+            if not isinstance(actions, list):
+                raise ValueError("investigation trace actions are unavailable")
+            actions.append(
+                {
+                    "name": command_name,
+                    "metadata": {
+                        "status": result.status.value,
+                        "rule": challenge.rule,
+                        "reason": result.reason,
+                        "returncode": result.returncode,
+                        "approval_id": result.approval_id,
+                        "stdout": result.stdout,
+                        "stderr": result.stderr,
+                        "stdout_redacted": result.stdout_redacted,
+                        "stderr_redacted": result.stderr_redacted,
+                        "stdout_truncated": result.stdout_truncated,
+                        "stderr_truncated": result.stderr_truncated,
+                    },
+                    "at": time.time(),
+                }
+            )
+            trace["status"] = record.status
+            trace["duration_seconds"] = max(
+                0.0,
+                time.time() - (record.started_at or record.created_at),
+            )
+            temporary = trace_path.with_name(f".{trace_path.name}.{token_hex(8)}.tmp")
+            try:
+                temporary.write_text(
+                    json.dumps(trace, sort_keys=True, indent=2),
+                    encoding="utf-8",
+                )
+                os.replace(temporary, trace_path)
+            finally:
+                temporary.unlink(missing_ok=True)
+        self.runs.attach_trace(run_id, trace_path)
+
     def trace_preview(self, run_id: str) -> dict[str, Any]:
         record = self.runs.require(run_id)
         trace_path = (self.state_dir / "traces" / f"{record.run_id}.trace.json").resolve()
@@ -1673,8 +1988,8 @@ class AgentService:
             raise ValueError("planner configuration changed while the run was queued")
         self._require_scope_lease(record)
         if record.kind == RunKind.INVESTIGATION.value:
-            if item.kind != "start":
-                raise ValueError("investigation command resumes are not yet represented")
+            if item.kind not in {"start", "resume"}:
+                raise ValueError("investigation work item kind is invalid")
             self._execute_investigation(record, item)
             return
         self._execute_verification(record, item)
@@ -2257,7 +2572,25 @@ class AgentService:
     def _execute_investigation(self, record: RunRecord, item: WorkItem) -> None:
         if self.investigation_planner_factory is None:
             raise ValueError("investigation planner is not configured")
-        running = self.runs.set_running(record.run_id, expected_status=RunStatus.STARTING)
+        expected = RunStatus.STARTING if item.kind == "start" else RunStatus.APPROVING
+        if RunStatus(record.status) != expected:
+            return
+        if item.kind == "resume":
+            if (
+                item.actor is None
+                or item.action_digest is None
+                or item.challenge_id is None
+                or item.grant_expires_at is None
+            ):
+                raise ValueError("approved investigation resume work item is incomplete")
+            if time.time() >= item.grant_expires_at:
+                self.runs.refresh_approval(
+                    record.run_id,
+                    expected=RunStatus.APPROVING,
+                    reason="approval grant expired before investigation command dequeue",
+                )
+                return
+        running = self.runs.set_running(record.run_id, expected_status=expected)
         if running.status != RunStatus.RUNNING.value:
             return
         self.runs.mark_work_started(item.work_id)
@@ -2271,6 +2604,11 @@ class AgentService:
         if recovery.in_flight_request is not None:
             raise RuntimeError("in-flight model request was not reconciled at startup")
         progress = dict(baseline)
+        evidence_identity_key = hmac.digest(
+            self._evidence_identity_root,
+            running.run_id.encode("utf-8"),
+            "sha256",
+        )
 
         def event_sink(kind: str, payload: dict[str, object]) -> None:
             for name in (
@@ -2296,6 +2634,56 @@ class AgentService:
                 event_payload=dict(payload),
             )
 
+        profile = detect_workspace(Path(running.workspace))
+        command_prefix = f"{running.domain}."
+        commands = {
+            name: tuple(argv)
+            for name, argv in profile.commands.items()
+            if name.startswith(command_prefix)
+        }
+
+        def command_event_sink(kind: str, payload: dict[str, Any]) -> None:
+            self.runs.append_event(running.run_id, kind, payload)
+
+        def command_trace_sink(
+            command_name: str,
+            challenge: ApprovalChallenge,
+            result: CommandResult,
+        ) -> None:
+            self._append_investigation_command_trace(
+                running.run_id,
+                command_name,
+                challenge,
+                result,
+            )
+
+        def command_scope_lease_check() -> None:
+            current = self.runs.require(running.run_id)
+            if current.status != RunStatus.RUNNING.value:
+                raise ValueError("investigation command is no longer dispatchable")
+            self._require_scope_lease(current)
+
+        command_executor = (
+            _InvestigationCommandExecutor(
+                workspace=Path(running.workspace),
+                domain=Domain(running.domain),
+                commands=commands,
+                approval_authority=self.approval_authority,
+                approval_item=(
+                    item
+                    if item.kind == "resume" and isinstance(recovery.resume_decision, ToolCall)
+                    else None
+                ),
+                event_sink=command_event_sink,
+                trace_sink=command_trace_sink,
+                dispatch_guard=lambda: self._scope_dispatch_lock,
+                scope_lease_check=command_scope_lease_check,
+                evidence_identity_key=evidence_identity_key,
+            )
+            if running.autonomy_level != AutonomyLevel.ADVISORY.value
+            else None
+        )
+
         loop = InvestigationLoop(
             planner=planner,
             trust=_GenerationBoundTrust(
@@ -2303,31 +2691,50 @@ class AgentService:
                 dict(running.scope_generations or {}),
             ),
             budget=budget,
+            command_executor=command_executor,
             event_sink=event_sink,
             cancel_requested=lambda: self.runs.is_cancel_requested(running.run_id),
-            evidence_identity_key=hmac.digest(
-                self._evidence_identity_root,
-                running.run_id.encode("utf-8"),
-                "sha256",
-            ),
+            evidence_identity_key=evidence_identity_key,
         )
-        report = loop.run(
-            run_id=running.run_id,
-            goal=running.goal,
-            workspace=Path(running.workspace),
-            initial_catalog=recovery.catalog,
-            prior_usage=baseline,
-            initial_evidence_identities=recovery.evidence_identities,
-            prior_tool_calls=recovery.prior_tool_calls,
-            resume_decision=recovery.resume_decision,
-            initial_model_calls=recovery.model_calls,
-            initial_transport_retries_used=recovery.resume_transport_retries_used,
-            initial_schema_retries_used=recovery.resume_schema_retries_used,
-            initial_physical_attempts_used=recovery.resume_physical_attempts_used,
-            initial_resume_request_kind=recovery.resume_request_kind,
-            initial_compaction_notes=recovery.compaction_notes,
-            initial_compacted_observation_ids=recovery.compacted_observation_ids,
-        )
+        try:
+            report = loop.run(
+                run_id=running.run_id,
+                goal=running.goal,
+                workspace=Path(running.workspace),
+                initial_catalog=recovery.catalog,
+                prior_usage=baseline,
+                initial_evidence_identities=recovery.evidence_identities,
+                prior_tool_calls=recovery.prior_tool_calls,
+                resume_decision=recovery.resume_decision,
+                initial_model_calls=recovery.model_calls,
+                initial_transport_retries_used=recovery.resume_transport_retries_used,
+                initial_schema_retries_used=recovery.resume_schema_retries_used,
+                initial_physical_attempts_used=recovery.resume_physical_attempts_used,
+                initial_resume_request_kind=recovery.resume_request_kind,
+                initial_compaction_notes=recovery.compaction_notes,
+                initial_compacted_observation_ids=recovery.compacted_observation_ids,
+            )
+        except _InvestigationApprovalExpired:
+            self.runs.refresh_approval(
+                running.run_id,
+                expected=RunStatus.RUNNING,
+                reason="approval grant expired at investigation command boundary",
+            )
+            return
+        except _InvestigationApprovalRequired as pause:
+            challenge_id = token_hex(16)
+            self.runs.transition(
+                running.run_id,
+                expected=RunStatus.RUNNING,
+                target=RunStatus.WAITING_FOR_APPROVAL,
+                pending_approval={
+                    "kind": "command_approval",
+                    "challenge_id": challenge_id,
+                    "action_ordinal": int(progress.get("tool_calls_used", 0)),
+                    **asdict(pause.challenge),
+                },
+            )
+            return
         current = self.runs.require(running.run_id)
         if (
             report.verdict == InvestigationVerdict.CANCELLED
@@ -2480,8 +2887,32 @@ class AgentService:
                                 recovery.result,
                             ),
                         )
-                elif pending_work is not None and pending_work.kind == "start":
-                    self.runs.recover_to_queued(record.run_id, expected=status)
+                elif (
+                    status == RunStatus.WAITING_FOR_APPROVAL
+                    and isinstance(recovery.resume_decision, ToolCall)
+                    and record.pending_approval is not None
+                    and pending_work is None
+                ):
+                    continue
+                elif pending_work is not None and pending_work.kind in {"start", "resume"}:
+                    command_outcome_is_unknown = (
+                        pending_work.kind == "resume"
+                        and pending_work.execution_started_at is not None
+                        and isinstance(recovery.resume_decision, ToolCall)
+                    )
+                    if command_outcome_is_unknown:
+                        self.runs.discard_pending_work(
+                            record.run_id,
+                            reason="approved investigation command outcome may be unknown",
+                        )
+                        self.runs.mark_failed(
+                            record.run_id,
+                            "investigation was interrupted after an approved command dispatch; "
+                            "command outcome may be unknown",
+                            expected_status=record.status,
+                        )
+                    else:
+                        self.runs.recover_to_queued(record.run_id, expected=status)
                 else:
                     self.runs.discard_pending_work(
                         record.run_id,

@@ -154,6 +154,23 @@ class AgentBudget:
     max_active_seconds: float = 600.0
 
     def validate(self) -> None:
+        for name in (
+            "max_decisions",
+            "max_tool_calls",
+            "max_command_calls",
+            "max_physical_requests",
+            "max_completion_tokens",
+            "max_observation_bytes",
+        ):
+            value = getattr(self, name)
+            if not isinstance(value, int) or isinstance(value, bool):
+                raise ValueError(f"{name} must be an integer")
+        if (
+            not isinstance(self.max_active_seconds, int | float)
+            or isinstance(self.max_active_seconds, bool)
+            or not math.isfinite(float(self.max_active_seconds))
+        ):
+            raise ValueError("max_active_seconds must be a finite number")
         if self.max_tool_calls > self.max_decisions:
             raise ValueError("tool-call budget cannot exceed the decision budget")
         if not 1 <= self.max_decisions <= MAX_DECISIONS_CEILING:

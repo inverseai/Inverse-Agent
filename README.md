@@ -35,15 +35,19 @@ uv run mypy
 
 ### Engineering Workbench
 
-Start the local GPT-OSS-20B model and Codex-style workbench together. The workspace root is the boundary within which engineers can select Android, iOS, Django, C/C++, or PyTorch projects.
+Start the local GPT-OSS-20B model and Codex-style workbench together. The workspace root is the boundary within which engineers can select Android, iOS, Django, C/C++, or PyTorch projects. Investigation mode is enabled only when the loopback model's measured context and conservative bytes-per-token estimator are supplied together.
 
 ```powershell
-.\scripts\start-workbench.ps1 -WorkspaceRoot "D:\Office Repos"
+.\scripts\start-workbench.ps1 -WorkspaceRoot "D:\Office Repos" `
+  -ModelContextTokens 32768 `
+  -ModelEstimatorBytesPerToken 2.0
 ```
+
+The numbers above are examples, not defaults: use the pair produced by calibration for the exact local model, LM Studio build, and GPU configuration. Omitting both keeps verification available and leaves investigation disabled.
 
 Open the printed loopback URL and enter the two session credentials shown in the same terminal. The operator token can profile workspaces and create tasks. The separate approver token is required to trust a workspace, approve a command, or decline a pending command. Operator access lasts only for the browser tab; approval access is memory-only and must be re-entered after a reload.
 
-The workbench exposes the capabilities implemented in v0.1: advisory planning and approval-gated verification runs. It shows the model rationale, registered-tool plan, exact command awaiting approval, durable task state, bounded output, and redacted traces. It does not yet edit source code or provide an unrestricted shell.
+The workbench exposes advisory and approval-gated verification plus bounded read-only investigation. Investigation requires revocable `source_read` consent; assisted investigation also requires `code_execution`, and every frozen command still receives a fresh action-bound approval. The UI reconstructs durable events, budgets, evidence citations, final answers, cancellation, and bounded redacted traces after reconnect. It does not edit source code or provide an unrestricted shell.
 
 Configure local secrets. The approval secret must be stable across CLI invocations because it signs resume capabilities; these credentials are not inherited by workspace subprocesses.
 
@@ -82,7 +86,7 @@ The FastAPI control plane serves the workbench and API from the same `127.0.0.1`
 uv run inverse-agent serve --workspace-root D:\work
 ```
 
-The MCP stdio server exposes profiling, run creation, run start, and run status. It intentionally does not expose workspace trust or approval issuance, so a model cannot approve its own actions.
+The MCP stdio server exposes safe projections for profiling, run creation/start/status/listing, plans, and bounded traces. It omits absolute paths, approval challenges, command output, workspace trust, and approval issuance, so a model cannot approve its own actions or recover source-bearing browser data through MCP.
 
 ```powershell
 uv run inverse-agent mcp --workspace-root D:\work
@@ -96,10 +100,10 @@ uv run inverse-agent mcp --workspace-root D:\work
 
 ### Local GPT-OSS-20B
 
-On a 24 GB NVIDIA GPU, load GPT-OSS-20B in LM Studio with a conservative 16K context and a stable API identifier:
+Load GPT-OSS-20B in LM Studio with the context length selected by the calibration gate and a stable API identifier:
 
 ```powershell
-.\scripts\start-local-model.ps1
+.\scripts\start-local-model.ps1 -ContextLength 32768
 ```
 
 Configure Inverse-Agent in the same shell and verify structured planning before starting a run:
@@ -107,11 +111,13 @@ Configure Inverse-Agent in the same shell and verify structured planning before 
 ```powershell
 $env:INVERSE_AGENT_MODEL_NAME = "inverse-gpt-oss-20b"
 $env:INVERSE_AGENT_MODEL_BASE_URL = "http://127.0.0.1:1234/v1"
+$env:INVERSE_AGENT_MODEL_CONTEXT_TOKENS = "32768"
+$env:INVERSE_AGENT_MODEL_ESTIMATOR_BYTES_PER_TOKEN = "2.0"
 uv run inverse-agent model-check
 uv run inverse-agent start D:\work\django-app --domain django
 ```
 
-When neither model variable is present, Inverse-Agent remains deterministic. Model name and base URL must be configured together; model failures stop planning and never silently fall back. `evaluate` remains deterministic unless `--use-model` is supplied explicitly.
+When neither model variable is present, Inverse-Agent remains deterministic. Model name and base URL must be configured together; investigation additionally requires the calibrated context/estimator pair and a numeric loopback endpoint. Model failures stop planning and never silently fall back. `evaluate` remains deterministic unless `--use-model` is supplied explicitly.
 
 Remote model endpoints are denied by default. They require HTTPS, `INVERSE_AGENT_MODEL_ALLOW_REMOTE=1`, and the `--model-allow-remote` flag together. API keys are accepted only through `INVERSE_AGENT_MODEL_API_KEY`, never through a command-line flag.
 

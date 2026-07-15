@@ -46,7 +46,14 @@
           <span class="workspace-path" id="workspace-path"></span>
         </button>
         <div class="topbar-controls">
-          <label class="select-wrap">
+          <label class="select-wrap kind-wrap">
+            <span class="sr-only">Task kind</span>
+            <select id="kind-select" aria-label="Task kind">
+              <option value="investigation">Investigation</option>
+              <option value="verification">Verification</option>
+            </select>
+          </label>
+          <label class="select-wrap domain-wrap">
             <span class="sr-only">Domain</span>
             <select id="domain-select" aria-label="Domain"></select>
           </label>
@@ -54,7 +61,7 @@
             <button type="button" data-mode="0">Advisory</button>
             <button type="button" data-mode="1" class="active">Assisted</button>
           </div>
-          <button class="icon-button inspector-toggle" id="inspector-toggle" type="button" title="Toggle inspector" aria-label="Toggle inspector">&#8943;</button>
+          <button class="icon-button inspector-toggle" id="inspector-toggle" type="button" title="Toggle inspector" aria-label="Toggle inspector" aria-expanded="true">&#8943;</button>
         </div>
       </header>
 
@@ -79,6 +86,14 @@
       <section class="inspector-section">
         <div class="section-heading">Workspace</div>
         <dl class="detail-list" id="workspace-details"></dl>
+      </section>
+      <section class="inspector-section">
+        <div class="section-heading">Consent</div>
+        <div class="consent-list" id="consent-list"></div>
+      </section>
+      <section class="inspector-section">
+        <div class="section-heading">Run budget</div>
+        <dl class="detail-list" id="budget-details"></dl>
       </section>
       <section class="inspector-section">
         <div class="section-heading">Available tools</div>
@@ -120,14 +135,14 @@
 
   <dialog class="modal consent-modal" id="trust-dialog" aria-labelledby="trust-title">
     <div class="consent-mark" aria-hidden="true">!</div>
-    <h2 id="trust-title">Trust this workspace?</h2>
+    <h2 id="trust-title">Grant workspace consent?</h2>
     <p class="consent-path" id="trust-path"></p>
-    <p>Approved verification commands can execute code from this directory with your user permissions. Trust cannot be revoked from this UI.</p>
+    <p id="trust-copy"></p>
     <div class="modal-status" id="trust-status" role="status"></div>
     <div class="modal-actions">
       <div class="action-spacer"></div>
       <button class="quiet-button" id="trust-cancel" type="button">Cancel</button>
-      <button class="warning-button" id="trust-confirm" type="button">Trust workspace</button>
+      <button class="warning-button" id="trust-confirm" type="button">Grant consent</button>
     </div>
   </dialog>
 

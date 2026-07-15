@@ -15,16 +15,18 @@ from importlib.resources import as_file, files
 from pathlib import Path
 
 from inverse_agent.adapters.registry import detect_workspace
+from inverse_agent.attestations import AttestationScope
 from inverse_agent.commit_review import ReviewDomain, review_commit
 from inverse_agent.control_plane import create_app
 from inverse_agent.dogfood import evaluate_workspace, save_evaluation
 from inverse_agent.eval import json_default
+from inverse_agent.investigation_model import ModelInvestigationPlanner
 from inverse_agent.mcp_server import create_mcp_server
 from inverse_agent.model_config import PlannerResolution, resolve_planner
-from inverse_agent.models import AutonomyLevel, Domain, RunStatus, WorkspaceProfile
+from inverse_agent.models import AutonomyLevel, Domain, RunKind, RunStatus, WorkspaceProfile
 from inverse_agent.redaction import redact_text
 from inverse_agent.review_benchmark import BenchmarkModelProvenance, run_benchmark_suite
-from inverse_agent.service import AgentService
+from inverse_agent.service import AgentService, RunRecord
 
 BUILTIN_BENCHMARK_SUITE = "builtin"
 
@@ -53,6 +55,8 @@ def evaluate_command(args: argparse.Namespace) -> int:
 
 
 def start_command(args: argparse.Namespace) -> int:
+    if getattr(args, "no_wait", False):
+        raise ValueError("--no-wait requires submission to a running control plane")
     workspace = Path(args.workspace).resolve()
     service = _service(args, workspace)
     try:
@@ -60,6 +64,7 @@ def start_command(args: argparse.Namespace) -> int:
             goal=args.goal,
             workspace=workspace,
             domain=Domain(args.domain),
+            kind=RunKind(args.kind),
             autonomy_level=AutonomyLevel(args.autonomy),
         )
         record = service.start(created.run_id)
@@ -72,6 +77,8 @@ def start_command(args: argparse.Namespace) -> int:
 
 
 def approve_command(args: argparse.Namespace) -> int:
+    if getattr(args, "no_wait", False):
+        raise ValueError("--no-wait requires submission to a running control plane")
     service = _service(args, Path(args.workspace_root).resolve())
     try:
         record = service.approve_and_resume(
@@ -92,8 +99,110 @@ def trust_command(args: argparse.Namespace) -> int:
     workspace = Path(args.workspace).resolve()
     service = _service(args, Path(args.workspace_root).resolve())
     try:
-        result = service.trust_workspace(workspace, trusted_by=args.trusted_by)
+        result = service.trust_workspace(
+            workspace,
+            trusted_by=args.trusted_by,
+            scope=AttestationScope(args.scope),
+        )
         print(json.dumps(result, indent=2))
+        return 0
+    finally:
+        service.close()
+
+
+def revoke_command(args: argparse.Namespace) -> int:
+    workspace = Path(args.workspace).resolve()
+    service = _service(args, Path(args.workspace_root).resolve())
+    try:
+        scope = AttestationScope(args.scope)
+        revoked = service.revoke_workspace(workspace, scope=scope)
+        print(
+            json.dumps(
+                {
+                    "workspace": str(workspace),
+                    "scope": scope.value,
+                    "revoked": revoked,
+                },
+                indent=2,
+            )
+        )
+        return 0
+    finally:
+        service.close()
+
+
+def list_runs_command(args: argparse.Namespace) -> int:
+    if not 1 <= args.limit <= 500 or args.offset < 0:
+        raise ValueError("list pagination is out of range")
+    service = _service(args, Path(args.workspace_root).resolve())
+    try:
+        records = service.list(limit=args.limit, offset=args.offset)
+        print(json.dumps([asdict(record) for record in records], default=json_default, indent=2))
+        return 0
+    finally:
+        service.close()
+
+
+def plan_command(args: argparse.Namespace) -> int:
+    service = _service(args, Path(args.workspace_root).resolve())
+    try:
+        print(json.dumps(service.plan_view(args.run_id), default=json_default, indent=2))
+        return 0
+    finally:
+        service.close()
+
+
+def trace_command(args: argparse.Namespace) -> int:
+    service = _service(args, Path(args.workspace_root).resolve())
+    try:
+        print(json.dumps(service.trace_preview(args.run_id), default=json_default, indent=2))
+        return 0
+    finally:
+        service.close()
+
+
+def events_command(args: argparse.Namespace) -> int:
+    if args.after < 0 or not 1 <= args.limit <= 200:
+        raise ValueError("event pagination is out of range")
+    service = _service(args, Path(args.workspace_root).resolve())
+    try:
+        events = service.events(args.run_id, after=args.after, limit=args.limit)
+        next_cursor = events[-1].sequence if events else args.after
+        print(
+            json.dumps(
+                {
+                    "events": [asdict(event) for event in events],
+                    "next_cursor": next_cursor,
+                },
+                default=json_default,
+                indent=2,
+            )
+        )
+        return 0
+    finally:
+        service.close()
+
+
+def decline_command(args: argparse.Namespace) -> int:
+    service = _service(args, Path(args.workspace_root).resolve())
+    try:
+        record = service.decline(
+            args.run_id,
+            declined_by=args.declined_by,
+            expected_action_digest=args.action_digest,
+            expected_challenge_id=args.challenge_id,
+        )
+        print(json.dumps(asdict(record), default=json_default, indent=2))
+        return 0
+    finally:
+        service.close()
+
+
+def cancel_command(args: argparse.Namespace) -> int:
+    service = _service(args, Path(args.workspace_root).resolve())
+    try:
+        record = service.cancel(args.run_id)
+        print(json.dumps(asdict(record), default=json_default, indent=2))
         return 0
     finally:
         service.close()
@@ -282,12 +391,41 @@ def _service(
     if len(secret) < 32:
         raise ValueError("INVERSE_AGENT_APPROVAL_SECRET must contain at least 32 bytes")
     selected = resolution or resolve_planner(args=args)
+    investigation_planner_factory = None
+    model_client = selected.client
+    if model_client is not None and selected.config.investigation_available:
+        context_tokens = selected.config.context_tokens
+        estimator_bytes_per_token = selected.config.estimator_bytes_per_token
+        assert context_tokens is not None
+        assert estimator_bytes_per_token is not None
+        ModelInvestigationPlanner(
+            client=model_client,
+            context_tokens=context_tokens,
+            estimator_bytes_per_token=estimator_bytes_per_token,
+        )
+
+        def investigation_planner_factory(record: RunRecord) -> ModelInvestigationPlanner:
+            profile = detect_workspace(Path(record.workspace))
+            prefix = f"{record.domain}."
+            commands = (
+                tuple(sorted(name for name in profile.commands if name.startswith(prefix)))
+                if record.autonomy_level != AutonomyLevel.ADVISORY.value
+                else ()
+            )
+            return ModelInvestigationPlanner(
+                client=model_client,
+                context_tokens=context_tokens,
+                estimator_bytes_per_token=estimator_bytes_per_token,
+                allowed_commands=commands,
+            )
+
     return AgentService(
         workspace_root=workspace_root,
         state_dir=Path(args.state_dir).resolve(),
         approval_secret=secret,
         planner=selected.planner,
         planner_fingerprint=selected.config.fingerprint,
+        investigation_planner_factory=investigation_planner_factory,
     )
 
 
@@ -303,6 +441,12 @@ def _add_model_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--model-base-url")
     parser.add_argument("--model-timeout-seconds", type=int)
     parser.add_argument("--model-max-actions", type=int)
+    parser.add_argument(
+        "--model-context-tokens",
+        type=int,
+        choices=(16_384, 24_576, 32_768, 49_152),
+    )
+    parser.add_argument("--model-estimator-bytes-per-token", type=float)
     parser.add_argument("--model-allow-remote", action="store_true")
 
 
@@ -324,6 +468,11 @@ def build_parser() -> argparse.ArgumentParser:
     start = sub.add_parser("start", help="Create and start a durable workflow")
     start.add_argument("workspace")
     start.add_argument("--domain", required=True, choices=[item.value for item in Domain])
+    start.add_argument(
+        "--kind",
+        default=RunKind.VERIFICATION.value,
+        choices=[item.value for item in RunKind],
+    )
     start.add_argument("--goal", default="Run the domain verification workflow")
     start.add_argument(
         "--autonomy",
@@ -332,6 +481,11 @@ def build_parser() -> argparse.ArgumentParser:
         choices=[item.value for item in AutonomyLevel],
     )
     start.add_argument("--state-dir", default=default_state_dir())
+    start.add_argument(
+        "--no-wait",
+        action="store_true",
+        help="Only supported when submitting to a separately running control plane",
+    )
     _add_model_arguments(start)
     start.set_defaults(func=start_command)
 
@@ -342,16 +496,92 @@ def build_parser() -> argparse.ArgumentParser:
     approve.add_argument("--challenge-id", required=True)
     approve.add_argument("--workspace-root", required=True)
     approve.add_argument("--state-dir", default=default_state_dir())
+    approve.add_argument(
+        "--no-wait",
+        action="store_true",
+        help="Only supported when submitting to a separately running control plane",
+    )
     _add_model_arguments(approve)
     approve.set_defaults(func=approve_command)
 
     trust = sub.add_parser("trust-workspace", help="Attest a workspace before executing its code")
     trust.add_argument("workspace")
     trust.add_argument("--trusted-by", required=True)
+    trust.add_argument(
+        "--scope",
+        default=AttestationScope.CODE_EXECUTION.value,
+        choices=(
+            AttestationScope.SOURCE_READ.value,
+            AttestationScope.CODE_EXECUTION.value,
+        ),
+    )
     trust.add_argument("--workspace-root", required=True)
     trust.add_argument("--state-dir", default=default_state_dir())
     _add_model_arguments(trust)
     trust.set_defaults(func=trust_command)
+
+    revoke = sub.add_parser("revoke-workspace", help="Revoke one workspace attestation scope")
+    revoke.add_argument("workspace")
+    revoke.add_argument(
+        "--scope",
+        required=True,
+        choices=(
+            AttestationScope.SOURCE_READ.value,
+            AttestationScope.CODE_EXECUTION.value,
+        ),
+    )
+    revoke.add_argument("--workspace-root", required=True)
+    revoke.add_argument("--state-dir", default=default_state_dir())
+    _add_model_arguments(revoke)
+    revoke.set_defaults(func=revoke_command)
+
+    list_runs = sub.add_parser("list-runs", help="List durable runs")
+    list_runs.add_argument("--workspace-root", required=True)
+    list_runs.add_argument("--state-dir", default=default_state_dir())
+    list_runs.add_argument("--limit", type=int, default=100)
+    list_runs.add_argument("--offset", type=int, default=0)
+    _add_model_arguments(list_runs)
+    list_runs.set_defaults(func=list_runs_command)
+
+    get_plan = sub.add_parser("get-plan", help="Read a durable run plan")
+    get_plan.add_argument("run_id")
+    get_plan.add_argument("--workspace-root", required=True)
+    get_plan.add_argument("--state-dir", default=default_state_dir())
+    _add_model_arguments(get_plan)
+    get_plan.set_defaults(func=plan_command)
+
+    get_trace = sub.add_parser("get-trace", help="Read a bounded redacted run trace")
+    get_trace.add_argument("run_id")
+    get_trace.add_argument("--workspace-root", required=True)
+    get_trace.add_argument("--state-dir", default=default_state_dir())
+    _add_model_arguments(get_trace)
+    get_trace.set_defaults(func=trace_command)
+
+    events = sub.add_parser("events", help="Read ordered durable run events")
+    events.add_argument("run_id")
+    events.add_argument("--workspace-root", required=True)
+    events.add_argument("--state-dir", default=default_state_dir())
+    events.add_argument("--after", type=int, default=0)
+    events.add_argument("--limit", type=int, default=200)
+    _add_model_arguments(events)
+    events.set_defaults(func=events_command)
+
+    decline = sub.add_parser("decline", help="Decline the current pending action")
+    decline.add_argument("run_id")
+    decline.add_argument("--declined-by", required=True)
+    decline.add_argument("--action-digest", required=True)
+    decline.add_argument("--challenge-id", required=True)
+    decline.add_argument("--workspace-root", required=True)
+    decline.add_argument("--state-dir", default=default_state_dir())
+    _add_model_arguments(decline)
+    decline.set_defaults(func=decline_command)
+
+    cancel = sub.add_parser("cancel", help="Cancel a durable run")
+    cancel.add_argument("run_id")
+    cancel.add_argument("--workspace-root", required=True)
+    cancel.add_argument("--state-dir", default=default_state_dir())
+    _add_model_arguments(cancel)
+    cancel.set_defaults(func=cancel_command)
 
     serve = sub.add_parser("serve", help="Serve the authenticated local control plane")
     serve.add_argument("--workspace-root", required=True)

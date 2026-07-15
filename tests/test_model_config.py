@@ -8,8 +8,10 @@ from pathlib import Path
 import pytest
 
 import inverse_agent.planner as planner_module
-from inverse_agent.cli import main
+from inverse_agent.cli import _service, main
+from inverse_agent.investigation_model import ModelInvestigationPlanner
 from inverse_agent.model_config import PlannerConfig, resolve_planner
+from inverse_agent.models import AutonomyLevel, Domain, RunKind
 from inverse_agent.planner import (
     DeterministicPlanner,
     OpenAICompatibleClient,
@@ -138,6 +140,88 @@ def test_api_key_is_excluded_from_config_output() -> None:
     assert "super-secret-model-key" not in repr(resolution.config)
     assert "super-secret-model-key" not in json.dumps(resolution.config.safe_summary())
     assert "super-secret-model-key" not in resolution.config.fingerprint
+
+
+def test_investigation_calibration_is_paired_validated_and_fingerprinted() -> None:
+    base = {
+        "INVERSE_AGENT_MODEL_NAME": "openai/gpt-oss-20b",
+        "INVERSE_AGENT_MODEL_BASE_URL": "http://127.0.0.1:1234/v1",
+    }
+    with pytest.raises(ValueError, match="configured together"):
+        resolve_planner(env={**base, "INVERSE_AGENT_MODEL_CONTEXT_TOKENS": "32768"})
+    with pytest.raises(ValueError, match="must be one of"):
+        resolve_planner(
+            env={
+                **base,
+                "INVERSE_AGENT_MODEL_CONTEXT_TOKENS": "20000",
+                "INVERSE_AGENT_MODEL_ESTIMATOR_BYTES_PER_TOKEN": "2.0",
+            }
+        )
+
+    calibrated = resolve_planner(
+        env={
+            **base,
+            "INVERSE_AGENT_MODEL_CONTEXT_TOKENS": "32768",
+            "INVERSE_AGENT_MODEL_ESTIMATOR_BYTES_PER_TOKEN": "2.0",
+        }
+    )
+    uncalibrated = resolve_planner(env=base)
+    assert calibrated.config.investigation_available
+    assert calibrated.config.safe_summary()["context_tokens"] == 32768
+    assert calibrated.config.fingerprint != uncalibrated.config.fingerprint
+
+
+def test_remote_calibrated_model_is_not_available_for_investigation() -> None:
+    resolution = resolve_planner(
+        args=argparse.Namespace(model_allow_remote=True),
+        env={
+            "INVERSE_AGENT_MODEL_NAME": "provider/model",
+            "INVERSE_AGENT_MODEL_BASE_URL": "https://models.example.test/v1",
+            "INVERSE_AGENT_MODEL_ALLOW_REMOTE": "1",
+            "INVERSE_AGENT_MODEL_CONTEXT_TOKENS": "32768",
+            "INVERSE_AGENT_MODEL_ESTIMATOR_BYTES_PER_TOKEN": "2.0",
+        },
+    )
+    assert not resolution.config.investigation_available
+
+
+def test_cli_service_wires_calibrated_model_investigation_factory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "manage.py").write_text("print('ok')\n", encoding="utf-8")
+    resolution = resolve_planner(
+        env={
+            "INVERSE_AGENT_MODEL_NAME": "openai/gpt-oss-20b",
+            "INVERSE_AGENT_MODEL_BASE_URL": "http://127.0.0.1:1234/v1",
+            "INVERSE_AGENT_MODEL_CONTEXT_TOKENS": "32768",
+            "INVERSE_AGENT_MODEL_ESTIMATOR_BYTES_PER_TOKEN": "2.0",
+        }
+    )
+    monkeypatch.setenv("INVERSE_AGENT_APPROVAL_SECRET", APPROVAL_SECRET)
+    service = _service(
+        argparse.Namespace(state_dir=str(tmp_path / "state")),
+        workspace,
+        resolution=resolution,
+    )
+    try:
+        created = service.create_run(
+            goal="Inspect the workspace",
+            workspace=workspace,
+            domain=Domain.DJANGO,
+            kind=RunKind.INVESTIGATION,
+            autonomy_level=AutonomyLevel.ASSISTED,
+        )
+        assert service.investigation_planner_factory is not None
+        planner = service.investigation_planner_factory(created)
+    finally:
+        service.close()
+
+    assert isinstance(planner, ModelInvestigationPlanner)
+    assert planner.context_tokens == 32768
+    assert "django.check" in planner.allowed_commands
 
 
 def test_planner_fingerprint_covers_non_secret_runtime_configuration() -> None:

@@ -1423,6 +1423,39 @@ class _ControlPlaneGitExecutor:
         finally:
             self._service.close()
 
+    def _wait_for_status(
+        self,
+        run_id: str,
+        *,
+        expected: frozenset[str],
+        active_deadline: float,
+        stage: str,
+    ) -> dict[str, object]:
+        terminal = frozenset(
+            {
+                RunStatus.SUCCEEDED.value,
+                RunStatus.INCOMPLETE.value,
+                RunStatus.CANCELLED.value,
+                RunStatus.FAILED.value,
+                RunStatus.REFUSED.value,
+            }
+        )
+        poll_deadline = min(active_deadline, time.monotonic() + 5.0)
+        while time.monotonic() < poll_deadline:
+            response = self._client.get(f"/runs/{run_id}", headers=self._operator_headers)
+            if response.status_code != 200:
+                raise BenchmarkDefinitionError(f"Git command {stage} state is unavailable")
+            payload = cast(dict[str, object], response.json())
+            status = str(payload.get("status", ""))
+            if status in expected:
+                return payload
+            if status in terminal:
+                raise BenchmarkDefinitionError(
+                    f"Git command reached unexpected terminal status during {stage}: {status}"
+                )
+            time.sleep(min(0.01, max(0.0, poll_deadline - time.monotonic())))
+        raise BenchmarkDefinitionError(f"Git command {stage} exceeded the active deadline")
+
     def execute(
         self,
         call: ToolCall,
@@ -1461,13 +1494,18 @@ class _ControlPlaneGitExecutor:
         if created.status_code != 200:
             raise BenchmarkDefinitionError("control-plane Git run creation failed")
         command_run_id = str(created.json()["run_id"])
-        waiting = self._client.post(f"/runs/{command_run_id}/start", headers=self._operator_headers)
-        waiting_payload = waiting.json()
-        if (
-            waiting.status_code != 200
-            or waiting_payload.get("status") != RunStatus.WAITING_FOR_APPROVAL
-        ):
-            raise BenchmarkDefinitionError("Git command did not stop for a fresh approval")
+        started = self._client.post(
+            f"/runs/{command_run_id}/start",
+            headers=self._operator_headers,
+        )
+        if started.status_code != 202:
+            raise BenchmarkDefinitionError("control-plane Git command did not queue")
+        waiting_payload = self._wait_for_status(
+            command_run_id,
+            expected=frozenset({RunStatus.WAITING_FOR_APPROVAL.value}),
+            active_deadline=active_deadline,
+            stage="approval wait",
+        )
         challenge = _verify_git_approval_challenge(
             command,
             waiting_payload.get("pending_approval"),
@@ -1481,8 +1519,22 @@ class _ControlPlaneGitExecutor:
                 "challenge_id": challenge.challenge_id,
             },
         )
-        if approved.status_code != 200:
+        if approved.status_code != 202:
             raise BenchmarkDefinitionError("Git command approval failed")
+        self._wait_for_status(
+            command_run_id,
+            expected=frozenset(
+                {
+                    RunStatus.SUCCEEDED.value,
+                    RunStatus.INCOMPLETE.value,
+                    RunStatus.CANCELLED.value,
+                    RunStatus.FAILED.value,
+                    RunStatus.REFUSED.value,
+                }
+            ),
+            active_deadline=active_deadline,
+            stage="approved execution",
+        )
         trace = self._client.get(f"/runs/{command_run_id}/trace", headers=self._operator_headers)
         if trace.status_code != 200:
             raise BenchmarkDefinitionError("Git command trace is unavailable")
