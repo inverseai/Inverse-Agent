@@ -229,6 +229,7 @@ class OpenAICompatibleClient:
         schema: Mapping[str, Any],
         max_tokens: int = MAX_MODEL_COMPLETION_TOKENS,
         timeout_seconds: float | None = None,
+        reasoning_effort: str | None = None,
     ) -> dict[str, Any]:
         """Complete a caller-supplied strict JSON schema over the hardened transport."""
 
@@ -240,6 +241,8 @@ class OpenAICompatibleClient:
             not math.isfinite(timeout_seconds) or timeout_seconds <= 0
         ):
             raise ValueError("request timeout must be a positive finite number")
+        if reasoning_effort not in {None, "low", "medium", "high"}:
+            raise ValueError("reasoning effort must be low, medium, or high")
         effective_timeout = float(self.timeout_seconds)
         if timeout_seconds is not None:
             effective_timeout = min(effective_timeout, timeout_seconds)
@@ -251,25 +254,26 @@ class OpenAICompatibleClient:
             validator = Draft202012Validator(schema_payload)
         except SchemaError as exc:
             raise ValueError("model response schema is invalid") from exc
-        body = json.dumps(
-            {
-                "model": self.model,
-                "messages": [
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": prompt},
-                ],
-                "response_format": {
-                    "type": "json_schema",
-                    "json_schema": {
-                        "name": schema_name,
-                        "strict": True,
-                        "schema": schema_payload,
-                    },
+        request_payload: dict[str, Any] = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": prompt},
+            ],
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": schema_name,
+                    "strict": True,
+                    "schema": schema_payload,
                 },
-                "temperature": 0,
-                "max_tokens": max_tokens,
-            }
-        ).encode()
+            },
+            "temperature": 0,
+            "max_tokens": max_tokens,
+        }
+        if reasoning_effort is not None:
+            request_payload["reasoning_effort"] = reasoning_effort
+        body = json.dumps(request_payload).encode()
         headers = {"Content-Type": "application/json"}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"

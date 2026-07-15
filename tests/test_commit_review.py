@@ -14,6 +14,7 @@ import pytest
 from inverse_agent.commit_review import (
     MAX_CHANGED_DEPENDENCY_LINKS,
     MAX_FINDINGS,
+    REVIEW_PROTOCOL_RETRY_PROMPT,
     REVIEW_RESPONSE_SCHEMA,
     ChangedFile,
     CommitReviewer,
@@ -27,11 +28,12 @@ from inverse_agent.commit_review import (
     ReviewSeverity,
 )
 from inverse_agent.environments import discover_trusted_git
+from inverse_agent.planner import PlannerProtocolError
 from inverse_agent.redaction import redact_text
 
 
 class FakeReviewClient:
-    def __init__(self, responses: list[dict[str, Any]]) -> None:
+    def __init__(self, responses: list[dict[str, Any] | Exception]) -> None:
         self.responses = responses
         self.calls: list[dict[str, object]] = []
 
@@ -43,6 +45,7 @@ class FakeReviewClient:
         schema_name: str,
         schema: Mapping[str, Any],
         max_tokens: int = 4096,
+        reasoning_effort: str | None = None,
     ) -> dict[str, Any]:
         self.calls.append(
             {
@@ -51,9 +54,13 @@ class FakeReviewClient:
                 "schema_name": schema_name,
                 "schema": schema,
                 "max_tokens": max_tokens,
+                "reasoning_effort": reasoning_effort,
             }
         )
-        return self.responses.pop(0)
+        response = self.responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return response
 
 
 def _response(*findings: dict[str, Any], summary: str = "") -> dict[str, Any]:
@@ -971,6 +978,51 @@ def test_reviewer_uses_two_scouts_and_adjudicates_validated_findings() -> None:
     ]
     assert all(call["schema"] == REVIEW_RESPONSE_SCHEMA for call in client.calls[:2])
     assert client.calls[2]["schema"]["required"] == ["summary", "decisions"]
+    assert all(call["reasoning_effort"] == "low" for call in client.calls)
+
+
+def test_reviewer_retries_one_protocol_invalid_response_without_repair() -> None:
+    client = FakeReviewClient(
+        [
+            PlannerProtocolError("invalid response"),
+            _response(),
+            _response(),
+        ]
+    )
+
+    report = CommitReviewer(client).review(
+        _snapshot(),
+        domain=ReviewDomain.GENERIC,
+        goal="Review this change",
+    )
+
+    assert report.verdict == "PASS"
+    assert [call["schema_name"] for call in client.calls] == [
+        "inverse_agent_commit_review_primary",
+        "inverse_agent_commit_review_primary",
+        "inverse_agent_commit_review_scout",
+    ]
+    assert REVIEW_PROTOCOL_RETRY_PROMPT not in str(client.calls[0]["system"])
+    assert REVIEW_PROTOCOL_RETRY_PROMPT in str(client.calls[1]["system"])
+    assert all(call["reasoning_effort"] == "low" for call in client.calls)
+
+
+def test_reviewer_fails_closed_after_second_protocol_invalid_response() -> None:
+    client = FakeReviewClient(
+        [
+            PlannerProtocolError("first invalid response"),
+            PlannerProtocolError("second invalid response"),
+        ]
+    )
+
+    with pytest.raises(PlannerProtocolError, match="second invalid response"):
+        CommitReviewer(client).review(
+            _snapshot(),
+            domain=ReviewDomain.GENERIC,
+            goal="Review this change",
+        )
+
+    assert len(client.calls) == 2
 
 
 def test_model_provenance_retains_original_body_when_static_key_matches() -> None:

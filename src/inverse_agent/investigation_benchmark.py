@@ -1440,7 +1440,7 @@ class _ControlPlaneGitExecutor:
                 RunStatus.REFUSED.value,
             }
         )
-        poll_deadline = min(active_deadline, time.monotonic() + 5.0)
+        poll_deadline = active_deadline
         while time.monotonic() < poll_deadline:
             response = self._client.get(f"/runs/{run_id}", headers=self._operator_headers)
             if response.status_code != 200:

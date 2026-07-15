@@ -21,7 +21,7 @@ from typing import Any, BinaryIO, Protocol, cast
 
 from inverse_agent.environments import discover_trusted_git
 from inverse_agent.models import RunnerPolicy
-from inverse_agent.planner import MAX_MODEL_COMPLETION_TOKENS
+from inverse_agent.planner import MAX_MODEL_COMPLETION_TOKENS, PlannerProtocolError
 from inverse_agent.policies import GIT_SAFE_PREFIX
 from inverse_agent.redaction import (
     SOURCE_INSTRUCTION_REDACTION_MARKER,
@@ -40,6 +40,9 @@ MAX_FILE_BYTES = 128 * 1024
 MAX_DIFF_CHARACTERS = 48_000
 MAX_GIT_METADATA_BYTES = 1024 * 1024
 MAX_FINDINGS = 20
+REVIEW_PROTOCOL_RETRY_PROMPT = """Protocol retry: the previous response was invalid or incomplete.
+Return the required JSON object promptly, keep private reasoning brief enough to leave room for the
+complete object, and do not wrap the object in prose or Markdown."""
 GIT_TIMEOUT_SECONDS = 20
 MAX_OBJECT_STORE_ENTRIES = 200_000
 MAX_OBJECT_STORE_SNAPSHOT_BYTES = 2 * 1024 * 1024 * 1024
@@ -171,6 +174,7 @@ class StructuredReviewClient(Protocol):
         schema_name: str,
         schema: Mapping[str, Any],
         max_tokens: int = MAX_MODEL_COMPLETION_TOKENS,
+        reasoning_effort: str | None = None,
     ) -> dict[str, Any]: ...
 
 
@@ -1472,7 +1476,7 @@ class CommitReviewer:
             )
         prompt = json.dumps(review_input, ensure_ascii=True)
         for system, schema_name in scout_prompts:
-            payload = self.client.complete_structured_json(
+            payload = self._complete_review_pass(
                 system=system,
                 prompt=prompt,
                 schema_name=schema_name,
@@ -1527,7 +1531,7 @@ class CommitReviewer:
             "untrusted_candidate_findings": self._candidate_payload(candidates, snapshot),
         }
         candidate_ids = tuple(f"K{index:03d}" for index in range(1, len(candidates) + 1))
-        final_payload = self.client.complete_structured_json(
+        final_payload = self._complete_review_pass(
             system=(
                 f"{ADJUDICATOR_SYSTEM_PROMPT}\nFor this {domain.value} review, use the "
                 f"following checklist: {DOMAIN_CHECKLISTS[domain]}."
@@ -1576,6 +1580,34 @@ class CommitReviewer:
             request_sanitized=request_sanitized,
             candidate_findings_truncated=candidate_findings_truncated,
         )
+
+    def _complete_review_pass(
+        self,
+        *,
+        system: str,
+        prompt: str,
+        schema_name: str,
+        schema: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        # GPT-OSS reasoning tokens share the completion allowance. Prefer low
+        # effort and retry one fresh strict response when reasoning crowds out
+        # the JSON object; never repair or extract a malformed response.
+        try:
+            return self.client.complete_structured_json(
+                system=system,
+                prompt=prompt,
+                schema_name=schema_name,
+                schema=schema,
+                reasoning_effort="low",
+            )
+        except PlannerProtocolError:
+            return self.client.complete_structured_json(
+                system=f"{system}\n{REVIEW_PROTOCOL_RETRY_PROMPT}",
+                prompt=prompt,
+                schema_name=schema_name,
+                schema=schema,
+                reasoning_effort="low",
+            )
 
     @staticmethod
     def _review_input(

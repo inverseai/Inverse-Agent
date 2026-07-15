@@ -48,6 +48,44 @@ from inverse_agent.investigation_model import ModelInvestigationPlanner
 from inverse_agent.planner import OpenAICompatibleClient
 
 
+def test_control_plane_git_wait_uses_the_active_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = [100.0]
+
+    class Response:
+        status_code = 200
+
+        def json(self) -> dict[str, str]:
+            status = "waiting_for_approval" if clock[0] >= 106.0 else "starting"
+            return {"status": status}
+
+    class Client:
+        def get(self, _path: str, *, headers: dict[str, str]) -> Response:
+            assert headers == {}
+            return Response()
+
+    monkeypatch.setattr(benchmark_module.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(
+        benchmark_module.time,
+        "sleep",
+        lambda _seconds: clock.__setitem__(0, clock[0] + 1.0),
+    )
+    executor = object.__new__(benchmark_module._ControlPlaneGitExecutor)
+    executor._client = Client()
+    executor._operator_headers = {}
+
+    payload = executor._wait_for_status(
+        "run-1",
+        expected=frozenset({"waiting_for_approval"}),
+        active_deadline=110.0,
+        stage="approval wait",
+    )
+
+    assert payload == {"status": "waiting_for_approval"}
+    assert clock[0] == 106.0
+
+
 def test_seven_cases_cover_priority_stacks_and_real_git() -> None:
     cases = default_cases()
     assert len(cases) == 7
