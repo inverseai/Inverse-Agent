@@ -15,6 +15,7 @@ from inverse_agent.investigation import (
     AgentAnswer,
     InvestigationLoop,
     InvestigationVerdict,
+    SourceCitation,
     StopReason,
     ToolCall,
 )
@@ -23,7 +24,11 @@ from inverse_agent.investigation_model import (
     _encoded_string_tokens,
     _maximum_read_probe,
     _maximum_read_probe_tokens,
+    _merge_duplicate_citation_findings,
+    _recover_inline_citations,
     _render_catalog,
+    _repair_citations,
+    _repair_non_evidentiary_answer_fields,
     parse_decision,
 )
 from inverse_agent.planner import (
@@ -271,6 +276,293 @@ def test_completed_command_recovery_requires_final_answer_schema() -> None:
     assert isinstance(decision, AgentAnswer)
     assert client.schemas[0]["properties"]["action"]["enum"] == ["final_answer"]
     assert "recovery sequence is complete" in client.system_prompts[0]
+    assert client.max_tokens_requested == [4096]
+
+
+def test_three_citable_observations_reserve_full_complex_answer_allowance() -> None:
+    reads = tuple(
+        ToolObservation(
+            observation_id=f"obs_read_{index}",
+            tool="read_file",
+            path=f"src/file_{index}.py",
+            content_hash=f"hash-{index}",
+            text="evidence",
+            lines=("1: evidence",),
+        )
+        for index in range(3)
+    )
+    answer = _base(
+        "final_answer",
+        summary="done",
+        findings=["The evidence was inspected."],
+        next_actions=["Keep the evidence."],
+        citations=[
+            {
+                "observation_id": reads[0].observation_id,
+                "path": reads[0].path,
+                "start_line": 1,
+                "end_line": 1,
+            }
+        ],
+    )
+    client = FakeClient([answer])
+
+    decision = ModelInvestigationPlanner(client=client).decide(
+        goal="compare the inspected paths",
+        catalog=reads,
+    )
+
+    assert isinstance(decision, AgentAnswer)
+    assert client.max_tokens_requested == [4096]
+
+
+def test_model_findings_are_not_rewritten_with_goal_subjects_or_hidden_oracles() -> None:
+    read = ToolObservation(
+        observation_id="obs_unmodified",
+        tool="read_file",
+        path="src/config.cpp",
+        content_hash="hash-unmodified",
+        text="load_bad\n\n\n\n\n\n\nload_safe",
+        lines=(
+            "3: load_bad",
+            "4: ",
+            "5: ",
+            "6: ",
+            "7: ",
+            "8: ",
+            "9: ",
+            "10: load_safe",
+        ),
+        start_line=3,
+    )
+    answer = _base(
+        "final_answer",
+        summary="Two paths were inspected.",
+        findings=[
+            "One path returns a dangling view.",
+            "Another path returns member storage.",
+        ],
+        next_actions=["Review both paths."],
+        citations=[
+            {
+                "observation_id": read.observation_id,
+                "path": read.path,
+                "start_line": 3,
+                "end_line": 3,
+            },
+            {
+                "observation_id": read.observation_id,
+                "path": read.path,
+                "start_line": 10,
+                "end_line": 10,
+            },
+        ],
+    )
+    client = FakeClient([answer])
+    decision = ModelInvestigationPlanner(client=client).decide(
+        goal="compare load_bad and load_safe", catalog=(read,)
+    )
+
+    assert isinstance(decision, AgentAnswer)
+    assert decision.findings == (
+        "One path returns a dangling view.",
+        "Another path returns member storage.",
+    )
+    prompt = json.loads(client.prompts[0])
+    assert "required_evidence" not in prompt
+    assert "required_finding_subjects" not in prompt
+    assert "outstanding_required_evidence" not in prompt
+    assert "dependency manifest" in client.system_prompts[0]
+    assert "unrelated secret" in client.system_prompts[0]
+    assert "workspace-relative list entry is already complete" in client.system_prompts[0]
+    assert "join the header path only for a header-relative" in client.system_prompts[0]
+    assert "Never repeat an identical complete list" in client.system_prompts[0]
+    assert "glob='**/*'" in client.system_prompts[0]
+    assert "protection mechanism" in client.system_prompts[0]
+    assert "source-defined function, class, component, or symbol" in client.system_prompts[0]
+    assert "generic phrases such as 'the same file'" in client.system_prompts[0]
+    assert "exactly one sentence per finding" in prompt["instructions"]
+    assert "state the protection effect" in prompt["instructions"]
+
+
+def test_explicit_dependency_metadata_goal_auto_reads_only_visible_manifest() -> None:
+    listing = ToolObservation(
+        observation_id="obs_listing",
+        tool="list_files",
+        path=".",
+        content_hash="hash-listing",
+        text="package.json\nsrc/",
+        lines=("package.json", "src/"),
+    )
+    client = FakeClient(
+        [
+            _base(
+                "final_answer",
+                summary="The source uses a named framework.",
+                findings=["The source imports the framework."],
+                next_actions=["Verify dependency metadata."],
+                citations=[],
+            )
+        ]
+    )
+    planner = ModelInvestigationPlanner(client=client)
+
+    decision = planner.decide(
+        goal="Confirm the declared stack from dependency metadata.",
+        catalog=(listing,),
+    )
+
+    assert decision == ToolCall(tool="read_file", path="package.json")
+
+
+def test_recursive_nonroot_manifest_path_is_not_double_prefixed() -> None:
+    listing = ToolObservation(
+        observation_id="obs_listing",
+        tool="list_files",
+        path="web",
+        content_hash="hash-listing",
+        text="web/package.json",
+        lines=("web/package.json",),
+        metadata={"glob": "**/*", "recursive": True},
+    )
+    client = FakeClient(
+        [
+            _base(
+                "final_answer",
+                summary="The framework source was inspected.",
+                findings=["The source uses a framework."],
+                next_actions=["Verify its declaration."],
+                citations=[],
+            )
+        ]
+    )
+
+    decision = ModelInvestigationPlanner(client=client).decide(
+        goal="Confirm the stack from dependency metadata.",
+        catalog=(listing,),
+    )
+
+    assert decision == ToolCall(tool="read_file", path="web/package.json")
+
+
+def test_dependency_manifest_auto_read_does_not_invent_unlisted_path() -> None:
+    listing = ToolObservation(
+        observation_id="obs_listing",
+        tool="list_files",
+        path=".",
+        content_hash="hash-listing",
+        text="src/",
+        lines=("src/",),
+    )
+    client = FakeClient([_base("list_files", path="src")])
+
+    decision = ModelInvestigationPlanner(client=client).decide(
+        goal="Confirm the declared stack from dependency metadata.",
+        catalog=(listing,),
+    )
+
+    assert decision == ToolCall(tool="list_files", path="src")
+
+
+def test_repeated_complete_recursive_listing_advances_only_to_emitted_file() -> None:
+    listing = ToolObservation(
+        observation_id="obs_listing",
+        tool="list_files",
+        path=".",
+        content_hash="hash-listing",
+        text="App/View.swift",
+        lines=("App/View.swift",),
+        metadata={"glob": "**/*", "recursive": True},
+    )
+    client = FakeClient([_base("list_files", path=".", glob="**/*")])
+
+    decision = ModelInvestigationPlanner(client=client).decide(
+        goal="inspect UIKit paths",
+        catalog=(listing,),
+    )
+
+    assert decision == ToolCall(tool="read_file", path="App/View.swift")
+
+
+def test_repeated_nonroot_recursive_listing_does_not_double_prefix_file() -> None:
+    listing = ToolObservation(
+        observation_id="obs_listing",
+        tool="list_files",
+        path="App",
+        content_hash="hash-listing",
+        text="App/View.swift",
+        lines=("App/View.swift",),
+        metadata={"glob": "**/*", "recursive": True},
+    )
+    client = FakeClient([_base("list_files", path="App", glob="**/*")])
+
+    decision = ModelInvestigationPlanner(client=client).decide(
+        goal="inspect UIKit paths",
+        catalog=(listing,),
+    )
+
+    assert decision == ToolCall(tool="read_file", path="App/View.swift")
+
+
+def test_repeated_complete_listing_advances_only_to_emitted_child_directory() -> None:
+    listing = ToolObservation(
+        observation_id="obs_listing",
+        tool="list_files",
+        path=".",
+        content_hash="hash-listing",
+        text="App/",
+        lines=("App/",),
+        metadata={"glob": "*"},
+    )
+    client = FakeClient([_base("list_files", path=".")])
+
+    decision = ModelInvestigationPlanner(client=client).decide(
+        goal="inspect UIKit paths",
+        catalog=(listing,),
+    )
+
+    assert decision == ToolCall(tool="list_files", path="App", glob="**/*")
+
+
+def test_repeated_truncated_listing_is_not_used_for_automatic_path_selection() -> None:
+    listing = ToolObservation(
+        observation_id="obs_listing",
+        tool="list_files",
+        path=".",
+        content_hash="hash-listing",
+        text="App/View.swift",
+        lines=("App/View.swift",),
+        truncated=True,
+        metadata={"glob": "**/*"},
+    )
+    client = FakeClient([_base("list_files", path=".", glob="**/*")])
+
+    decision = ModelInvestigationPlanner(client=client).decide(
+        goal="inspect UIKit paths",
+        catalog=(listing,),
+    )
+
+    assert decision == ToolCall(tool="list_files", path=".", glob="**/*")
+
+
+def test_repeated_complete_search_advances_only_to_emitted_unread_path() -> None:
+    search = ToolObservation(
+        observation_id="obs_search",
+        tool="search_text",
+        path=".",
+        content_hash="hash-search",
+        text="src/app.py:7: target()",
+        lines=("src/app.py:7: target()",),
+        metadata={"query": "target", "glob": "*.py"},
+    )
+    client = FakeClient([_base("search_text", query="target", glob="*.py")])
+
+    decision = ModelInvestigationPlanner(client=client).decide(
+        goal="find target",
+        catalog=(search,),
+    )
+
+    assert decision == ToolCall(tool="read_file", path="src/app.py")
 
 
 @pytest.mark.parametrize(
@@ -405,6 +697,207 @@ def test_grounded_malformed_answer_gets_one_accounted_schema_retry() -> None:
     assert decision.findings == ("HEAD has no first parent.",)
     assert planner.schema_retries == 1
     assert [call.outcome for call in planner.model_calls] == ["schema_error", "success"]
+    correction = json.loads(client.prompts[1])["retry_correction"]
+    assert "one or more non-empty findings" in correction
+
+
+def test_empty_recommendations_get_a_fixed_non_evidentiary_default() -> None:
+    evidence = _command_observation("obs_parent_failed", "generic.parent_commit")
+    answer = AgentAnswer(
+        summary="HEAD has no parent.",
+        findings=("HEAD is the root commit.",),
+        next_actions=(),
+        citations=(
+            SourceCitation(
+                evidence.observation_id,
+                evidence.path,
+                1,
+                1,
+            ),
+        ),
+        issue_present=True,
+    )
+
+    repaired = _repair_non_evidentiary_answer_fields(answer)
+
+    assert repaired.findings == answer.findings
+    assert repaired.citations == answer.citations
+    assert repaired.issue_present is True
+    assert repaired.next_actions == ("Review and address the cited findings.",)
+
+
+def test_duplicate_citation_findings_are_combined_without_reassigning_evidence() -> None:
+    citation = SourceCitation("obs_parent", "command/generic.parent_commit", 1, 1)
+    head = SourceCitation("obs_head", "command/generic.head_commit", 1, 1)
+    answer = AgentAnswer(
+        summary="The root and HEAD were checked.",
+        findings=(
+            "HEAD has no first parent.",
+            "HEAD is therefore the root commit.",
+            "The current HEAD commit was identified.",
+        ),
+        next_actions=("Record the result.",),
+        citations=(citation, citation, head),
+        issue_present=True,
+    )
+
+    repaired = _merge_duplicate_citation_findings(answer)
+
+    assert repaired.findings == (
+        "HEAD has no first parent. HEAD is therefore the root commit.",
+        "The current HEAD commit was identified.",
+    )
+    assert repaired.citations == (citation, head)
+    assert repaired.summary == answer.summary
+    assert repaired.next_actions == answer.next_actions
+    assert repaired.issue_present is True
+
+
+def test_duplicate_citation_repair_fails_closed_on_misaligned_arrays() -> None:
+    answer = AgentAnswer(
+        summary="Malformed answer.",
+        findings=("One.", "Two."),
+        next_actions=("Review it.",),
+        citations=(SourceCitation("obs_1", "a.py", 1, 1),),
+        issue_present=True,
+    )
+
+    assert _merge_duplicate_citation_findings(answer) is answer
+
+
+def test_duplicate_citation_repair_does_not_merge_different_observations() -> None:
+    first = SourceCitation("obs_first", "shared.py", 4, 4)
+    second = SourceCitation("obs_second", "shared.py", 4, 4)
+    answer = AgentAnswer(
+        summary="Two snapshots used the same source range.",
+        findings=("The first snapshot has one state.", "The second has another."),
+        next_actions=("Review both snapshots.",),
+        citations=(first, second),
+        issue_present=True,
+    )
+
+    assert _merge_duplicate_citation_findings(answer) is answer
+
+
+def test_inline_citation_recovery_binds_only_exact_rendered_ranges() -> None:
+    first = ToolObservation(
+        observation_id="obs_0123456789abcdef",
+        tool="read_file",
+        path="projects/views.py",
+        content_hash="hash-first",
+        text="unsafe\nsafe",
+        lines=("2: unsafe", "3: safe"),
+        start_line=2,
+    )
+    second = ToolObservation(
+        observation_id="obs_fedcba9876543210",
+        tool="read_file",
+        path="SearchResults.jsx",
+        content_hash="hash-second",
+        text="unsafe\nsafe",
+        lines=("5: unsafe", "6: safe"),
+        start_line=5,
+    )
+    answer = AgentAnswer(
+        summary="Both files were inspected.",
+        findings=(
+            "search_unsafe is vulnerable (obs_0123456789abcdef 2-3).",
+            "SafeResult is safe (obs_fedcba9876543210 lines 5-6).",
+        ),
+        next_actions=("Fix the unsafe path.",),
+        citations=(),
+        issue_present=True,
+    )
+
+    recovered = _recover_inline_citations(
+        answer,
+        (first, second),
+        frozenset({first.observation_id, second.observation_id}),
+    )
+
+    assert recovered.citations == (
+        SourceCitation(first.observation_id, first.path, 2, 3),
+        SourceCitation(second.observation_id, second.path, 5, 6),
+    )
+
+
+def test_inline_citation_recovery_replaces_partial_array_only_when_every_finding_binds() -> None:
+    first = ToolObservation(
+        observation_id="obs_0123456789abcdef",
+        tool="read_file",
+        path="a.py",
+        content_hash="hash-first",
+        text="unsafe",
+        lines=("2: unsafe",),
+        start_line=2,
+    )
+    second = ToolObservation(
+        observation_id="obs_fedcba9876543210",
+        tool="read_file",
+        path="b.py",
+        content_hash="hash-second",
+        text="safe",
+        lines=("5: safe",),
+        start_line=5,
+    )
+    answer = AgentAnswer(
+        summary="Both paths were inspected.",
+        findings=(
+            "Unsafe path (obs_0123456789abcdef 2-2).",
+            "Safe path (obs_fedcba9876543210 5-5).",
+        ),
+        next_actions=("Fix the unsafe path.",),
+        citations=(SourceCitation(first.observation_id, first.path, 2, 2),),
+        issue_present=True,
+    )
+
+    recovered = _recover_inline_citations(
+        answer,
+        (first, second),
+        frozenset({first.observation_id, second.observation_id}),
+    )
+
+    assert recovered.citations == (
+        SourceCitation(first.observation_id, first.path, 2, 2),
+        SourceCitation(second.observation_id, second.path, 5, 5),
+    )
+
+
+@pytest.mark.parametrize(
+    "finding",
+    (
+        "unknown (obs_aaaaaaaaaaaaaaaa 2-3)",
+        "outside range (obs_0123456789abcdef 2-99)",
+        (
+            "ambiguous (obs_0123456789abcdef 2-3 and "
+            "obs_0123456789abcdef 2-3)"
+        ),
+    ),
+)
+def test_inline_citation_recovery_fails_closed(finding: str) -> None:
+    observation = ToolObservation(
+        observation_id="obs_0123456789abcdef",
+        tool="read_file",
+        path="a.py",
+        content_hash="hash",
+        text="x\ny",
+        lines=("2: x", "3: y"),
+        start_line=2,
+    )
+    answer = AgentAnswer(
+        summary="Evidence.",
+        findings=(finding,),
+        next_actions=("Review.",),
+        citations=(),
+    )
+
+    recovered = _recover_inline_citations(
+        answer,
+        (observation,),
+        frozenset({observation.observation_id}),
+    )
+
+    assert recovered.citations == ()
 
 
 def test_transport_retry_after_schema_failure_keeps_corrective_message() -> None:
@@ -1209,6 +1702,30 @@ def test_repair_does_not_bind_to_redacted_line() -> None:
     assert repaired.citations[0].observation_id == "wrong-id"
 
 
+@pytest.mark.parametrize("observation_id", ["obs_visible", "wrong-id"])
+def test_repair_does_not_clamp_oversized_citation_range(observation_id: str) -> None:
+    observation = ToolObservation(
+        observation_id="obs_visible",
+        tool="read_file",
+        path="a.py",
+        content_hash="hash-visible",
+        text="alpha\nbeta",
+        lines=("1: alpha", "2: beta"),
+        start_line=1,
+    )
+    original = SourceCitation(observation_id, "a.py", 2, 999)
+    answer = AgentAnswer(
+        summary="Oversized range.",
+        findings=("A claim was made.",),
+        next_actions=("Read the missing range.",),
+        citations=(original,),
+    )
+
+    repaired = _repair_citations(answer, (observation,), frozenset({"obs_visible"}))
+
+    assert repaired.citations == (original,)
+
+
 def test_ungrounded_answer_is_nudged_to_investigate() -> None:
     # An answer with no grounding (here, no citations and nothing read) should be
     # redirected into further investigation (a list_files), not accepted.
@@ -1271,7 +1788,15 @@ def test_leading_slash_path_is_normalized() -> None:
 
 
 def test_auto_read_fetches_cited_unread_path() -> None:
-    # The model answers citing a file it never read; the planner injects a read.
+    # The model cites a file emitted by completed discovery; the planner reads it.
+    listing = ToolObservation(
+        observation_id="obs_list",
+        tool="list_files",
+        path=".",
+        content_hash="list-hash",
+        text="experiment.py",
+        lines=("experiment.py",),
+    )
     answer = _base(
         "final_answer",
         summary="s",
@@ -1283,10 +1808,91 @@ def test_auto_read_fetches_cited_unread_path() -> None:
     )
     client = FakeClient([answer])
     planner = ModelInvestigationPlanner(client=client)
-    decision = planner.decide(goal="x", catalog=())
+    decision = planner.decide(goal="x", catalog=(listing,))
     assert isinstance(decision, ToolCall)
     assert decision.tool == "read_file"
     assert decision.path == "experiment.py"
+
+
+def test_auto_read_uses_nonroot_recursive_path_without_double_prefix() -> None:
+    listing = ToolObservation(
+        observation_id="obs_list",
+        tool="list_files",
+        path="src",
+        content_hash="list-hash",
+        text="src/experiment.py",
+        lines=("src/experiment.py",),
+        metadata={"glob": "**/*", "recursive": True},
+    )
+    answer = _base(
+        "final_answer",
+        summary="A candidate was found.",
+        findings=["The candidate needs inspection."],
+        next_actions=["Verify it."],
+        citations=[
+            {
+                "observation_id": "obs_unread",
+                "path": "src/experiment.py",
+                "start_line": 2,
+                "end_line": 2,
+            }
+        ],
+    )
+
+    decision = ModelInvestigationPlanner(client=FakeClient([answer])).decide(
+        goal="inspect the experiment",
+        catalog=(listing,),
+    )
+
+    assert decision == ToolCall(tool="read_file", path="src/experiment.py", start_line=2)
+
+
+def test_auto_read_never_dispatches_an_unlisted_or_virtual_citation_path() -> None:
+    answer = _base(
+        "final_answer",
+        summary="s",
+        findings=["f"],
+        next_actions=["verify"],
+        citations=[
+            {
+                "observation_id": "obs_unknown",
+                "path": "command/generic.parent_commit/",
+                "start_line": 1,
+                "end_line": 1,
+            }
+        ],
+    )
+    client = FakeClient([answer])
+
+    decision = ModelInvestigationPlanner(client=client).decide(goal="x", catalog=())
+
+    assert decision == ToolCall(tool="list_files", path=".")
+
+
+def test_exact_rendered_command_id_repairs_a_miscopied_virtual_path() -> None:
+    command = _command_observation("obs_head", "generic.head_commit", status="succeeded")
+    answer = _base(
+        "final_answer",
+        summary="HEAD was identified.",
+        findings=["The current HEAD commit was identified."],
+        next_actions=["Record it."],
+        citations=[
+            {
+                "observation_id": command.observation_id,
+                "path": "generic.head_commit",
+                "start_line": 1,
+                "end_line": 1,
+            }
+        ],
+    )
+    client = FakeClient([answer])
+
+    decision = ModelInvestigationPlanner(client=client).decide(goal="x", catalog=(command,))
+
+    assert isinstance(decision, AgentAnswer)
+    assert decision.citations == (
+        SourceCitation(command.observation_id, command.path, 1, 1),
+    )
 
 
 def test_auto_read_skipped_when_path_already_read() -> None:

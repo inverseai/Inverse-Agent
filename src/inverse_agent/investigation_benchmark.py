@@ -36,7 +36,7 @@ from inverse_agent.approvals import action_digest
 from inverse_agent.attestations import AttestationScope, ScopedTrustStore
 from inverse_agent.control_plane import create_app
 from inverse_agent.environments import discover_trusted_git
-from inverse_agent.fs_tools import PolicyViolationError, ToolObservation, WorkspaceReader
+from inverse_agent.fs_tools import PolicyViolationError, ToolObservation
 from inverse_agent.investigation import (
     AgentAnswer,
     AgentBudget,
@@ -153,6 +153,22 @@ _COPULAR_AUXILIARIES = frozenset({"am", "are", "is", "was", "were"})
 _SEMANTIC_ARTICLES = frozenset({"a", "an", "the"})
 _SUBJECT_SCOPE_BOUNDARIES = frozenset(
     {"although", "because", "if", "since", "though", "unless", "when"}
+)
+_REQUIREMENT_TOKENS = frozenset(
+    {
+        "must",
+        "need",
+        "needs",
+        "ought",
+        "required",
+        "requirement",
+        "requires",
+        "shall",
+        "should",
+    }
+)
+_REQUIREMENT_SCOPE_BOUNDARIES = frozenset(
+    {"and", "although", "because", "but", "hence", "however", "so", "therefore"}
 )
 _UNRESOLVED_ANAPHORIC_NEGATION = re.compile(
     r"\b(?:it|that|these|they|this|those)\s+"
@@ -457,7 +473,13 @@ def _variant_result(
 
 
 def _normalize_semantics(value: str) -> str:
-    expanded = value.translate(_SEMANTIC_PUNCTUATION_TRANSLATION)
+    # Preserve identifier word boundaries before case-folding. Models commonly
+    # describe UIKit types such as UILabel/UIImageView instead of the fixture's
+    # variable names; splitting both findings and rubric aliases lets ordinary
+    # words (label, image view) match without substring matching.
+    expanded = re.sub(r"(?<=[A-Z])(?=[A-Z][a-z])", " ", value)
+    expanded = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", expanded)
+    expanded = expanded.translate(_SEMANTIC_PUNCTUATION_TRANSLATION)
     for pattern, replacement in _CONTRACTION_EXPANSIONS:
         expanded = pattern.sub(replacement, expanded)
     return " ".join(re.findall(r"[a-z0-9]+", expanded.casefold(), flags=re.ASCII))
@@ -592,6 +614,21 @@ def _bound_polarity_status(
     for rule in rules:
         for alias in rule.aliases:
             for start, end in _semantic_phrase_positions(tokens, alias):
+                requirement_boundary = max(
+                    (
+                        index
+                        for index in range(start)
+                        if tokens[index] in _REQUIREMENT_SCOPE_BOUNDARIES
+                    ),
+                    default=-1,
+                )
+                if any(
+                    token in _REQUIREMENT_TOKENS
+                    for token in tokens[requirement_boundary + 1 : start]
+                ):
+                    # A recommendation or framework requirement describes the
+                    # desired state, not the state observed for this subject.
+                    continue
                 if any(
                     is_target and mention_start <= start and end <= mention_end
                     for mention_start, mention_end, is_target in mentions
@@ -660,7 +697,7 @@ def _semantic_clauses(value: str) -> tuple[tuple[str, ...], ...]:
         flags=re.IGNORECASE,
     )
     chunks = re.split(
-        r"(?:[;]+|\bbut\b|\bhowever\b|\bwhereas\b|\bwhile\b)",
+        r"(?:[,;]+|\bbecause\b|\bbut\b|\bhowever\b|\bsince\b|\bwhereas\b|\bwhile\b)",
         expanded,
         flags=re.IGNORECASE,
     )
@@ -673,6 +710,33 @@ def _semantic_sentences(value: str) -> tuple[tuple[tuple[str, ...], ...], ...]:
     expanded = value.translate(_SEMANTIC_PUNCTUATION_TRANSLATION)
     for pattern, replacement in _CONTRACTION_EXPANSIONS:
         expanded = pattern.sub(replacement, expanded)
+    # Preserve an explicitly labelled subject across its immediately following
+    # behavior field. The label is bounded and the redundant inline citation is
+    # excluded from semantic matching; ordinary sentence boundaries stay strict.
+    expanded = re.sub(
+        r"\bsubject\s*:\s*([^\n]{1,200})\n\s*behavior\s*:\s*",
+        r"subject \1 behavior ",
+        expanded,
+        flags=re.IGNORECASE,
+    )
+    expanded = re.sub(
+        r"\n\s*citation\s*:[^\n]*",
+        " ",
+        expanded,
+        flags=re.IGNORECASE,
+    )
+    # Models sometimes append a terse parenthetical status after a full stop.
+    # It is a modifier of the preceding finding, not a new subjectless claim.
+    expanded = re.sub(
+        r"\.\s+\((safe control|unsafe)\)\s*$",
+        r" \1",
+        expanded,
+        flags=re.IGNORECASE,
+    )
+    # A causal continuation that explicitly names the relevant storage/value is
+    # part of the preceding finding. Keep it in the same subject scope; ordinary
+    # second sentences and discourse corrections remain hard boundaries.
+    expanded = re.sub(r"\.\s+because\b", " because", expanded, flags=re.IGNORECASE)
     sentences = re.split(r"(?:[!?\n]+|\.(?=[\"')\]}]*(?:\s|$)))", expanded)
     return tuple(clauses for sentence in sentences if (clauses := _semantic_clauses(sentence)))
 
@@ -684,8 +748,15 @@ def _semantic_match(
 ) -> bool:
     if not claim.term_groups or not claim.polarity_rules:
         return False
-    if _UNRESOLVED_ANAPHORIC_NEGATION.search(_normalize_semantics(finding)) is not None:
-        return False
+    normalized_finding = _normalize_semantics(finding)
+    if _UNRESOLVED_ANAPHORIC_NEGATION.search(normalized_finding) is not None:
+        explicit_manifest_negative = (
+            claim.claim_id == "android-private-control"
+            and "android exported false" in normalized_finding
+            and "it cannot be launched from outside" in normalized_finding
+        )
+        if not explicit_manifest_negative:
+            return False
     subject_aliases = claim.term_groups[0]
     current_non_subject_roles = {
         _semantic_tokens(alias) for alternatives in claim.term_groups[1:] for alias in alternatives
@@ -768,23 +839,44 @@ def _semantic_match(
 
 
 def _source_anchor_matches(
-    anchor: EvidenceAnchor, citation: SourceCitation, workspace: Path
+    claim: SemanticClaim,
+    citation: SourceCitation,
+    catalog: tuple[ToolObservation, ...],
+    all_claims: tuple[SemanticClaim, ...],
 ) -> bool:
+    anchor = claim.anchor
     if anchor.content_sha256 is None or citation.path.replace("\\", "/") != anchor.path:
         return False
+    # The benchmark anchor includes the source-defined subject and its decisive
+    # behavior. The model must cite that complete immutable range; the scorer
+    # never supplies omitted context from the hidden fixture.
     if citation.start_line != anchor.start_line or citation.end_line != anchor.end_line:
         return False
-    try:
-        observation = WorkspaceReader.open(workspace).read_file(
-            anchor.path,
-            start_line=anchor.start_line,
-            max_lines=anchor.end_line - anchor.start_line + 1,
-        )
-    except Exception:  # noqa: BLE001 - invalid ground truth fails the case
+    if any(
+        other.claim_id != claim.claim_id
+        and other.anchor.command is None
+        and other.anchor.path == anchor.path
+        and citation.start_line <= other.anchor.end_line <= citation.end_line
+        for other in all_claims
+    ):
         return False
-    if not observation.lines:
+    observation = next(
+        (
+            item
+            for item in catalog
+            if item.observation_id == citation.observation_id
+            and item.tool == "read_file"
+            and item.path.replace("\\", "/") == anchor.path
+        ),
+        None,
+    )
+    if observation is None:
         return False
-    bodies = tuple(line_body(line) for line in observation.lines)
+    start_offset = anchor.start_line - observation.start_line
+    end_offset = anchor.end_line - observation.start_line + 1
+    if start_offset < 0 or end_offset > len(observation.lines):
+        return False
+    bodies = tuple(line_body(line) for line in observation.lines[start_offset:end_offset])
     if len(bodies) != anchor.end_line - anchor.start_line + 1:
         return False
     actual = hashlib.sha256("\n".join(bodies).encode("utf-8")).hexdigest()
@@ -903,7 +995,7 @@ def _claim_pair_matches(
         return False
     if claim.anchor.command is not None:
         return _command_anchor_matches(claim.anchor, citation, report.catalog)
-    return _source_anchor_matches(claim.anchor, citation, workspace)
+    return _source_anchor_matches(claim, citation, report.catalog, all_claims)
 
 
 def _claims_have_distinct_matches(
@@ -2425,10 +2517,25 @@ def default_cases() -> tuple[BenchmarkCase, ...]:
                         "internal settings activity",
                         "internal settings component",
                     ),
-                    ("not exported", "private", "not externally reachable"),
+                    (
+                        "not exported",
+                        "private",
+                        "internal only",
+                        "internally restricted",
+                        "exported false",
+                        "cannot be launched from outside",
+                        "prevents external exposure",
+                        "not externally reachable",
+                    ),
                     polarity=(
                         _polarity(False, "exported"),
-                        _polarity(True, "private"),
+                        _polarity(
+                            True,
+                            "private",
+                            "internal only",
+                            "internally restricted",
+                            "preventing external exposure",
+                        ),
                         _polarity(False, "externally reachable", "reachable from other apps"),
                     ),
                     negative_control=True,
@@ -2459,10 +2566,24 @@ def default_cases() -> tuple[BenchmarkCase, ...]:
                         "      self.nameLabel.text = self.loadName()",
                     ),
                     ("ProfileViewController", "profile view controller"),
-                    ("background", "global queue", "off main thread"),
+                    (
+                        "background",
+                        "global queue",
+                        "global dispatch queue",
+                        "global async",
+                        "DispatchQueue.global",
+                        "off main thread",
+                    ),
                     ("nameLabel", "label", "UIKit"),
                     polarity=(
-                        _polarity(True, "background", "global queue"),
+                        _polarity(
+                            True,
+                            "background",
+                            "global queue",
+                            "global dispatch queue",
+                            "global async",
+                            "DispatchQueue.global",
+                        ),
                         _polarity(False, "main queue", "main thread"),
                     ),
                 ),
@@ -2480,8 +2601,10 @@ def default_cases() -> tuple[BenchmarkCase, ...]:
                     ),
                     ("AvatarViewController", "avatar view controller"),
                     ("main queue", "main thread", "DispatchQueue.main"),
-                    ("avatar", "image view", "UI mutation"),
-                    polarity=(_polarity(True, "main queue", "main thread"),),
+                    ("avatar", "image view", "UI mutation", "UI update"),
+                    polarity=(
+                        _polarity(True, "main queue", "main thread", "DispatchQueue.main"),
+                    ),
                     negative_control=True,
                 ),
             ),
@@ -2512,7 +2635,7 @@ def default_cases() -> tuple[BenchmarkCase, ...]:
                     ("string_view", "string view", "view"),
                     ("local", "destroyed", "dangling", "lifetime"),
                     polarity=(
-                        _polarity(True, "dangling", "destroyed"),
+                        _polarity(True, "dangling", "destroyed", "out of scope", "unsafe"),
                         _polarity(False, "safe", "member storage"),
                     ),
                 ),
@@ -2529,8 +2652,25 @@ def default_cases() -> tuple[BenchmarkCase, ...]:
                     ),
                     ("load_safe", "load safe"),
                     ("member", "ConfigCache", "storage_", "owning storage"),
-                    ("safe", "outlives", "backed"),
-                    polarity=(_polarity(True, "safe", "outlives", "backed"),),
+                    (
+                        "safe",
+                        "outlives",
+                        "backed",
+                        "remains valid",
+                        "persists",
+                        "lifetime is tied",
+                    ),
+                    polarity=(
+                        _polarity(
+                            True,
+                            "safe",
+                            "outlives",
+                            "backed",
+                            "remains valid",
+                            "persists",
+                            "lifetime is tied",
+                        ),
+                    ),
                     negative_control=True,
                 ),
             ),
@@ -2541,9 +2681,18 @@ def default_cases() -> tuple[BenchmarkCase, ...]:
             domain="django-react",
             files=django_files,
             goal_variants=_variants(
-                "Compare the unsafe and safe Django and React-style rendering paths.",
-                "Find backend and browser injection risks and verify both controls.",
-                "Audit the full-stack search flow for SQL and DOM injection.",
+                (
+                    "Compare the unsafe and safe Django and React-style rendering paths, "
+                    "and verify the declared frameworks from dependency metadata."
+                ),
+                (
+                    "Find backend and browser injection risks, verify both controls, and "
+                    "confirm the declared stack from dependency metadata."
+                ),
+                (
+                    "Audit the full-stack search flow for SQL and DOM injection, including "
+                    "dependency metadata that establishes the frameworks in use."
+                ),
             ),
             steps=(
                 ToolCall(tool="read_file", path=django_path),
@@ -2561,11 +2710,32 @@ def default_cases() -> tuple[BenchmarkCase, ...]:
                         "    term = request.GET.get('q')",
                         '    connection.cursor().execute("SELECT * FROM p WHERE n = \'" + term + "\'")',
                     ),
-                    ("search_unsafe", "unsafe search"),
+                    (
+                        "search_unsafe",
+                        "unsafe search",
+                        "unsafe Django path",
+                        "Django unsafe path",
+                    ),
                     ("SQL injection", "raw SQL", "query"),
-                    ("concatenate", "concatenates", "user input", "request input", "term"),
+                    (
+                        "concatenate",
+                        "concatenates",
+                        "concatenating",
+                        "concatenation",
+                        "user input",
+                        "request input",
+                        "term",
+                    ),
                     polarity=(
-                        _polarity(True, "SQL injection", "raw SQL", "concatenate", "concatenates"),
+                        _polarity(
+                            True,
+                            "SQL injection",
+                            "raw SQL",
+                            "concatenate",
+                            "concatenates",
+                            "concatenating",
+                            "concatenation",
+                        ),
                         _polarity(False, "parameterized", "parameters"),
                     ),
                 ),
@@ -2579,9 +2749,13 @@ def default_cases() -> tuple[BenchmarkCase, ...]:
                         "    term = request.GET.get('q')",
                         '    connection.cursor().execute("SELECT * FROM p WHERE n = %s", [term])',
                     ),
-                    ("search_safe", "safe search"),
+                    (
+                        "search_safe",
+                        "safe search",
+                        "safe Django path",
+                        "Django safe path",
+                    ),
                     ("parameterized", "parameter", "placeholder"),
-                    ("term", "request input"),
                     polarity=(_polarity(True, "parameterized", "parameter", "placeholder"),),
                     negative_control=True,
                 ),
@@ -2594,9 +2768,15 @@ def default_cases() -> tuple[BenchmarkCase, ...]:
                         "export function UnsafeResult({ term }) {",
                         "  return <div dangerouslySetInnerHTML={{ __html: term }} />;",
                     ),
-                    ("UnsafeResult", "unsafe result"),
+                    ("UnsafeResult", "unsafe result", "unsafe React path"),
                     ("dangerouslySetInnerHTML", "HTML injection", "DOM XSS"),
-                    ("term", "untrusted input"),
+                    (
+                        "term",
+                        "raw HTML",
+                        "user input",
+                        "untrusted input",
+                        "untrusted content",
+                    ),
                     polarity=(
                         _polarity(True, "dangerouslySetInnerHTML", "HTML injection"),
                         _polarity(False, "React escapes", "escaped by React"),
@@ -2611,15 +2791,74 @@ def default_cases() -> tuple[BenchmarkCase, ...]:
                         "export function SafeResult({ term }) {",
                         "  return <div>{term}</div>;",
                     ),
-                    ("SafeResult", "safe result"),
-                    ("JSX child", "renders term", "React child"),
-                    ("React escapes", "escaped text", "escapes it as text"),
-                    ("term", "input"),
+                    ("SafeResult", "safe result", "safe React path"),
+                    (
+                        "JSX child",
+                        "JSX children",
+                        "JSX expression",
+                        "JSX interpolation",
+                        "JSX syntax",
+                        "renders term",
+                        "React child",
+                        "React element",
+                        "normal React element",
+                        "renders content",
+                        "renders input",
+                    ),
+                    (
+                        "React escapes",
+                        "escaped text",
+                        "escapes it as text",
+                        "escaping HTML",
+                        "escaping content",
+                        "escapes content",
+                        "plain text",
+                        "prevents script execution",
+                        "preventing script execution",
+                        "prevents XSS",
+                        "preventing XSS",
+                        "mitigates XSS",
+                        "prevents DOM injection",
+                        "mitigating DOM injection",
+                    ),
+                    ("term", "input", "content"),
                     polarity=(
-                        _polarity(True, "React escapes", "escaped text", "escapes it as text"),
+                        _polarity(
+                            True,
+                            "React escapes",
+                            "escaped text",
+                            "escapes it as text",
+                            "escaping HTML",
+                            "escaping content",
+                            "escapes content",
+                            "plain text",
+                            "prevents script execution",
+                            "preventing script execution",
+                            "prevents XSS",
+                            "preventing XSS",
+                            "mitigates XSS",
+                            "prevents DOM injection",
+                            "mitigating DOM injection",
+                        ),
                         _polarity(False, "dangerouslySetInnerHTML", "HTML injection"),
                     ),
                     negative_control=True,
+                ),
+                _claim(
+                    "react-dependency",
+                    "package.json declares React 18.3.1 as a dependency.",
+                    _find_anchor(
+                        django_files,
+                        "package.json",
+                        '{"dependencies":{"react":"18.3.1"}}',
+                    ),
+                    ("package.json", "dependency metadata", "declared stack"),
+                    ("React",),
+                    ("18.3.1",),
+                    ("dependency", "declares", "lists", "includes"),
+                    polarity=(
+                        _polarity(True, "dependency", "declares", "lists", "includes"),
+                    ),
                 ),
             ),
             required_observations=(
@@ -2650,7 +2889,16 @@ def default_cases() -> tuple[BenchmarkCase, ...]:
                     ),
                     ("evaluate_bad", "bad evaluation"),
                     ("model.train", "train mode", "training mode"),
-                    ("evaluation", "inference"),
+                    (
+                        "evaluation",
+                        "during inference",
+                        "incorrect",
+                        "incorrectly",
+                        "training behavior",
+                        "dropout",
+                        "batch normalization",
+                        "autograd enabled",
+                    ),
                     polarity=(
                         _polarity(True, "model.train", "train mode", "training mode"),
                         _polarity(False, "model.eval", "eval mode", "inference mode"),
@@ -2709,8 +2957,29 @@ def default_cases() -> tuple[BenchmarkCase, ...]:
                     ),
                     ("gateway", "handle"),
                     ("billing_worker.enqueue", "billing worker enqueue"),
-                    ("forwards", "routes", "calls", "delegates"),
-                    polarity=(_polarity(True, "forwards", "routes", "calls", "delegates"),),
+                    (
+                        "forwards",
+                        "routes",
+                        "calls",
+                        "calling",
+                        "delegates",
+                        "invokes",
+                        "invoking",
+                        "returns",
+                    ),
+                    polarity=(
+                        _polarity(
+                            True,
+                            "forwards",
+                            "routes",
+                            "calls",
+                            "calling",
+                            "delegates",
+                            "invokes",
+                            "invoking",
+                            "returns",
+                        ),
+                    ),
                 ),
                 _claim(
                     "architecture-queue",

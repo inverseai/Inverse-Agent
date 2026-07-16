@@ -272,6 +272,453 @@ def test_semantic_scorer_accepts_synonyms_not_exact_answer_text(tmp_path: Path) 
     assert passed, reason
 
 
+def test_semantic_scorer_accepts_live_uikit_type_names_with_complete_anchors(
+    tmp_path: Path,
+) -> None:
+    case = next(item for item in default_cases() if item.name == "ios_main_thread_ui")
+
+    def answer(catalog: tuple[ToolObservation, ...]) -> AgentAnswer:
+        return AgentAnswer(
+            summary="The profile path is unsafe while the avatar control uses the main queue.",
+            findings=(
+                (
+                    "Unsafe path: `ProfileViewController.refresh()` updates a UILabel "
+                    "inside a global async block, violating UIKit's requirement that UI "
+                    "updates occur on the main thread."
+                ),
+                (
+                    "Safe path: `AvatarViewController.refresh()` loads an image in the "
+                    "background, then dispatches the UI update to the main queue."
+                ),
+            ),
+            next_actions=("Move every UIKit mutation onto the main queue.",),
+            citations=_case_citations(case, catalog),
+            issue_present=True,
+        )
+
+    report, workspace = _run_source_answer(case, tmp_path, answer)
+    passed, reason = _score_variant_model(case, report, workspace)
+    assert passed, reason
+
+
+def test_semantic_scorer_accepts_global_dispatch_queue_wording(tmp_path: Path) -> None:
+    case = next(item for item in default_cases() if item.name == "ios_main_thread_ui")
+
+    def answer(catalog: tuple[ToolObservation, ...]) -> AgentAnswer:
+        return AgentAnswer(
+            summary="The profile path is unsafe and the avatar path is safe.",
+            findings=(
+                (
+                    "ProfileViewController.refresh updates nameLabel.text on a global dispatch "
+                    "queue, which is unsafe because UIKit requires updates on the main thread."
+                ),
+                (
+                    "AvatarViewController.refresh schedules avatarView.image on "
+                    "DispatchQueue.main, respecting UIKit thread confinement."
+                ),
+            ),
+            next_actions=("Move the unsafe update to the main queue.",),
+            citations=_case_citations(case, catalog),
+            issue_present=True,
+        )
+
+    report, workspace = _run_source_answer(case, tmp_path, answer)
+    passed, reason = _score_variant_model(case, report, workspace)
+    assert passed, reason
+
+
+def test_semantic_scorer_does_not_treat_requirement_as_observed_safe_state(
+    tmp_path: Path,
+) -> None:
+    case = next(item for item in default_cases() if item.name == "ios_main_thread_ui")
+
+    def answer(catalog: tuple[ToolObservation, ...]) -> AgentAnswer:
+        return AgentAnswer(
+            summary="The profile path is unsafe; the avatar path still needs a fix.",
+            findings=(
+                "ProfileViewController.refresh updates nameLabel on a global queue.",
+                "AvatarViewController.refresh should dispatch its avatar update to the main queue.",
+            ),
+            next_actions=("Move every UIKit mutation onto the main queue.",),
+            citations=_case_citations(case, catalog),
+            issue_present=True,
+        )
+
+    report, workspace = _run_source_answer(case, tmp_path, answer)
+    passed, reason = _score_variant_model(case, report, workspace)
+    assert not passed
+    assert "semantic claims" in reason
+
+
+def test_semantic_scorer_accepts_live_pytorch_clause_with_complete_anchors(
+    tmp_path: Path,
+) -> None:
+    case = next(item for item in default_cases() if item.name == "pytorch_eval_mode")
+
+    def answer(catalog: tuple[ToolObservation, ...]) -> AgentAnswer:
+        return AgentAnswer(
+            summary="The bad helper trains during evaluation; the safe helper disables gradients.",
+            findings=(
+                (
+                    "The `evaluate_bad` function incorrectly calls `model.train()`, "
+                    "which enables training behavior such as dropout and batch normalization "
+                    "updates."
+                ),
+                (
+                    "The `evaluate_safe` helper sets evaluation mode (`model.eval()`) "
+                    "and uses `torch.inference_mode()` to prevent gradient tracking."
+                ),
+            ),
+            next_actions=("Use the safe helper for evaluation.",),
+            citations=_case_citations(case, catalog),
+            issue_present=True,
+        )
+
+    report, workspace = _run_source_answer(case, tmp_path, answer)
+    passed, reason = _score_variant_model(case, report, workspace)
+    assert passed, reason
+
+
+def test_semantic_scorer_accepts_absent_inference_guard_with_autograd_enabled(
+    tmp_path: Path,
+) -> None:
+    case = next(item for item in default_cases() if item.name == "pytorch_eval_mode")
+
+    def answer(catalog: tuple[ToolObservation, ...]) -> AgentAnswer:
+        return AgentAnswer(
+            summary="The bad helper leaves training state active; the safe helper disables it.",
+            findings=(
+                (
+                    "evaluate_bad calls model.train and computes loss without an inference-mode "
+                    "guard, leaving autograd enabled. This violates inference-state correctness."
+                ),
+                (
+                    "evaluate_safe calls model.eval and torch.inference_mode, disabling "
+                    "gradient tracking."
+                ),
+            ),
+            next_actions=("Use the safe helper for evaluation.",),
+            citations=_case_citations(case, catalog),
+            issue_present=True,
+        )
+
+    report, workspace = _run_source_answer(case, tmp_path, answer)
+    passed, reason = _score_variant_model(case, report, workspace)
+    assert passed, reason
+
+
+def test_semantic_scorer_accepts_manifest_boolean_and_internal_only_wording(
+    tmp_path: Path,
+) -> None:
+    case = next(item for item in default_cases() if item.name == "android_exported_activity")
+
+    def answer(catalog: tuple[ToolObservation, ...]) -> AgentAnswer:
+        read = next(item for item in catalog if item.tool == "read_file")
+        return AgentAnswer(
+            summary="The manifest exposes one activity and restricts the control.",
+            findings=(
+                (
+                    'DeepLinkActivity is externally reachable because android:exported="true".'
+                ),
+                (
+                    "InternalSettingsActivity has android:exported=\"false\", indicating "
+                    "it cannot be launched from outside the app."
+                ),
+            ),
+            next_actions=("Keep the internal activity restricted.",),
+            citations=(
+                SourceCitation(read.observation_id, read.path, 4, 4),
+                SourceCitation(read.observation_id, read.path, 5, 6),
+            ),
+            issue_present=True,
+        )
+
+    report, workspace = _run_source_answer(case, tmp_path, answer)
+    passed, reason = _score_variant_model(case, report, workspace)
+    assert passed, reason
+
+
+def test_semantic_scorer_accepts_calling_as_a_forwarding_relation(
+    tmp_path: Path,
+) -> None:
+    case = next(item for item in default_cases() if item.name == "generic_architecture")
+
+    def answer(catalog: tuple[ToolObservation, ...]) -> AgentAnswer:
+        citations = _case_citations(case, catalog)
+        return AgentAnswer(
+            summary="The gateway invokes the worker, which puts work on the queue.",
+            findings=(
+                "Gateway handles a request by calling billing_worker.enqueue(request).",
+                case.claims[1].answer_text,
+            ),
+            next_actions=("Keep the queue handoff observable.",),
+            citations=citations,
+            issue_present=True,
+        )
+
+    report, workspace = _run_source_answer(case, tmp_path, answer)
+    passed, reason = _score_variant_model(case, report, workspace)
+    assert passed, reason
+
+
+def test_semantic_scorer_accepts_returning_as_a_forwarding_relation(
+    tmp_path: Path,
+) -> None:
+    case = next(item for item in default_cases() if item.name == "generic_architecture")
+
+    def answer(catalog: tuple[ToolObservation, ...]) -> AgentAnswer:
+        return AgentAnswer(
+            summary="Gateway returns into the worker, which enqueues the request.",
+            findings=(
+                "The gateway handle returns billing_worker.enqueue(request).",
+                "billing_worker.enqueue puts the request onto BILLING_QUEUE.",
+            ),
+            next_actions=("Keep the handoff observable.",),
+            citations=_case_citations(case, catalog),
+            issue_present=True,
+        )
+
+    report, workspace = _run_source_answer(case, tmp_path, answer)
+    passed, reason = _score_variant_model(case, report, workspace)
+    assert passed, reason
+
+
+def test_semantic_scorer_accepts_live_full_stack_equivalent_wording(
+    tmp_path: Path,
+) -> None:
+    case = next(item for item in default_cases() if item.name == "django_react_injection")
+
+    def answer(catalog: tuple[ToolObservation, ...]) -> AgentAnswer:
+        return AgentAnswer(
+            summary="The backend and browser paths each contain an unsafe and safe control.",
+            findings=(
+                "search_unsafe concatenates user input into a SQL query, creating injection risk.",
+                "search_safe uses parameterized placeholders to bind user input safely.",
+                (
+                    "UnsafeResult renders untrusted content with dangerouslySetInnerHTML, "
+                    "exposing XSS risk."
+                ),
+                (
+                    "SafeResult renders content as a normal React element, preventing "
+                    "script execution."
+                ),
+                "package.json lists React 18.3.1 as a dependency.",
+            ),
+            next_actions=("Keep both safe controls and remove both unsafe paths.",),
+            citations=_case_citations(case, catalog),
+            issue_present=True,
+        )
+
+    report, workspace = _run_source_answer(case, tmp_path, answer)
+    passed, reason = _score_variant_model(case, report, workspace)
+    assert passed, reason
+
+
+def test_semantic_scorer_accepts_user_input_for_unsafe_react_value(tmp_path: Path) -> None:
+    case = next(item for item in default_cases() if item.name == "django_react_injection")
+
+    def answer(catalog: tuple[ToolObservation, ...]) -> AgentAnswer:
+        return AgentAnswer(
+            summary="Both stacks contain an unsafe path and a safe control.",
+            findings=(
+                "search_unsafe concatenates user input into a SQL query, creating injection risk.",
+                "search_safe uses parameterized placeholders to bind user input safely.",
+                "UnsafeResult renders user input via dangerouslySetInnerHTML, exposing XSS risk.",
+                "SafeResult renders content as a JSX child, preventing script execution.",
+                "Dependency metadata declares React 18.3.1.",
+            ),
+            next_actions=("Remove both unsafe paths.",),
+            citations=_case_citations(case, catalog),
+            issue_present=True,
+        )
+
+    report, workspace = _run_source_answer(case, tmp_path, answer)
+    passed, reason = _score_variant_model(case, report, workspace)
+    assert passed, reason
+
+
+def test_semantic_scorer_accepts_raw_html_and_explicit_content_escaping(
+    tmp_path: Path,
+) -> None:
+    case = next(item for item in default_cases() if item.name == "django_react_injection")
+
+    def answer(catalog: tuple[ToolObservation, ...]) -> AgentAnswer:
+        return AgentAnswer(
+            summary="Both stacks contain an unsafe path and a safe control.",
+            findings=(
+                "search_unsafe concatenates user input into a SQL query, enabling injection.",
+                "search_safe uses a parameterized query to prevent SQL injection.",
+                "UnsafeResult assigns raw HTML via dangerouslySetInnerHTML, exposing XSS risk.",
+                "SafeResult renders content as plain text, preventing DOM injection.",
+                "package.json includes the React 18.3.1 dependency.",
+            ),
+            next_actions=("Remove both unsafe paths.",),
+            citations=_case_citations(case, catalog),
+            issue_present=True,
+        )
+
+    report, workspace = _run_source_answer(case, tmp_path, answer)
+    passed, reason = _score_variant_model(case, report, workspace)
+    assert passed, reason
+
+
+def test_semantic_scorer_accepts_jsx_that_escapes_content(tmp_path: Path) -> None:
+    case = next(item for item in default_cases() if item.name == "django_react_injection")
+
+    def answer(catalog: tuple[ToolObservation, ...]) -> AgentAnswer:
+        return AgentAnswer(
+            summary="Both stacks contain an unsafe path and a safe control.",
+            findings=(
+                "search_unsafe concatenates user input into a SQL query, enabling injection.",
+                "search_safe uses a parameterized query to prevent SQL injection.",
+                "UnsafeResult renders term via dangerouslySetInnerHTML, exposing DOM injection.",
+                (
+                    "SafeResult outputs term as plain JSX children, thereby escaping malicious "
+                    "markup and mitigating DOM injection."
+                ),
+                "The declared stack in package.json lists React 18.3.1 as a dependency.",
+            ),
+            next_actions=("Remove both unsafe paths.",),
+            citations=_case_citations(case, catalog),
+            issue_present=True,
+        )
+
+    report, workspace = _run_source_answer(case, tmp_path, answer)
+    passed, reason = _score_variant_model(case, report, workspace)
+    assert passed, reason
+
+
+def test_semantic_scorer_requires_grounded_manifest_finding(
+    tmp_path: Path,
+) -> None:
+    case = next(item for item in default_cases() if item.name == "django_react_injection")
+
+    def answer(catalog: tuple[ToolObservation, ...]) -> AgentAnswer:
+        return AgentAnswer(
+            summary="Both stacks contain an unsafe path and a safe control; React is declared.",
+            findings=(
+                "Unsafe Django path builds a SQL query via string concatenation.",
+                "Safe Django path uses a parameterized SQL placeholder.",
+                "Unsafe React path renders untrusted content with dangerouslySetInnerHTML.",
+                "Safe React path renders content as escaped plain text through JSX interpolation.",
+                "package.json declares React 18.3.1 as a dependency.",
+            ),
+            next_actions=("Remove the two unsafe paths and retain both controls.",),
+            citations=_case_citations(case, catalog),
+            issue_present=True,
+        )
+
+    report, workspace = _run_source_answer(case, tmp_path, answer)
+    passed, reason = _score_variant_model(case, report, workspace)
+    assert passed, reason
+
+
+def test_semantic_scorer_rejects_false_extra_finding(tmp_path: Path) -> None:
+    case = next(item for item in default_cases() if item.name == "django_react_injection")
+
+    def answer(catalog: tuple[ToolObservation, ...]) -> AgentAnswer:
+        views = next(
+            item for item in catalog if item.tool == "read_file" and item.path == "projects/views.py"
+        )
+        return AgentAnswer(
+            summary="The requested controls and dependency were checked.",
+            findings=(
+                *(claim.answer_text for claim in case.claims),
+                "projects/views.py declares Django 99 as its installed dependency.",
+            ),
+            next_actions=("Remove the unsafe paths.",),
+            citations=(
+                *_case_citations(case, catalog),
+                SourceCitation(views.observation_id, views.path, 1, 1),
+            ),
+            issue_present=True,
+        )
+
+    report, workspace = _run_source_answer(case, tmp_path, answer)
+    assert report.verdict is InvestigationVerdict.PASS
+    passed, reason = _score_variant_model(case, report, workspace)
+    assert not passed
+    assert "semantic claims" in reason
+
+
+def test_semantic_scorer_accepts_live_cpp_wording_with_complete_anchors(
+    tmp_path: Path,
+) -> None:
+    case = next(item for item in default_cases() if item.name == "cpp_dangling_view")
+
+    def answer(catalog: tuple[ToolObservation, ...]) -> AgentAnswer:
+        return AgentAnswer(
+            summary="The local-backed view dangles; the member-backed view is safe.",
+            findings=(
+                (
+                    "load_bad returns std::string_view(local), where local goes out of "
+                    "scope; unsafe."
+                ),
+                (
+                    "load_safe returns a view of member storage_, which remains valid for "
+                    "the ConfigCache lifetime. (safe control)"
+                ),
+            ),
+            next_actions=("Keep returned views backed by owning storage.",),
+            citations=_case_citations(case, catalog),
+            issue_present=True,
+        )
+
+    report, workspace = _run_source_answer(case, tmp_path, answer)
+    passed, reason = _score_variant_model(case, report, workspace)
+    assert passed, reason
+
+
+def test_semantic_scorer_accepts_persistent_member_lifetime_wording(tmp_path: Path) -> None:
+    case = next(item for item in default_cases() if item.name == "cpp_dangling_view")
+
+    def answer(catalog: tuple[ToolObservation, ...]) -> AgentAnswer:
+        return AgentAnswer(
+            summary="The local view dangles while the member-backed view stays valid.",
+            findings=(
+                "load_bad returns a dangling string_view because local goes out of scope.",
+                (
+                    "ConfigCache::load_safe returns storage_, a member string, as a string_view; "
+                    "since storage_ is part of the object's lifetime, the view remains valid as "
+                    "long as the object exists."
+                ),
+            ),
+            next_actions=("Keep views backed by persistent owning storage.",),
+            citations=_case_citations(case, catalog),
+            issue_present=True,
+        )
+
+    report, workspace = _run_source_answer(case, tmp_path, answer)
+    passed, reason = _score_variant_model(case, report, workspace)
+    assert passed, reason
+
+
+def test_semantic_scorer_accepts_labelled_subject_behavior_finding(tmp_path: Path) -> None:
+    case = next(item for item in default_cases() if item.name == "cpp_dangling_view")
+
+    def answer(catalog: tuple[ToolObservation, ...]) -> AgentAnswer:
+        return AgentAnswer(
+            summary="The local view dangles while the member-backed view remains valid.",
+            findings=(
+                (
+                    "subject: load_bad\nbehavior: returns a string_view over local, which goes "
+                    "out of scope and dangles.\ncitation: obs lines 3-5"
+                ),
+                (
+                    "subject: load_safe\nbehavior: returns member storage_ that remains valid for "
+                    "the ConfigCache lifetime.\ncitation: obs line 10"
+                ),
+            ),
+            next_actions=("Keep returned views backed by owning storage.",),
+            citations=_case_citations(case, catalog),
+            issue_present=True,
+        )
+
+    report, workspace = _run_source_answer(case, tmp_path, answer)
+    passed, reason = _score_variant_model(case, report, workspace)
+    assert passed, reason
+
+
 def test_semantic_scorer_rejects_anchor_text_without_meaning(tmp_path: Path) -> None:
     case = next(item for item in default_cases() if item.name == "pytorch_eval_mode")
 
@@ -280,6 +727,29 @@ def test_semantic_scorer_rejects_anchor_text_without_meaning(tmp_path: Path) -> 
             summary="Copied source tokens.",
             findings=("model.train()", "model.eval()"),
             next_actions=("Review manually.",),
+            citations=_case_citations(case, catalog),
+            issue_present=True,
+        )
+
+    report, workspace = _run_source_answer(case, tmp_path, answer)
+    passed, reason = _score_variant_model(case, report, workspace)
+    assert not passed
+    assert "semantic claims" in reason
+
+
+def test_semantic_scorer_rejects_generic_findings_with_correct_anchors(
+    tmp_path: Path,
+) -> None:
+    case = next(item for item in default_cases() if item.name == "cpp_dangling_view")
+
+    def answer(catalog: tuple[ToolObservation, ...]) -> AgentAnswer:
+        return AgentAnswer(
+            summary="One path is unsafe and another is safe.",
+            findings=(
+                "One function returns a view over a local object that goes out of scope.",
+                "Another function returns a view backed by member storage.",
+            ),
+            next_actions=("Keep returned views backed by owning storage.",),
             citations=_case_citations(case, catalog),
             issue_present=True,
         )
@@ -1000,6 +1470,36 @@ def test_semantic_scorer_rejects_broad_overlapping_anchor_ranges(tmp_path: Path)
     assert "validated evidence anchors" in reason
 
 
+def test_semantic_scorer_rejects_decisive_line_without_subject_anchor(
+    tmp_path: Path,
+) -> None:
+    case = next(item for item in default_cases() if item.name == "ios_main_thread_ui")
+    first_anchor = case.claims[0].anchor
+
+    def answer(catalog: tuple[ToolObservation, ...]) -> AgentAnswer:
+        citations = _case_citations(case, catalog)
+        return AgentAnswer(
+            summary="Both UI paths were inspected.",
+            findings=tuple(claim.answer_text for claim in case.claims),
+            next_actions=("Move the unsafe mutation to the main queue.",),
+            citations=(
+                replace(
+                    citations[0],
+                    start_line=first_anchor.end_line,
+                    end_line=first_anchor.end_line,
+                ),
+                citations[1],
+            ),
+            issue_present=True,
+        )
+
+    report, workspace = _run_source_answer(case, tmp_path, answer)
+    assert report.verdict is InvestigationVerdict.PASS
+    passed, reason = _score_variant_model(case, report, workspace)
+    assert not passed
+    assert "validated evidence anchors" in reason
+
+
 def test_tampered_anchor_prevents_case_and_suite_pass(tmp_path: Path) -> None:
     cases = list(default_cases())
     original = cases[0]
@@ -1087,19 +1587,24 @@ def test_empty_required_read_does_not_satisfy_full_stack_case(tmp_path: Path) ->
     )
 
     def answer(catalog: tuple[ToolObservation, ...]) -> AgentAnswer:
+        available = tuple(
+            citation
+            for claim in case.claims
+            if (citation := _find_citation(catalog, claim.anchor)) is not None
+        )
         return AgentAnswer(
             summary="The full-stack paths were inspected.",
             findings=tuple(claim.answer_text for claim in case.claims),
             next_actions=("Keep the safe controls.",),
-            citations=_case_citations(case, catalog),
+            citations=available,
             issue_present=True,
         )
 
     report, workspace = _run_source_answer(case, tmp_path, answer)
-    assert report.verdict is InvestigationVerdict.PASS
     passed, reason = _score_variant_model(case, report, workspace)
     assert not passed
-    assert "required observation" in reason
+    assert report.verdict is not InvestigationVerdict.PASS
+    assert "verdict=" in reason
 
 
 def test_truncated_reads_do_not_satisfy_required_observations(tmp_path: Path) -> None:
