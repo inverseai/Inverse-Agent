@@ -11,12 +11,15 @@ protocol failure.
 
 from __future__ import annotations
 
+import ast
 import json
 import math
 import re
+import textwrap
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
+from html.parser import HTMLParser
 from typing import Any, Protocol
 
 from inverse_agent.fs_tools import (
@@ -139,7 +142,10 @@ _SYSTEM_PROMPT = (
     "search, or read request; use its result or choose a different request. If a "
     "directory may contain nested source files, use list_files with glob='**/*'; use "
     "list_files rather than search_text to discover filenames or extensions. If a "
-    "read_file observation already shows the answer, send final_answer now.\n"
+    "read_file observation already shows the answer, send final_answer now. For a trace, "
+    "pipeline, flow, or call-chain goal, a caller proves only the handoff: follow each "
+    "relevant workspace-defined callee to its listed implementation and cite a distinct "
+    "finding for each observed hop before returning final_answer.\n"
     "Citations: cite a read_file or explicitly CITABLE command observation only. "
     "Copy its observation_id exactly "
     "from the id= field, use its path, and set start_line/end_line to the numbers "
@@ -147,7 +153,8 @@ _SYSTEM_PROMPT = (
     "distinct citation range to a line you actually saw; combine findings when "
     "the same range would otherwise be repeated. For a source finding, include the "
     "source-defined subject declaration and its decisive behavior in the cited range, "
-    "not only the final behavior line.\n"
+    "not only the final behavior line. For an import-only framework finding, cite only the "
+    "import statement and do not include the following declaration.\n"
     "In final_answer set condition_holds=true when the code confirms the "
     "condition or fact the goal asks about (e.g. the component IS exported, the "
     "entrypoint DOES exist, the bug IS present) and false only if the code shows "
@@ -155,7 +162,16 @@ _SYSTEM_PROMPT = (
     "condition_holds true even when a safe control is also present. For compare/audit "
     "goals, use one self-contained finding per distinct subject and explicitly name its "
     "source-defined function, class, component, or symbol plus its observed behavior, "
-    "including every requested unsafe path and safe control; generic phrases such as "
+    "including every requested unsafe path and safe control. When one requested safe "
+    "subject uses several distinct protection mechanisms, name every observed mechanism "
+    "in that subject's single finding. Do not combine distinct unsafe and safe subjects "
+    "into one finding, even when they share a file. For an injection finding that names "
+    "dangerouslySetInnerHTML, use one positive-flow clause in this order: the source-defined "
+    "component, a passes/renders/feeds verb, explicitly untrusted, user-controlled, "
+    "user-provided, or user-supplied data, then the named sink. Merely calling HTML raw or naming a prop does "
+    "not establish provenance. For other injection findings, explicitly distinguish "
+    "untrusted, user-controlled, user-provided, or user-supplied data from static or trusted content; "
+    "syntax such as an HTML sink alone is not data provenance; generic phrases such as "
     "'the same file' or 'a component' are not subjects. Give a "
     "non-empty summary, at least one finding, "
     "and at least one recommended next action. Provide exactly one citation for "
@@ -163,10 +179,12 @@ _SYSTEM_PROMPT = (
     "mechanism or result rather than only calling it safe or naming syntax. Keep all "
     "answer fields concise; do not duplicate findings or citations inside the summary.\n"
     "Observation completeness: headers explicitly show truncated/incomplete flags. "
-    "A bounded read_file window may support a localized claim when every cited line "
-    "is visible. Redaction of an unrelated secret does not prevent a complete localized "
-    "answer grounded entirely in visible non-redacted lines; never reveal, reconstruct, "
-    "or search for redacted content. Never infer broad absence from an incomplete or truncated list_files "
+    "A bounded non-code read_file window may support a localized claim when every cited "
+    "line is visible. Code-source anchors require a read_file observation beginning at "
+    "line 1 that is either unredacted or explicitly reports lexical_context_preserved=true, "
+    "so comments, strings, and other lexical context are known. Never reveal, reconstruct, "
+    "or search for redacted content. Never infer broad "
+    "absence from an incomplete or truncated list_files "
     "or search_text result, or from an incomplete read of a cited path. Retry the same "
     "catalog request successfully to replace earlier uncertainty. If the final answer "
     "still depends on missing content, set complete=false. Set complete=true on tool "
@@ -186,6 +204,283 @@ _COMMAND_PROMPT_APPENDIX = (
     "recovery command to the command that must already have a failed observation. "
     "Never select a mapped recovery command before that required failure."
 )
+_SOURCE_IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(?:(?:::|\.)[A-Za-z_][A-Za-z0-9_]*)*")
+_CAMEL_IDENTIFIER = re.compile(r"[a-z0-9][A-Z]")
+_CITATION_LABEL_FINDING = re.compile(
+    r"\s*(?:citation|evidence|source)\s*:\s*obs_[A-Za-z0-9_]{8,128}"
+    r"(?:\s+(?:lines?\s*)?\d+(?:\s*[-\u2013]\s*\d+)?)?\s*[.]?\s*",
+    re.IGNORECASE,
+)
+_CODE_PATH_SPAN = re.compile(
+    r"`(?=[^`\r\n]*[/\\])[^`\r\n]*\."
+    r"(?:cjs|js|jsx|mjs|svelte|ts|tsx|vue)`",
+    re.IGNORECASE,
+)
+_SUMMARY_SENTENCE_BOUNDARY = re.compile(r"(?<=[.!?])\s+")
+_DANGEROUS_HTML_SINK = re.compile(r"(?<![A-Za-z0-9_$])dangerouslySetInnerHTML(?![A-Za-z0-9_$])")
+_DANGEROUS_HTML_SINK_CANDIDATE = re.compile(r"dangerouslySetInnerHTML", re.IGNORECASE)
+_UNSAFE_RESULT_SUBJECT = re.compile(r"(?<![A-Za-z0-9_$])UnsafeResult(?![A-Za-z0-9_$])")
+_UNSAFE_RESULT_CANDIDATE = re.compile(r"UnsafeResult", re.IGNORECASE)
+_UNTRUSTED_DATA = re.compile(
+    r"\b(?:untrusted|user[- ]controlled|user[- ]provided|user[- ]supplied|"
+    r"user(?:Controlled|Provided|Supplied)[A-Za-z0-9_$]*)\b",
+    re.IGNORECASE,
+)
+_DIRECT_DATA_FLOW = re.compile(
+    r"\b(?:assigns|feeds|forwards|injects|inserts|pass|passes|renders|sends|sets)\b",
+    re.IGNORECASE,
+)
+_REACT_LABELED_SUBJECT = re.compile(
+    r"\bsubject\s*:\s*`?UnsafeResult`?\s*;\s*behavior\s*:\s*",
+    re.IGNORECASE,
+)
+_REACT_PROTECTED_OR_NEGATED = frozenset(
+    {
+        "avoid",
+        "avoids",
+        "block",
+        "blocks",
+        "cannot",
+        "cant",
+        "couldn",
+        "didn",
+        "doesn",
+        "don",
+        "encoded",
+        "escaped",
+        "escaping",
+        "filter",
+        "filtered",
+        "filtering",
+        "filters",
+        "false",
+        "hadn",
+        "hasn",
+        "haven",
+        "isn",
+        "mayn",
+        "mightn",
+        "mustn",
+        "never",
+        "needn",
+        "no",
+        "not",
+        "prevent",
+        "prevented",
+        "prevents",
+        "protected",
+        "refuse",
+        "refuses",
+        "safe",
+        "sanitised",
+        "sanitise",
+        "sanitises",
+        "sanitising",
+        "sanitize",
+        "sanitizes",
+        "sanitizing",
+        "sanitized",
+        "static",
+        "shouldn",
+        "wasn",
+        "weren",
+        "won",
+        "wouldn",
+        "trusted",
+        "validated",
+        "without",
+    }
+)
+_REACT_POST_SINK_DISCONNECTION = frozenset({"audit", "logger", "only", "wrapper"})
+_REACT_SUBJECT_FLOW_WORDS = frozenset({"component", "directly", "explicitly", "that"})
+_REACT_FLOW_PROVENANCE_WORDS = frozenset(
+    {"a", "an", "directly", "explicitly", "raw", "the", "untrusted"}
+)
+_REACT_PROVENANCE_SINK_WORDS = frozenset(
+    {
+        "content",
+        "data",
+        "directly",
+        "dom",
+        "html",
+        "input",
+        "into",
+        "markup",
+        "payload",
+        "prop",
+        "property",
+        "react",
+        "sink",
+        "term",
+        "text",
+        "the",
+        "through",
+        "to",
+        "value",
+        "via",
+        "with",
+        "unsafely",
+    }
+)
+_REACT_FLOW_CONNECTORS = frozenset({"into", "through", "to", "via", "with"})
+_EXPLICIT_DECLARATION = re.compile(
+    r"^\s*(?:(?:abstract|annotation|async|case|data|declare|default|export|final|internal|open|"
+    r"override|partial|private|protected|pub(?:\s*\([^)]*\))?|public|readonly|"
+    r"ref|sealed|static|unsafe|value)\s+)*(?:actor|class|def|"
+    r"enum(?:\s+(?:class|struct))?|fn|fun|func|function|interface|module|namespace|"
+    r"object|protocol|record(?:\s+(?:class|struct))?|struct|trait)\s*\*?\s+"
+    r"([A-Za-z_][A-Za-z0-9_]*)"
+    r"(?![\w$\\]|[^\x00-\x7F])"
+)
+_TYPED_FUNCTION_DECLARATION = re.compile(
+    r"^\s*(?!(?:assert|await|break|case|catch|co_await|co_return|co_yield|continue|"
+    r"defer|delete|do|else|for|go|goto|if|new|raise|return|sizeof|switch|throw|try|"
+    r"typeof|while|with|yield)\b)"
+    r"(?:[A-Za-z_][A-Za-z0-9_:<>,.?\[\]]*\s+)+[*&\s]*"
+    r"([A-Za-z_][A-Za-z0-9_]*)\s*\([^;{}]*\)\s*"
+    r"(?:(?:const|final|noexcept|override)\s*)*(?:->[^{;]+)?\s*(?:\{|;|$)"
+)
+_QUALIFIED_CONSTRUCTOR_DECLARATION = re.compile(
+    r"^\s*(?:[A-Za-z_][A-Za-z0-9_]*::)+~?([A-Za-z_][A-Za-z0-9_]*)\s*\("
+)
+_PASCAL_CONSTRUCTOR_DECLARATION = re.compile(
+    r"^\s*(?:public\s+|private\s+|protected\s+)?([A-Z][A-Za-z0-9_]*)\s*"
+    r"\([^;{}]*\)\s*(?:throws\s+[^{]+)?(?:\{|$)"
+)
+_CONSTEXPR_DECLARATION = re.compile(
+    r"^\s*(?:(?:inline|static)\s+)*(?:constexpr|consteval|constinit)\s+"
+    r"(?:[A-Za-z_][A-Za-z0-9_:<>,.?\[\]]*\s+)+[*&\s]*"
+    r"([A-Za-z_][A-Za-z0-9_]*)\s*="
+)
+_JS_METHOD_DECLARATION = re.compile(
+    r"^\s*(?!(?:catch|for|if|switch|while|with)\b)"
+    r"(?:(?:async|get|set|static)\s+)*([A-Za-z_$][A-Za-z0-9_$]*)\s*"
+    r"\([^;{}]*\)\s*\{"
+)
+_SHELL_FUNCTION_DECLARATION = re.compile(
+    r"^\s*(?:function\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*\(\s*\)\s*(?:\{|$)"
+)
+_SQL_DECLARATION = re.compile(
+    r"^\s*CREATE\s+(?:OR\s+REPLACE\s+)?(?:TEMP(?:ORARY)?\s+)?"
+    r"(?:FUNCTION|PROCEDURE|TABLE|TRIGGER|VIEW)\s+(?:IF\s+NOT\s+EXISTS\s+)?"
+    r"(?:(?:[A-Za-z_][A-Za-z0-9_]*|\"[A-Za-z_][A-Za-z0-9_]*\"|"
+    r"`[A-Za-z_][A-Za-z0-9_]*`|\[[A-Za-z_][A-Za-z0-9_]*\])\.)*"
+    r"(?:\"([A-Za-z_][A-Za-z0-9_]*)\"|`([A-Za-z_][A-Za-z0-9_]*)`|"
+    r"\[([A-Za-z_][A-Za-z0-9_]*)\]|([A-Za-z_][A-Za-z0-9_]*))"
+    r"(?![\w$\\]|[^\x00-\x7F])",
+    re.IGNORECASE,
+)
+_SQL_RESERVED_DECLARATION_SYMBOLS = frozenset(
+    {"exists", "if", "not", "or", "replace", "temp", "temporary"}
+)
+_GO_TYPE_DECLARATION = re.compile(
+    r"^\s*type\s+([A-Za-z_][A-Za-z0-9_]*)\s+(?:=\s*)?"
+    r"(?:struct|interface|[A-Za-z_][A-Za-z0-9_.]*)\b"
+)
+_GO_RECEIVER_METHOD_DECLARATION = re.compile(
+    r"^\s*func\s*\([^)]*\)\s*([A-Za-z_][A-Za-z0-9_]*)\s*\("
+)
+_OBJC_TYPE_DECLARATION = re.compile(
+    r"^\s*@(?:implementation|interface|protocol)\s+([A-Za-z_][A-Za-z0-9_]*)"
+    r"(?![\w$\\]|[^\x00-\x7F])"
+)
+_OBJC_METHOD_DECLARATION = re.compile(
+    r"^\s*[-+]\s*\([^)]*\)\s*([A-Za-z_][A-Za-z0-9_]*)"
+    r"(?![\w$\\]|[^\x00-\x7F])"
+)
+_PREPROCESSOR_CONDITIONAL = re.compile(
+    r"^\s*#\s*(if|ifdef|ifndef|elif|else|endif)\b(.*)$",
+    re.IGNORECASE,
+)
+_PREPROCESSOR_INTEGER_LITERAL = re.compile(
+    r"\s*(?:\(\s*)?"
+    r"(0[xX][0-9A-Fa-f']+|0[bB][01']+|0[0-7']*|[1-9][0-9']*)"
+    r"[uUlLzZ]*(?:\s*\))?\s*"
+)
+_PREPROCESSOR_BOOLEAN_LITERAL = re.compile(r"\s*(?:\(\s*)?(true|false)(?:\s*\))?\s*")
+_PHP_HALT_COMPILER = re.compile(
+    r"(?<![A-Za-z0-9_\x80-\xff])__halt_compiler"
+    r"(?![A-Za-z0-9_\x80-\xff])\s*\(\s*\)\s*;",
+    re.IGNORECASE,
+)
+_SWIFT_CLASS_MEMBER_DECLARATION = re.compile(
+    r"^\s*class\s+(?:func|var)\s+([A-Za-z_][A-Za-z0-9_]*)"
+    r"(?![\w$\\]|[^\x00-\x7F])"
+)
+_PYTHON_IMPORT_LINE = re.compile(r"^\s*import\s+(.+?)\s*$")
+_PYTHON_FROM_IMPORT_LINE = re.compile(
+    r"^\s*from\s+(?:\.+(?:[A-Za-z_][A-Za-z0-9_.]*)?|"
+    r"[A-Za-z_][A-Za-z0-9_.]*)\s+import\s+(.+?)\s*$"
+)
+_JS_DEFAULT_IMPORT_DECLARATION = re.compile(
+    r"^\s*import\s+(?:type\s+)?([A-Za-z_$][A-Za-z0-9_$]*)"
+    r"(?:\s*,|\s+from\b)",
+    re.MULTILINE,
+)
+_JS_NAMESPACE_IMPORT_DECLARATION = re.compile(
+    r"^\s*import\s+\*\s+as\s+([A-Za-z_$][A-Za-z0-9_$]*)\s+from\b",
+    re.MULTILINE,
+)
+_JS_NAMED_IMPORT_DECLARATION = re.compile(
+    r"^\s*import\s+(?:type\s+)?"
+    r"(?:[A-Za-z_$][A-Za-z0-9_$]*\s*,\s*)?\{([^}]*)\}\s*from\b",
+    re.MULTILINE,
+)
+_SCRIPT_ASSIGNMENT_DECLARATION = re.compile(
+    r"^\s*(?:(?:const|let|val|var)\s+)?(?:mut\s+)?([A-Za-z_][A-Za-z0-9_]*)"
+    r"\s*(?::[^=]+)?=(?!=)"
+)
+_TYPED_VARIABLE_DECLARATION = re.compile(
+    r"^\s*(?!(?:assert|await|break|case|catch|co_await|co_return|co_yield|continue|"
+    r"defer|delete|do|else|for|go|goto|if|new|raise|return|sizeof|switch|throw|try|"
+    r"typeof|while|with|yield)\b)"
+    r"(?:[A-Za-z_][A-Za-z0-9_:<>,.?\[\]]*\s+)*"
+    r"[A-Za-z_][A-Za-z0-9_:<>,.?\[\]]*(?:\s*[*&]+\s*|\s+)"
+    r"([A-Za-z_][A-Za-z0-9_]*)\s*=(?!=)"
+)
+_C_LIKE_SOURCE_SUFFIXES = frozenset(
+    {
+        ".c",
+        ".cc",
+        ".cpp",
+        ".cs",
+        ".cxx",
+        ".h",
+        ".hh",
+        ".hpp",
+        ".hxx",
+        ".java",
+        ".m",
+        ".mm",
+    }
+)
+_C_CPP_SOURCE_SUFFIXES = frozenset(
+    {".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx", ".m", ".mm"}
+)
+_CPP_RAW_STRING_SUFFIXES = frozenset({".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx", ".mm"})
+_JS_SOURCE_SUFFIXES = frozenset({".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx"})
+_JSX_SOURCE_SUFFIXES = frozenset({".jsx", ".tsx"})
+_MARKUP_SOURCE_SUFFIXES = frozenset({".htm", ".html", ".svelte", ".vue", ".xml"})
+_EMBEDDED_SCRIPT_SUFFIXES = frozenset({".htm", ".html", ".svelte", ".vue"})
+_SCRIPT_ASSIGNMENT_SUFFIXES = frozenset(
+    {
+        ".cjs",
+        ".js",
+        ".jsx",
+        ".kt",
+        ".kts",
+        ".mjs",
+        ".php",
+        ".py",
+        ".rb",
+        ".rs",
+        ".swift",
+        ".ts",
+        ".tsx",
+    }
+)
+_SHELL_SOURCE_SUFFIXES = frozenset({".bash", ".fish", ".sh", ".zsh"})
+_HASH_COMMENT_SUFFIXES = _SHELL_SOURCE_SUFFIXES | frozenset({".php", ".py", ".rb"})
 _COMMAND_FINALIZATION_APPENDIX = (
     "\nThe declared command recovery sequence is complete. Return final_answer now; "
     "do not select another tool or command."
@@ -195,6 +490,27 @@ _SCHEMA_RETRY_CORRECTION = (
     "JSON object matching the supplied schema, with no prose, markdown fence, prefix, "
     "suffix, or additional object. Re-check that every finding is self-contained and has "
     "exactly one distinct citation in the same position."
+)
+_SOURCE_SYMBOL_CITATION_ERROR = (
+    "each source citation must include the source-defined symbol named in its finding plus "
+    "the decisive behavior; expand body-only ranges to the declaration"
+)
+_SOURCE_LEXICAL_CONTEXT_ERROR = (
+    "code-source anchors require a line-1 read_file observation with preserved lexical context"
+)
+_CITATION_LABEL_FINDING_ERROR = (
+    "a code-source finding must be a self-contained claim, not only a citation label"
+)
+_SOURCE_SYMBOL_FINDING_ERROR = (
+    "each code-source finding must name a concrete source-defined identifier supported by "
+    "the cited declaration"
+)
+_SUITE_BODY_CITATION_ERROR = (
+    "a cited suite header must include at least its first visible body line"
+)
+_INJECTION_PROVENANCE_ERROR = (
+    "a dangerouslySetInnerHTML security finding must state a positive direct flow of explicitly "
+    "untrusted, user-controlled, user-provided, or user-supplied data into that sink"
 )
 _SCHEMA_RETRY_DETAILS = {
     "final answer summary is empty": "Return a non-empty summary.",
@@ -211,6 +527,40 @@ _SCHEMA_RETRY_DETAILS = {
     "each finding must use a distinct citation range": (
         "Use a different exact evidence range for every finding, or combine claims that "
         "would otherwise reuse one range."
+    ),
+    _SOURCE_SYMBOL_CITATION_ERROR: (
+        "Expand each body-only source citation so its range includes the named function, "
+        "class, component, or symbol declaration and its decisive behavior. For an injection "
+        "finding, also state the positive direct flow of explicitly untrusted, user-controlled, "
+        "or user-supplied data into the named sink."
+    ),
+    _SOURCE_LEXICAL_CONTEXT_ERROR: (
+        "Read each cited code source again with start_line 1 and use an unredacted observation "
+        "or one explicitly marked lexical_context_preserved=true before returning a code-source "
+        "finding."
+    ),
+    _CITATION_LABEL_FINDING_ERROR: (
+        "Rewrite every code-source finding as a self-contained claim that names the observed "
+        "function, class, component, or symbol and describes its behavior; do not use a citation "
+        "label as a finding. Cite that symbol declaration through its decisive behavior."
+    ),
+    _SOURCE_SYMBOL_FINDING_ERROR: (
+        "Rewrite every code-source finding to name at least one concrete function, class, "
+        "component, import, or other identifier visible in the cited source and describe "
+        "its behavior."
+    ),
+    _SUITE_BODY_CITATION_ERROR: (
+        "Expand a citation that ends at a suite header ending in ':' to include at least "
+        "the first visible indented body line."
+    ),
+    _INJECTION_PROVENANCE_ERROR: (
+        "State that the named component positively passes, renders, assigns, feeds, forwards, "
+        "inserts, sends, or sets explicitly untrusted, user-controlled, user-provided, or "
+        "user-supplied data "
+        "directly into dangerouslySetInnerHTML. Use one clause ordered as: real component "
+        "name, positive flow verb, explicit provenance phrase, then dangerouslySetInnerHTML; "
+        "do not substitute only 'raw HTML' or 'term prop' for provenance. Also cite the "
+        "component declaration through the decisive sink line."
     ),
     "complete and condition_holds must be JSON booleans": (
         "Set complete and condition_holds to JSON true or false values, not strings."
@@ -236,6 +586,44 @@ _DEPENDENCY_MANIFEST_NAMES = frozenset(
         "pom.xml",
         "pyproject.toml",
         "requirements.txt",
+    }
+)
+_SOURCE_CODE_SUFFIXES = frozenset(
+    {
+        ".c",
+        ".cc",
+        ".cpp",
+        ".cs",
+        ".cxx",
+        ".go",
+        ".gradle",
+        ".h",
+        ".hh",
+        ".htm",
+        ".html",
+        ".hpp",
+        ".hxx",
+        ".java",
+        ".js",
+        ".jsx",
+        ".kt",
+        ".kts",
+        ".m",
+        ".mm",
+        ".php",
+        ".py",
+        ".rb",
+        ".rs",
+        ".scala",
+        ".sh",
+        ".sql",
+        ".svelte",
+        ".swift",
+        ".ts",
+        ".tsx",
+        ".vue",
+        ".xml",
+        ".zsh",
     }
 )
 _COMPACTION_SYSTEM_PROMPT = (
@@ -314,6 +702,8 @@ def _render_block(obs: ToolObservation) -> tuple[str, bool]:
         f"incomplete={str(obs.incomplete).lower()} "
         f"redacted={str(obs.redacted).lower()}"
     )
+    if obs.metadata.get("lexical_context_preserved") is True:
+        status += " lexical_context_preserved=true"
     header = f"id={obs.observation_id} tool={obs.tool} path={obs.path} status[{status}] ({citable})"
     if obs.tool == "list_files":
         listing_paths = (
@@ -591,6 +981,1723 @@ def _repair_citations(
     )
 
 
+def _masked_text(value: str) -> str:
+    """Mask non-newline characters without changing source line boundaries."""
+
+    return "".join(character if character in "\r\n" else " " for character in value)
+
+
+def _line_ending_span(source: str, start: int) -> tuple[int, int] | None:
+    """Return the next CR, LF, or CRLF span at or after ``start``."""
+
+    candidates = tuple(
+        position
+        for position in (source.find("\r", start), source.find("\n", start))
+        if position >= 0
+    )
+    if not candidates:
+        return None
+    line_start = min(candidates)
+    line_end = line_start + (2 if source.startswith("\r\n", line_start) else 1)
+    return line_start, line_end
+
+
+def _line_comment_end(
+    source: str,
+    start: int,
+    *,
+    splice: bool,
+    trigraph_splice: bool = False,
+) -> int:
+    """Return a line-comment end, following C phase-two backslash splices."""
+
+    cursor = start
+    while (line_ending := _line_ending_span(source, cursor)) is not None:
+        line_start, line_end = line_ending
+        physical_line = source[cursor:line_start].rstrip(" \t")
+        if not splice or not (
+            physical_line.endswith("\\") or (trigraph_splice and physical_line.endswith("??/"))
+        ):
+            return line_end
+        cursor = line_end
+    return len(source)
+
+
+def _lexical_token_end(
+    source: str,
+    start: int,
+    token: str,
+    suffix: str,
+) -> int | None:
+    """Match a token across C splices or Java Unicode-escape translation."""
+
+    cursor = start
+    for offset, expected in enumerate(token):
+        if suffix == ".java" and source.startswith("\\u", cursor):
+            unicode_match = re.match(r"\\u+([0-9A-Fa-f]{4})", source[cursor:])
+            if unicode_match is None or chr(int(unicode_match.group(1), 16)) != expected:
+                return None
+            cursor += len(unicode_match.group(0))
+        elif cursor < len(source) and source[cursor] == expected:
+            cursor += 1
+        else:
+            return None
+        if offset + 1 < len(token) and suffix in _C_CPP_SOURCE_SUFFIXES:
+            while True:
+                if source.startswith("\\\r\n", cursor):
+                    cursor += 3
+                elif source.startswith(("\\\r", "\\\n"), cursor):
+                    cursor += 2
+                elif suffix in _C_CPP_SOURCE_SUFFIXES and source.startswith("??/\r\n", cursor):
+                    cursor += 5
+                elif suffix in _C_CPP_SOURCE_SUFFIXES and source.startswith(
+                    ("??/\r", "??/\n"), cursor
+                ):
+                    cursor += 4
+                else:
+                    break
+    return cursor
+
+
+def _shell_arithmetic_depth(value: str) -> int:
+    """Count unmatched shell arithmetic groups outside quotes and escapes."""
+
+    depth = 0
+    quote = ""
+    index = 0
+    while index < len(value):
+        character = value[index]
+        if quote:
+            if quote == '"' and character == "\\":
+                index += min(2, len(value) - index)
+            elif character == quote:
+                quote = ""
+                index += 1
+            else:
+                index += 1
+            continue
+        if character in {"'", '"'}:
+            quote = character
+            index += 1
+            continue
+        if character == "\\":
+            index += min(2, len(value) - index)
+            continue
+        if value.startswith("$((", index):
+            depth += 1
+            index += 3
+            continue
+        if value.startswith("((", index):
+            depth += 1
+            index += 2
+            continue
+        if depth and value.startswith("))", index):
+            depth -= 1
+            index += 2
+            continue
+        index += 1
+    return depth
+
+
+def _ruby_heredoc_can_start(prefix: str) -> bool:
+    """Reject clear Ruby infix-shift contexts before a heredoc candidate."""
+
+    stripped = prefix.rstrip()
+    if not stripped or stripped.endswith(("=", "=>", "(", "[", "{", ",", ":")):
+        return True
+    return (
+        re.search(
+            r"\b(?:fail|p|print|puts|raise|return|warn|yield)\s*$",
+            stripped,
+        )
+        is not None
+    )
+
+
+def _heredoc_literal_end(source: str, start: int, suffix: str) -> int | None:
+    """Return the end of a shell, Ruby, or PHP heredoc that begins at ``start``."""
+
+    allow_indent = False
+    php = False
+    if suffix in _SHELL_SOURCE_SUFFIXES:
+        line_start = max(source.rfind("\r", 0, start), source.rfind("\n", 0, start)) + 1
+        prefix = source[line_start:start]
+        if _shell_arithmetic_depth(prefix):
+            return None
+        opener_ending = _line_ending_span(source, start)
+        opener_content_end = len(source) if opener_ending is None else opener_ending[0]
+        opener = source[start:opener_content_end]
+        pattern = re.compile(
+            r"<<(-?)[ \t]*(?:'([^'\r\n]+)'|\"([^\"\r\n]+)\"|"
+            r"\\([^ \t\r\n;&|()<>]+)|([A-Za-z_][A-Za-z0-9_]*))"
+        )
+        specs: list[tuple[str, bool]] = []
+        cursor = 0
+        quote = ""
+        arithmetic_depth = 0
+        while cursor < len(opener):
+            character = opener[cursor]
+            if quote:
+                if quote == '"' and character == "\\":
+                    cursor += min(2, len(opener) - cursor)
+                elif character == quote:
+                    quote = ""
+                    cursor += 1
+                else:
+                    cursor += 1
+                continue
+            if opener.startswith("$((", cursor):
+                arithmetic_depth += 1
+                cursor += 3
+                continue
+            if opener.startswith("((", cursor):
+                arithmetic_depth += 1
+                cursor += 2
+                continue
+            if arithmetic_depth and opener.startswith("))", cursor):
+                arithmetic_depth -= 1
+                cursor += 2
+                continue
+            if character in {"'", '"'}:
+                quote = character
+                cursor += 1
+                continue
+            if character == "\\":
+                cursor += min(2, len(opener) - cursor)
+                continue
+            if character == "#" and (cursor == 0 or opener[cursor - 1].isspace()):
+                break
+            match = pattern.match(opener, cursor) if not arithmetic_depth else None
+            if match is not None and not opener.startswith("<<<", cursor):
+                delimiter = next(value for value in match.groups()[1:] if value is not None)
+                specs.append((delimiter, match.group(1) == "-"))
+                cursor = match.end()
+                continue
+            if cursor == 0:
+                return None
+            cursor += 1
+        if not specs:
+            return None
+        body_cursor = len(source) if opener_ending is None else opener_ending[1]
+        for delimiter, allow_indent in specs:
+            found = False
+            while body_cursor < len(source):
+                ending = _line_ending_span(source, body_cursor)
+                content_end = len(source) if ending is None else ending[0]
+                candidate = source[body_cursor:content_end].removesuffix("\r")
+                if allow_indent:
+                    candidate = candidate.lstrip("\t")
+                if candidate == delimiter:
+                    body_cursor = content_end if ending is None else ending[1]
+                    found = True
+                    break
+                if ending is None:
+                    break
+                body_cursor = ending[1]
+            if not found:
+                return len(source)
+        return body_cursor
+    elif suffix == ".rb":
+        line_start = max(source.rfind("\r", 0, start), source.rfind("\n", 0, start)) + 1
+        if not _ruby_heredoc_can_start(source[line_start:start]):
+            return None
+        opener_ending = _line_ending_span(source, start)
+        opener_content_end = len(source) if opener_ending is None else opener_ending[0]
+        opener = source[start:opener_content_end]
+        pattern = re.compile(
+            r"<<([-~]?)(?:'([^'\r\n]+)'|\"([^\"\r\n]+)\"|"
+            r"`([^`\r\n]+)`|([A-Za-z_][A-Za-z0-9_]*))"
+        )
+        specs = []
+        cursor = 0
+        quote = ""
+        while cursor < len(opener):
+            character = opener[cursor]
+            if quote:
+                if character == "\\":
+                    cursor += min(2, len(opener) - cursor)
+                elif character == quote:
+                    quote = ""
+                    cursor += 1
+                else:
+                    cursor += 1
+                continue
+            match = pattern.match(opener, cursor)
+            if match is not None:
+                delimiter = next(value for value in match.groups()[1:] if value is not None)
+                specs.append((delimiter, bool(match.group(1))))
+                cursor = match.end()
+                continue
+            if cursor == 0:
+                return None
+            if character in {"'", '"', "`"}:
+                quote = character
+            elif character == "#":
+                break
+            cursor += 1
+        if not specs:
+            return None
+        body_cursor = len(source) if opener_ending is None else opener_ending[1]
+        for delimiter, allow_indent in specs:
+            found = False
+            while body_cursor < len(source):
+                ending = _line_ending_span(source, body_cursor)
+                content_end = len(source) if ending is None else ending[0]
+                candidate = source[body_cursor:content_end].removesuffix("\r")
+                if allow_indent:
+                    candidate = candidate.lstrip(" \t")
+                if candidate == delimiter:
+                    body_cursor = content_end if ending is None else ending[1]
+                    found = True
+                    break
+                if ending is None:
+                    break
+                body_cursor = ending[1]
+            if not found:
+                return len(source)
+        return body_cursor
+    elif suffix == ".php":
+        match = re.match(
+            r"<<<[ \t]*(?:(['\"])([A-Za-z_][A-Za-z0-9_]*)\1|"
+            r"([A-Za-z_][A-Za-z0-9_]*))",
+            source[start:],
+        )
+        if match is None:
+            return None
+        php = True
+        allow_indent = True
+        delimiter = match.group(2) or match.group(3)
+    else:
+        return None
+
+    opener_end = _line_ending_span(source, start + len(match.group(0)))
+    if opener_end is None:
+        return len(source)
+    cursor = opener_end[1]
+    while cursor < len(source):
+        ending = _line_ending_span(source, cursor)
+        content_end = len(source) if ending is None else ending[0]
+        raw_candidate = source[cursor:content_end].removesuffix("\r")
+        candidate = raw_candidate
+        if allow_indent:
+            candidate = candidate.lstrip(" \t")
+        if php and candidate.startswith(delimiter):
+            remainder = candidate[len(delimiter) :]
+            if not remainder or not (remainder[0].isalnum() or remainder[0] == "_"):
+                indentation = len(raw_candidate) - len(candidate)
+                return cursor + indentation + len(delimiter)
+        elif candidate == delimiter:
+            return content_end if ending is None else ending[1]
+        if ending is None:
+            break
+        cursor = ending[1]
+    return len(source)
+
+
+def _ruby_percent_literal_end(source: str, start: int) -> int | None:
+    """Return the end of a Ruby percent literal, including paired delimiters."""
+
+    match = re.match(r"%(?:[qQwWiIxrs])?([^A-Za-z0-9\s])", source[start:])
+    if match is None:
+        return None
+    opening = match.group(1)
+    closing = {"(": ")", "[": "]", "{": "}", "<": ">"}.get(opening, opening)
+    paired = closing != opening
+    depth = 1
+    index = start + len(match.group(0))
+    while index < len(source):
+        character = source[index]
+        if character == "\\":
+            index += min(2, len(source) - index)
+            continue
+        if paired and character == opening:
+            depth += 1
+        elif character == closing:
+            depth -= 1
+            if depth == 0:
+                return index + 1
+        index += 1
+    return len(source)
+
+
+def _ruby_begin_comment_end(source: str, start: int) -> int | None:
+    """Return the end of a Ruby =begin/=end block comment at column zero."""
+
+    if start > 0 and source[start - 1] not in "\r\n":
+        return None
+    if re.match(r"=begin(?=[ \t]|\r|\n|$)", source[start:]) is None:
+        return None
+    cursor = start
+    while cursor < len(source):
+        ending = _line_ending_span(source, cursor)
+        content_end = len(source) if ending is None else ending[0]
+        candidate = source[cursor:content_end].removesuffix("\r")
+        if cursor != start and re.match(r"=end(?:[ \t]|$)", candidate) is not None:
+            return content_end if ending is None else ending[1]
+        if ending is None:
+            break
+        cursor = ending[1]
+    return len(source)
+
+
+def _ruby_regex_literal_end(source: str, start: int) -> int:
+    """Return the end of a Ruby regex literal, which may cross physical lines."""
+
+    index = start + 1
+    in_character_class = False
+    while index < len(source):
+        character = source[index]
+        if character == "\\":
+            index += min(2, len(source) - index)
+            continue
+        if character == "[":
+            in_character_class = True
+        elif character == "]":
+            in_character_class = False
+        elif character == "/" and not in_character_class:
+            index += 1
+            while index < len(source) and source[index].isalpha():
+                index += 1
+            return index
+        index += 1
+    return len(source)
+
+
+def _ruby_regex_can_start(prefix: str) -> bool:
+    """Identify Ruby expression contexts that can introduce a slash regex."""
+
+    return (
+        prefix.endswith(("=~", "!~"))
+        or re.search(r"\b(?:then|unless|until|when)\s*$", prefix) is not None
+        or re.fullmatch(r"(?:abort|fail|p|print|puts|raise|warn)\s*", prefix) is not None
+        or _javascript_regex_can_start(prefix)
+    )
+
+
+def _mask_source_comments_and_strings(source: str, suffix: str = "") -> str:
+    """Replace comments and string literals with spaces while preserving newlines."""
+
+    result: list[str] = []
+    index = 0
+    quote = ""
+    block_end = ""
+    block_depth = 0
+    multiline_quote = False
+    raw_quote = False
+    verbatim_quote = False
+    while index < len(source):
+        character = source[index]
+        if block_end:
+            nested_block_end = (
+                _lexical_token_end(source, index, "/*", suffix)
+                if block_end == "*/" and block_depth
+                else None
+            )
+            closing_block_end = (
+                _lexical_token_end(source, index, "*/", suffix) if block_end == "*/" else None
+            )
+            if nested_block_end is not None:
+                result.extend(_masked_text(source[index:nested_block_end]))
+                index = nested_block_end
+                block_depth += 1
+            elif closing_block_end is not None or source.startswith(block_end, index):
+                end = closing_block_end or index + len(block_end)
+                result.extend(_masked_text(source[index:end]))
+                index = end
+                if block_depth:
+                    block_depth -= 1
+                if not block_depth:
+                    block_end = ""
+            else:
+                result.append(character if character in "\r\n" else " ")
+                index += 1
+            continue
+        if quote:
+            backslash_escapes = not (
+                raw_quote or verbatim_quote or (suffix in _SHELL_SOURCE_SUFFIXES and quote == "'")
+            )
+            if verbatim_quote and source.startswith('""', index):
+                result.extend((" ", " "))
+                index += 2
+            elif backslash_escapes and source.startswith("\\\r\n", index):
+                result.extend((" ", " ", "\n"))
+                index += 3
+            elif backslash_escapes and source.startswith("\\\r", index):
+                result.extend((" ", "\r"))
+                index += 2
+            elif suffix in _C_CPP_SOURCE_SUFFIXES and source.startswith("??/\r\n", index):
+                result.extend((" ", " ", " ", "\r", "\n"))
+                index += 5
+            elif suffix in _C_CPP_SOURCE_SUFFIXES and source.startswith(("??/\r", "??/\n"), index):
+                result.extend((" ", " ", " ", source[index + 3]))
+                index += 4
+            elif backslash_escapes and character == "\\" and index + 1 < len(source):
+                result.extend(
+                    (
+                        " ",
+                        source[index + 1] if source[index + 1] in "\r\n" else " ",
+                    )
+                )
+                index += 2
+            elif character in "\r\n" and quote in {"'", '"'} and not multiline_quote:
+                result.append(character)
+                index += 1
+                quote = ""
+            elif source.startswith(quote, index) and (
+                not raw_quote or not source.startswith('"', index + len(quote))
+            ):
+                result.extend(" " for _ in quote)
+                index += len(quote)
+                quote = ""
+                multiline_quote = False
+                raw_quote = False
+                verbatim_quote = False
+            else:
+                result.append(character if character in "\r\n" else " ")
+                index += 1
+            continue
+        if (
+            suffix == ".rb"
+            and (ruby_comment_end := _ruby_begin_comment_end(source, index)) is not None
+        ):
+            result.extend(_masked_text(source[index:ruby_comment_end]))
+            index = ruby_comment_end
+            continue
+        if suffix in _SHELL_SOURCE_SUFFIXES | {".php", ".rb"} and source.startswith("<<", index):
+            heredoc_end = _heredoc_literal_end(source, index, suffix)
+            if heredoc_end is not None:
+                result.extend(_masked_text(source[index:heredoc_end]))
+                index = heredoc_end
+                continue
+        if suffix == ".rb" and character == "%":
+            percent_end = _ruby_percent_literal_end(source, index)
+            if percent_end is not None:
+                result.extend(_masked_text(source[index:percent_end]))
+                index = percent_end
+                continue
+        if suffix == ".gradle" and source.startswith("$/", index):
+            dollar_slashy_end = index + 2
+            while dollar_slashy_end < len(source):
+                if source.startswith(("$$", "$/"), dollar_slashy_end):
+                    dollar_slashy_end += 2
+                elif source.startswith("/$", dollar_slashy_end):
+                    dollar_slashy_end += 2
+                    break
+                else:
+                    dollar_slashy_end += 1
+            result.extend(_masked_text(source[index:dollar_slashy_end]))
+            index = dollar_slashy_end
+            continue
+        if suffix == ".java":
+            java_text_block_open = _lexical_token_end(source, index, '"""', suffix)
+            if java_text_block_open is not None:
+                java_text_block_end = java_text_block_open
+                while java_text_block_end < len(source):
+                    close = _lexical_token_end(source, java_text_block_end, '"""', suffix)
+                    if close is not None:
+                        java_text_block_end = close
+                        break
+                    java_text_block_end += 1
+                result.extend(_masked_text(source[index:java_text_block_end]))
+                index = java_text_block_end
+                continue
+        if suffix == ".swift" and character == "#":
+            swift_raw_match = re.match(r'(#+)("{1,})', source[index:])
+            if swift_raw_match is not None:
+                terminator = f"{swift_raw_match.group(2)}{swift_raw_match.group(1)}"
+                close = source.find(terminator, index + len(swift_raw_match.group(0)))
+                end = len(source) if close < 0 else close + len(terminator)
+                result.extend(_masked_text(source[index:end]))
+                index = end
+                continue
+        if suffix in _MARKUP_SOURCE_SUFFIXES and source.startswith("<!--", index):
+            result.extend(" " for _ in "<!--")
+            index += 4
+            block_end = "-->"
+            continue
+        if suffix in {".cjs", ".js"} and source.startswith("<!--", index):
+            line_end = _line_comment_end(source, index, splice=False)
+            result.extend(_masked_text(source[index:line_end]))
+            index = line_end
+            continue
+        block_start_end = _lexical_token_end(source, index, "/*", suffix)
+        if block_start_end is not None:
+            result.extend(_masked_text(source[index:block_start_end]))
+            index = block_start_end
+            block_end = "*/"
+            block_depth = 1 if suffix in {".rs", ".swift"} else 0
+            continue
+        line_comment_token_end = _lexical_token_end(source, index, "//", suffix)
+        if (
+            line_comment_token_end is not None
+            or (suffix == ".sql" and source.startswith("--", index))
+            or (character == "#" and (not suffix or suffix in _HASH_COMMENT_SUFFIXES))
+        ):
+            splice = suffix in _C_CPP_SOURCE_SUFFIXES and line_comment_token_end is not None
+            line_end = _line_comment_end(
+                source,
+                index,
+                splice=splice,
+                trigraph_splice=suffix in _C_CPP_SOURCE_SUFFIXES,
+            )
+            result.extend(_masked_text(source[index:line_end]))
+            index = line_end
+            continue
+        if suffix == ".cs":
+            csharp_raw_match = re.match(r'\$*("{3,})', source[index:])
+            if csharp_raw_match is not None:
+                opening = csharp_raw_match.group(0)
+                result.extend(_masked_text(opening))
+                index += len(opening)
+                quote = csharp_raw_match.group(1)
+                multiline_quote = True
+                raw_quote = True
+                continue
+            csharp_verbatim_match = re.match(r'(?:@\$|\$@|@)"', source[index:])
+            if csharp_verbatim_match is not None:
+                opening = csharp_verbatim_match.group(0)
+                result.extend(_masked_text(opening))
+                index += len(opening)
+                quote = '"'
+                multiline_quote = True
+                verbatim_quote = True
+                continue
+        if suffix in _CPP_RAW_STRING_SUFFIXES and character == "R":
+            raw_match = re.match(r'R"([^ ()\\\t\r\n]{0,16})\(', source[index:])
+            if raw_match is not None:
+                terminator = f'){raw_match.group(1)}"'
+                close = source.find(terminator, index + len(raw_match.group(0)))
+                end = len(source) if close < 0 else close + len(terminator)
+                result.extend(_masked_text(source[index:end]))
+                index = end
+                continue
+        if suffix == ".rs" and character == "r":
+            raw_match = re.match(r'r(#{0,255})"', source[index:])
+            if raw_match is not None:
+                terminator = f'"{raw_match.group(1)}'
+                close = source.find(terminator, index + len(raw_match.group(0)))
+                end = len(source) if close < 0 else close + len(terminator)
+                result.extend(_masked_text(source[index:end]))
+                index = end
+                continue
+        if suffix == ".rb" and character == "/":
+            line_start = max(source.rfind("\r", 0, index), source.rfind("\n", 0, index)) + 1
+            prefix = source[line_start:index].rstrip()
+            if _ruby_regex_can_start(prefix):
+                ruby_regex_end = _ruby_regex_literal_end(source, index)
+                result.extend(_masked_text(source[index:ruby_regex_end]))
+                index = ruby_regex_end
+                continue
+        if suffix == ".gradle" and character == "/":
+            line_start = max(source.rfind("\r", 0, index), source.rfind("\n", 0, index)) + 1
+            prefix = source[line_start:index].rstrip()
+            if _javascript_regex_can_start(prefix):
+                groovy_slashy_end = _ruby_regex_literal_end(source, index)
+                result.extend(_masked_text(source[index:groovy_slashy_end]))
+                index = groovy_slashy_end
+                continue
+        if character == "/":
+            line_start = max(source.rfind("\r", 0, index), source.rfind("\n", 0, index)) + 1
+            prefix = source[line_start:index].rstrip()
+            if _javascript_regex_can_start(prefix):
+                regex_end = _javascript_regex_literal_end(source, index)
+                if regex_end is not None:
+                    result.extend(" " for _ in source[index:regex_end])
+                    index = regex_end
+                    continue
+        triple = source[index : index + 3]
+        if triple in {"'''", '"""'}:
+            result.extend((" ", " ", " "))
+            index += 3
+            quote = triple
+            multiline_quote = True
+            continue
+        if character in {"'", '"', "`"}:
+            result.append(" ")
+            index += 1
+            quote = character
+            multiline_quote = character == "`" or (
+                suffix in {".php", ".rb", ".sh", ".zsh"} or (suffix == ".rs" and character == '"')
+            )
+            continue
+        result.append(character)
+        index += 1
+    return "".join(result)
+
+
+def _javascript_regex_can_start(prefix: str) -> bool:
+    """Conservatively identify expression-start positions for a JS regex literal."""
+
+    if not prefix or prefix[-1] in "=(:,[!&|?;{" or prefix.endswith("=>"):
+        return True
+    if (
+        re.search(
+            r"\b(?:await|case|delete|do|else|in|instanceof|new|of|return|throw|"
+            r"typeof|void|yield)\s*$",
+            prefix,
+        )
+        is not None
+    ):
+        return True
+    if not prefix.endswith(")"):
+        return False
+    depth = 0
+    for index in range(len(prefix) - 1, -1, -1):
+        character = prefix[index]
+        if character == ")":
+            depth += 1
+        elif character == "(":
+            depth -= 1
+            if depth == 0:
+                leading = prefix[:index].rstrip()
+                control = re.search(r"([A-Za-z_$][A-Za-z0-9_$]*)\s*$", leading)
+                return control is not None and control.group(1) in {
+                    "for",
+                    "if",
+                    "while",
+                    "with",
+                }
+    return False
+
+
+def _javascript_regex_literal_end(source: str, start: int) -> int | None:
+    """Return the end of a single-line JavaScript regex literal, if complete."""
+
+    index = start + 1
+    in_character_class = False
+    while index < len(source):
+        character = source[index]
+        if character in "\r\n":
+            return None
+        if character == "\\":
+            index += 2
+            continue
+        if character == "[":
+            in_character_class = True
+        elif character == "]":
+            in_character_class = False
+        elif character == "/" and not in_character_class:
+            index += 1
+            while index < len(source) and source[index].isalpha():
+                index += 1
+            return index
+        index += 1
+    return None
+
+
+def _jsx_tag_end(source: str, start: int) -> int | None:
+    """Return the end of a JSX tag while ignoring braces in its attributes."""
+
+    brace_depth = 0
+    index = start + 1
+    while index < len(source):
+        character = source[index]
+        if character == "{":
+            brace_depth += 1
+        elif character == "}" and brace_depth:
+            brace_depth -= 1
+        elif character == ">" and not brace_depth:
+            return index + 1
+        index += 1
+    return None
+
+
+def _jsx_unmatched_opening_is_plausible(
+    source: str,
+    start: int,
+    tag_text: str,
+) -> bool:
+    """Distinguish a plausible JSX opener from common TS generic syntax."""
+
+    if start and (source[start - 1].isalnum() or source[start - 1] in "_$)]"):
+        return False
+    return (
+        re.match(
+            r"<[A-Za-z_$][A-Za-z0-9_$.-]*\s+extends\b",
+            tag_text,
+        )
+        is None
+    )
+
+
+def _mask_jsx_markup(source: str) -> str:
+    """Mask JSX tags and literal text while retaining braced code expressions."""
+
+    result = list(source)
+    stack: list[str] = []
+    index = 0
+    tag_start = re.compile(
+        r"<(?:(/)\s*)?((?:[^\W\d]|\$)(?:[\w$_.:-]|[^\x00-\x7F])*)"
+        r"(?=[\s/>])"
+    )
+    while index < len(source):
+        if stack and source[index] == "{":
+            depth = 1
+            expression_start = index + 1
+            index = expression_start
+            while index < len(source) and depth:
+                if source[index] == "{":
+                    depth += 1
+                elif source[index] == "}":
+                    depth -= 1
+                index += 1
+            expression_end = index - 1 if not depth else len(source)
+            result[expression_start:expression_end] = list(
+                _mask_jsx_markup(source[expression_start:expression_end])
+            )
+            continue
+        fragment_open = source.startswith("<>", index)
+        fragment_close = source.startswith("</>", index)
+        if fragment_open or fragment_close:
+            fragment_end = index + (3 if fragment_close else 2)
+            if stack or fragment_open:
+                for position in range(index, fragment_end):
+                    result[position] = " "
+                if fragment_close:
+                    if stack:
+                        stack.pop()
+                else:
+                    stack.append("#fragment")
+                index = fragment_end
+                continue
+        match = tag_start.match(source, index) if source[index] == "<" else None
+        if match is not None:
+            closing = bool(match.group(1))
+            name = match.group(2)
+            tag_end = _jsx_tag_end(source, index)
+            if tag_end is not None:
+                tag_text = source[index:tag_end]
+                self_closing = tag_text.rstrip().endswith("/>")
+                if (
+                    stack
+                    or self_closing
+                    or re.search(rf"<\s*/\s*{re.escape(name)}\s*>", source[tag_end:])
+                    or (
+                        not closing
+                        and _jsx_unmatched_opening_is_plausible(
+                            source,
+                            index,
+                            tag_text,
+                        )
+                    )
+                ):
+                    brace_depth = 0
+                    for position in range(index, tag_end):
+                        character = source[position]
+                        if character == "{":
+                            brace_depth += 1
+                        elif character == "}" and brace_depth:
+                            brace_depth -= 1
+                        elif not brace_depth and character not in "\r\n":
+                            result[position] = " "
+                    if closing:
+                        if stack:
+                            stack.pop()
+                    elif not self_closing:
+                        stack.append(name)
+                    index = tag_end
+                    continue
+        if stack and source[index] not in "\r\n":
+            result[index] = " "
+        index += 1
+    return "".join(result)
+
+
+def _translate_java_unicode_escapes(source: str) -> str:
+    """Apply eligible Java Unicode escapes before lexical masking and extraction."""
+
+    result: list[str] = []
+    index = 0
+    translated_backslashes = 0
+    while index < len(source):
+        if source.startswith("\\u", index):
+            unicode_match = re.match(r"\\u+([0-9A-Fa-f]{4})", source[index:])
+            if unicode_match is not None and translated_backslashes % 2 == 0:
+                translated = chr(int(unicode_match.group(1), 16))
+                result.append(translated)
+                translated_backslashes = translated_backslashes + 1 if translated == "\\" else 0
+                index += len(unicode_match.group(0))
+                continue
+        character = source[index]
+        result.append(character)
+        translated_backslashes = translated_backslashes + 1 if character == "\\" else 0
+        index += 1
+    return "".join(result)
+
+
+def _preprocessor_literal_truth(
+    condition: str,
+    *,
+    boolean_literals: bool,
+) -> bool | None:
+    """Return the truth of one exact integer or Boolean conditional literal."""
+
+    if boolean_literals:
+        match = _PREPROCESSOR_BOOLEAN_LITERAL.fullmatch(condition)
+        return None if match is None else match.group(1) == "true"
+    match = _PREPROCESSOR_INTEGER_LITERAL.fullmatch(condition)
+    if match is None:
+        return None
+    literal = match.group(1).replace("'", "")
+    if literal.casefold().startswith("0x"):
+        base = 16
+    elif literal.casefold().startswith("0b"):
+        base = 2
+    elif len(literal) > 1 and literal.startswith("0"):
+        base = 8
+    else:
+        base = 10
+    return int(literal, base) != 0
+
+
+def _mask_inactive_preprocessor_branches(
+    source: str,
+    *,
+    allow_splices: bool,
+    boolean_literals: bool,
+) -> str:
+    """Mask branches whose exact preprocessor literal makes them unreachable."""
+
+    result: list[str] = []
+    conditional_frames: list[tuple[bool, bool]] = []
+    lines = source.splitlines(keepends=True)
+    line_index = 0
+    while line_index < len(lines):
+        line = lines[line_index]
+        body = line.rstrip("\r\n")
+        directive_lines = [line]
+        logical_body = body
+        if body.lstrip(" \t").startswith("#"):
+            logical_parts: list[str] = []
+            while True:
+                candidate = logical_body.rstrip(" \t")
+                splice = "??/" if candidate.endswith("??/") else "\\"
+                if not allow_splices or not candidate.endswith(splice):
+                    logical_parts.append(logical_body)
+                    break
+                logical_parts.append(candidate[: -len(splice)])
+                if line_index + 1 >= len(lines):
+                    break
+                line_index += 1
+                continuation = lines[line_index]
+                directive_lines.append(continuation)
+                logical_body = continuation.rstrip("\r\n")
+            logical_body = "".join(logical_parts)
+        match = _PREPROCESSOR_CONDITIONAL.fullmatch(logical_body)
+        if match is not None:
+            directive = match.group(1).casefold()
+            condition = match.group(2)
+            if directive == "if":
+                truth = _preprocessor_literal_truth(
+                    condition,
+                    boolean_literals=boolean_literals,
+                )
+                conditional_frames.append((truth is False, truth is True))
+            elif directive in {"ifdef", "ifndef"}:
+                conditional_frames.append((False, False))
+            elif directive == "elif" and conditional_frames:
+                _inactive, definitely_selected = conditional_frames[-1]
+                truth = _preprocessor_literal_truth(
+                    condition,
+                    boolean_literals=boolean_literals,
+                )
+                conditional_frames[-1] = (
+                    definitely_selected or truth is False,
+                    definitely_selected or truth is True,
+                )
+            elif directive == "else" and conditional_frames:
+                _inactive, definitely_selected = conditional_frames[-1]
+                conditional_frames[-1] = (definitely_selected, True)
+            elif directive == "endif" and conditional_frames:
+                conditional_frames.pop()
+            result.extend(directive_lines)
+            line_index += 1
+            continue
+        result.extend(
+            directive_lines
+            if logical_body.lstrip(" \t").startswith("#")
+            else (
+                _masked_text(directive_line)
+                if any(inactive for inactive, _selected in conditional_frames)
+                else directive_line
+                for directive_line in directive_lines
+            )
+        )
+        line_index += 1
+    return "".join(result)
+
+
+def _mask_preprocessor_directives(source: str, *, allow_splices: bool) -> str:
+    """Mask C-family directive lines, including physical splice continuations."""
+
+    result: list[str] = []
+    continuing = False
+    for line in source.splitlines(keepends=True):
+        body = line.rstrip("\r\n")
+        directive = continuing or body.lstrip(" \t").startswith("#")
+        result.append(_masked_text(line) if directive else line)
+        continuing = allow_splices and directive and body.rstrip(" \t").endswith(("\\", "??/"))
+    return "".join(result)
+
+
+def _mask_ruby_data_section(source: str) -> str:
+    """Mask bytes after Ruby's exact column-zero ``__END__`` marker."""
+
+    offset = 0
+    for line in source.splitlines(keepends=True):
+        offset += len(line)
+        if line.rstrip("\r\n") == "__END__":
+            return source[:offset] + _masked_text(source[offset:])
+    return source
+
+
+def _mask_php_halt_compiler_tail(source: str) -> str:
+    """Mask bytes after the first real PHP ``__halt_compiler();`` token."""
+
+    match = _PHP_HALT_COMPILER.search(source)
+    if match is None:
+        return source
+    return source[: match.end()] + _masked_text(source[match.end() :])
+
+
+def _masked_source_code(source: str, suffix: str) -> str:
+    """Return source with non-code lexical regions masked for its language."""
+
+    lexical_source = _translate_java_unicode_escapes(source) if suffix == ".java" else source
+    masked = _mask_source_comments_and_strings(lexical_source, suffix)
+    if suffix in _C_CPP_SOURCE_SUFFIXES | {".cs"}:
+        allow_splices = suffix in _C_CPP_SOURCE_SUFFIXES
+        masked = _mask_inactive_preprocessor_branches(
+            masked,
+            allow_splices=allow_splices,
+            boolean_literals=suffix == ".cs",
+        )
+        masked = _mask_preprocessor_directives(masked, allow_splices=allow_splices)
+    elif suffix == ".rb":
+        masked = _mask_ruby_data_section(masked)
+    elif suffix == ".php":
+        masked = _mask_php_halt_compiler_tail(masked)
+    return _mask_jsx_markup(masked) if suffix in _JSX_SOURCE_SUFFIXES else masked
+
+
+def _explicit_declaration_symbols(source: str, suffix: str = "") -> frozenset[str]:
+    """Extract only unambiguous keyword declarations outside comments/strings."""
+
+    symbols: set[str] = set()
+    for line in _masked_source_code(source, suffix).splitlines():
+        match = _EXPLICIT_DECLARATION.match(line)
+        if match is None:
+            continue
+        if suffix == ".swift" and re.match(r"^\s*class\s+(?:func|subscript|var)\b", line):
+            continue
+        symbols.add(match.group(1))
+    return frozenset(symbols)
+
+
+class _MarkupDeclarationParser(HTMLParser):
+    """Collect declaration-like attributes and embedded script bodies from markup."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.symbols: set[str] = set()
+        self.script_capture_stack: list[bool] = []
+        self.script_suffix_stack: list[str] = []
+        self.script_sources: list[tuple[str, str]] = []
+        self.script_line_spans: list[tuple[int, int, str]] = []
+
+    def _record_attributes(self, attrs: list[tuple[str, str | None]]) -> None:
+        for name, value in attrs:
+            normalized_name = name.casefold()
+            if normalized_name not in {"android:id", "android:name", "id", "name"}:
+                continue
+            attribute_value = value or ""
+            if normalized_name in {"android:id", "android:name"}:
+                identifiers = re.findall(r"[A-Za-z_][A-Za-z0-9_]*", attribute_value)
+                if identifiers:
+                    self.symbols.add(identifiers[-1])
+            elif re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", attribute_value):
+                self.symbols.add(attribute_value)
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        self._record_attributes(attrs)
+        if tag.casefold() == "script":
+            attributes = {name.casefold(): value for name, value in attrs}
+            script_type = (attributes.get("type") or "").casefold().split(";", 1)[0].strip()
+            self.script_capture_stack.append(
+                script_type
+                in {
+                    "",
+                    "application/ecmascript",
+                    "application/javascript",
+                    "module",
+                    "text/ecmascript",
+                    "text/javascript",
+                    "text/typescript",
+                }
+            )
+            language = (attributes.get("lang") or "").casefold().strip()
+            self.script_suffix_stack.append(
+                {
+                    "jsx": ".jsx",
+                    "ts": ".ts",
+                    "tsx": ".tsx",
+                    "typescript": ".ts",
+                }.get(language, ".ts" if script_type == "text/typescript" else ".js")
+            )
+
+    def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        self._record_attributes(attrs)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag.casefold() == "script" and self.script_capture_stack:
+            self.script_capture_stack.pop()
+            self.script_suffix_stack.pop()
+
+    def handle_data(self, data: str) -> None:
+        if self.script_capture_stack and self.script_capture_stack[-1]:
+            self.script_sources.append((data, self.script_suffix_stack[-1]))
+            start_line, _column = self.getpos()
+            self.script_line_spans.append(
+                (
+                    start_line,
+                    start_line + data.count("\n"),
+                    self.script_suffix_stack[-1],
+                )
+            )
+
+
+def _parse_markup(source: str) -> _MarkupDeclarationParser | None:
+    """Parse markup, returning no partial declarations after a parser failure."""
+
+    parser = _MarkupDeclarationParser()
+    try:
+        parser.feed(source)
+        parser.close()
+    except (AssertionError, ValueError):
+        return None
+    return parser
+
+
+def _markup_declaration_symbols(source: str) -> frozenset[str]:
+    """Return symbols from real tag attributes, failing closed on malformed input."""
+
+    parser = _parse_markup(source)
+    return frozenset() if parser is None else frozenset(parser.symbols)
+
+
+def _markup_script_sources(source: str) -> tuple[tuple[str, str], ...]:
+    """Return only data contained by actual markup script elements."""
+
+    parser = _parse_markup(source)
+    return () if parser is None else tuple(parser.script_sources)
+
+
+def _markup_script_line_spans(source: str) -> tuple[tuple[int, int, str], ...]:
+    """Return relative line spans occupied by executable script element data."""
+
+    parser = _parse_markup(source)
+    return () if parser is None else tuple(parser.script_line_spans)
+
+
+def _mask_markup_comments(source: str) -> str:
+    """Mask markup comments while preserving tag attributes and line boundaries."""
+
+    result = list(source)
+    index = 0
+    in_tag = False
+    quote = ""
+    while index < len(source):
+        character = source[index]
+        if quote:
+            if character == quote:
+                quote = ""
+            index += 1
+            continue
+        if in_tag:
+            if character in {"'", '"'}:
+                quote = character
+            elif character == ">":
+                in_tag = False
+            index += 1
+            continue
+        if source.startswith("<!--", index):
+            close = source.find("-->", index + 4)
+            end = len(source) if close < 0 else close + 3
+            result[index:end] = list(_masked_text(source[index:end]))
+            index = end
+            continue
+        if character == "<":
+            in_tag = True
+        index += 1
+    return "".join(result)
+
+
+def _strip_sql_comments(source: str) -> str:
+    """Mask SQL comments and strings while preserving quoted identifiers."""
+
+    result: list[str] = []
+    index = 0
+    while index < len(source):
+        character = source[index]
+        if (
+            character in {"q", "Q"}
+            and (index == 0 or not (source[index - 1].isalnum() or source[index - 1] == "_"))
+            and index + 2 < len(source)
+            and source[index + 1] == "'"
+        ):
+            opening = source[index + 2]
+            closing = {"(": ")", "[": "]", "{": "}", "<": ">"}.get(opening, opening)
+            terminator = f"{closing}'"
+            close = source.find(terminator, index + 3)
+            end = len(source) if close < 0 else close + len(terminator)
+            result.extend(_masked_text(source[index:end]))
+            index = end
+            continue
+        if character == "'":
+            end = index + 1
+            while end < len(source):
+                if source[end] == "\\" and end + 1 < len(source):
+                    end += 2
+                    continue
+                if source[end] == "'":
+                    if end + 1 < len(source) and source[end + 1] == "'":
+                        end += 2
+                        continue
+                    end += 1
+                    break
+                end += 1
+            result.extend(_masked_text(source[index:end]))
+            index = end
+            continue
+        if character == "$":
+            delimiter_match = re.match(r"\$(?:[A-Za-z_][A-Za-z0-9_]*)?\$", source[index:])
+            if delimiter_match is not None:
+                delimiter = delimiter_match.group(0)
+                close = source.find(delimiter, index + len(delimiter))
+                end = len(source) if close < 0 else close + len(delimiter)
+                result.extend(_masked_text(source[index:end]))
+                index = end
+                continue
+        if source.startswith("--", index):
+            line_ending = _line_ending_span(source, index)
+            if line_ending is None:
+                result.extend(" " for _ in source[index:])
+                break
+            line_start, line_end = line_ending
+            result.extend(" " for _ in source[index:line_start])
+            result.extend(source[line_start:line_end])
+            index = line_end
+            continue
+        if source.startswith("/*", index):
+            end = index + 2
+            depth = 1
+            while end < len(source) and depth:
+                if source.startswith("/*", end):
+                    depth += 1
+                    end += 2
+                elif source.startswith("*/", end):
+                    depth -= 1
+                    end += 2
+                else:
+                    end += 1
+            result.extend(_masked_text(source[index:end]))
+            index = end
+            continue
+        if character in {'"', "`", "["}:
+            terminator = "]" if character == "[" else character
+            end = index + 1
+            while end < len(source):
+                if terminator != "]" and source[end] == "\\" and end + 1 < len(source):
+                    end += 2
+                    continue
+                if source[end] != terminator:
+                    end += 1
+                    continue
+                if end + 1 < len(source) and source[end + 1] == terminator:
+                    end += 2
+                    continue
+                end += 1
+                break
+            span = source[index:end]
+            result.extend(span if not any(mark in span for mark in "\r\n") else _masked_text(span))
+            index = end
+            continue
+        result.append(character)
+        index += 1
+    return "".join(result)
+
+
+def _contextual_source_slice(
+    full_source: str,
+    basename: str,
+    start_offset: int,
+    end_offset: int,
+) -> tuple[str, str]:
+    """Slice source only after masking it in the full observation's lexical context."""
+
+    suffix = next(
+        (candidate for candidate in _SOURCE_CODE_SUFFIXES if basename.endswith(candidate)),
+        "",
+    )
+    raw_lines = full_source.splitlines()
+    if suffix in _EMBEDDED_SCRIPT_SUFFIXES:
+        parser = _parse_markup(full_source)
+        if parser is None:
+            return "", basename
+        for (script_source, script_suffix), (span_start, span_end, span_suffix) in zip(
+            parser.script_sources,
+            parser.script_line_spans,
+            strict=True,
+        ):
+            if span_start <= start_offset + 1 and end_offset <= span_end:
+                if script_suffix != span_suffix:
+                    return "", basename
+                contextual_script = _masked_source_code(script_source, script_suffix)
+                script_lines = script_source.splitlines()
+                contextual_lines = contextual_script.splitlines()
+                if len(contextual_lines) != len(script_lines):
+                    return "", basename
+                script_start = start_offset + 1 - span_start
+                script_end = end_offset - span_start + 1
+                if script_start < 0 or script_end > len(contextual_lines):
+                    return "", basename
+                return (
+                    "\n".join(contextual_lines[script_start:script_end]),
+                    f"cited-script{script_suffix}",
+                )
+    contextual_source = (
+        _strip_sql_comments(full_source)
+        if suffix == ".sql"
+        else (
+            _mask_markup_comments(full_source)
+            if suffix in _MARKUP_SOURCE_SUFFIXES
+            else _masked_source_code(full_source, suffix)
+        )
+    )
+    contextual_lines = contextual_source.splitlines()
+    if len(contextual_lines) != len(raw_lines):
+        return "", basename
+    return (
+        "\n".join(contextual_lines[start_offset:end_offset]),
+        basename,
+    )
+
+
+def _import_declaration_symbols(source: str, suffix: str) -> frozenset[str]:
+    """Return import-bound names without treating import mechanisms as subjects."""
+
+    symbols: set[str] = set()
+    masked = _masked_source_code(source, suffix)
+    if suffix == ".py":
+
+        def add_ast_imports(tree: ast.AST) -> None:
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    symbols.update(
+                        alias.asname or alias.name.split(".", maxsplit=1)[0] for alias in node.names
+                    )
+                elif isinstance(node, ast.ImportFrom):
+                    symbols.update(
+                        alias.asname or alias.name for alias in node.names if alias.name != "*"
+                    )
+
+        try:
+            tree = ast.parse(source)
+        except SyntaxError:
+            tree = None
+        if tree is not None:
+            add_ast_imports(tree)
+        else:
+            source_lines = source.splitlines()
+            masked_lines = masked.splitlines()
+            line_index = 0
+            while line_index < len(masked_lines):
+                line = masked_lines[line_index]
+                plain_import = _PYTHON_IMPORT_LINE.match(line)
+                from_import = _PYTHON_FROM_IMPORT_LINE.match(line)
+                if plain_import is None and from_import is None:
+                    line_index += 1
+                    continue
+                end_index = line_index
+                balance = line.count("(") - line.count(")")
+                continued = line.rstrip().endswith("\\")
+                while end_index + 1 < len(masked_lines) and (balance > 0 or continued):
+                    end_index += 1
+                    continuation = masked_lines[end_index]
+                    balance += continuation.count("(") - continuation.count(")")
+                    continued = continuation.rstrip().endswith("\\")
+                statement = textwrap.dedent("\n".join(source_lines[line_index : end_index + 1]))
+                try:
+                    statement_tree = ast.parse(statement)
+                except SyntaxError:
+                    statement_tree = None
+                if statement_tree is not None:
+                    add_ast_imports(statement_tree)
+                    line_index = end_index + 1
+                    continue
+                matched_import = plain_import if plain_import is not None else from_import
+                assert matched_import is not None
+                clause = matched_import.group(1).strip().strip("()")
+                for candidate in clause.split(","):
+                    alias_match = re.fullmatch(
+                        r"([A-Za-z_][A-Za-z0-9_.]*)"
+                        r"(?:\s+as\s+([A-Za-z_][A-Za-z0-9_]*))?",
+                        candidate.strip(),
+                    )
+                    if alias_match is None:
+                        continue
+                    imported_name, local_alias = alias_match.groups()
+                    symbols.add(
+                        local_alias
+                        or (
+                            imported_name.split(".", maxsplit=1)[0]
+                            if plain_import is not None
+                            else imported_name
+                        )
+                    )
+                line_index = end_index + 1
+    if suffix in _JS_SOURCE_SUFFIXES:
+        symbols.update(match.group(1) for match in _JS_DEFAULT_IMPORT_DECLARATION.finditer(masked))
+        symbols.update(
+            match.group(1) for match in _JS_NAMESPACE_IMPORT_DECLARATION.finditer(masked)
+        )
+        for match in _JS_NAMED_IMPORT_DECLARATION.finditer(masked):
+            for candidate in match.group(1).split(","):
+                local_name = re.split(r"\s+as\s+", candidate.strip())[-1]
+                local_name = re.sub(r"^type\s+", "", local_name).strip()
+                if re.fullmatch(r"[A-Za-z_$][A-Za-z0-9_$]*", local_name):
+                    symbols.add(local_name)
+    return frozenset(symbols)
+
+
+def _import_source_symbols(source: str, suffix: str) -> frozenset[str]:
+    """Return concrete module-path identifiers named by Python imports."""
+
+    if suffix != ".py":
+        return frozenset()
+    modules: set[str] = set()
+
+    def add_module(module: str | None) -> None:
+        if module is None:
+            return
+        modules.update(
+            segment
+            for segment in module.lstrip(".").split(".")
+            if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", segment)
+        )
+
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        tree = None
+    if tree is not None:
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    add_module(alias.name)
+            elif isinstance(node, ast.ImportFrom):
+                add_module(node.module)
+        return frozenset(modules)
+
+    masked = _masked_source_code(source, suffix)
+    for line in masked.splitlines():
+        if match := re.match(
+            r"^\s*from\s+(?P<module>\.*[A-Za-z_][A-Za-z0-9_.]*)\s+import\b",
+            line,
+        ):
+            add_module(match.group("module"))
+            continue
+        if match := _PYTHON_IMPORT_LINE.match(line):
+            for candidate in match.group(1).split(","):
+                add_module(candidate.split(" as ", maxsplit=1)[0].strip())
+    return frozenset(modules)
+
+
+def _visible_declaration_symbols(source: str, basename: str) -> frozenset[str]:
+    """Return conservative source-defined symbols for a recognized file type."""
+
+    suffix = next(
+        (candidate for candidate in _SOURCE_CODE_SUFFIXES if basename.endswith(candidate)),
+        "",
+    )
+    masked = _masked_source_code(source, suffix)
+    generic_source = suffix != ".sql" and suffix not in _MARKUP_SOURCE_SUFFIXES
+    symbols = set(_explicit_declaration_symbols(source, suffix)) if generic_source else set()
+    if generic_source:
+        symbols.update(_import_declaration_symbols(source, suffix))
+    for line in masked.splitlines():
+        if (
+            suffix in _SCRIPT_ASSIGNMENT_SUFFIXES
+            and (match := _SCRIPT_ASSIGNMENT_DECLARATION.match(line)) is not None
+        ):
+            symbols.add(match.group(1))
+        if suffix in _C_LIKE_SOURCE_SUFFIXES:
+            for pattern in (
+                _TYPED_FUNCTION_DECLARATION,
+                _QUALIFIED_CONSTRUCTOR_DECLARATION,
+                _PASCAL_CONSTRUCTOR_DECLARATION,
+                _CONSTEXPR_DECLARATION,
+                _TYPED_VARIABLE_DECLARATION,
+            ):
+                if (match := pattern.match(line)) is not None:
+                    symbols.add(match.group(1))
+        if (
+            suffix in _JS_SOURCE_SUFFIXES
+            and (match := _JS_METHOD_DECLARATION.match(line)) is not None
+        ):
+            symbols.add(match.group(1))
+        if (
+            suffix in _SHELL_SOURCE_SUFFIXES
+            and (match := _SHELL_FUNCTION_DECLARATION.match(line)) is not None
+        ):
+            symbols.add(match.group(1))
+        if suffix == ".go":
+            for pattern in (_GO_TYPE_DECLARATION, _GO_RECEIVER_METHOD_DECLARATION):
+                if (match := pattern.match(line)) is not None:
+                    symbols.add(match.group(1))
+        if suffix in {".m", ".mm"}:
+            for pattern in (_OBJC_TYPE_DECLARATION, _OBJC_METHOD_DECLARATION):
+                if (match := pattern.match(line)) is not None:
+                    symbols.add(match.group(1))
+        if (
+            suffix == ".swift"
+            and (match := _SWIFT_CLASS_MEMBER_DECLARATION.match(line)) is not None
+        ):
+            symbols.add(match.group(1))
+    if suffix == ".sql":
+        for line in _strip_sql_comments(source).splitlines():
+            if (match := _SQL_DECLARATION.match(line)) is not None:
+                groups = match.groups()
+                symbol = next(value for value in groups if value is not None)
+                if groups[-1] is None or symbol.casefold() not in _SQL_RESERVED_DECLARATION_SYMBOLS:
+                    symbols.add(symbol)
+    if suffix in _MARKUP_SOURCE_SUFFIXES:
+        symbols.update(_markup_declaration_symbols(source))
+    if suffix in _EMBEDDED_SCRIPT_SUFFIXES:
+        for script_source, script_suffix in _markup_script_sources(source):
+            symbols.update(
+                _visible_declaration_symbols(script_source, f"embedded-script{script_suffix}")
+            )
+    return frozenset(symbols)
+
+
+def _expand_immediate_symbol_declaration_citations(
+    answer: AgentAnswer,
+    catalog: tuple[ToolObservation, ...],
+    rendered_ids: frozenset[str],
+) -> AgentAnswer:
+    """Include an immediately preceding declaration named by the finding.
+
+    The expansion is limited to one visible line in the same fully rendered
+    observation. It occurs only when every named source symbol missing from the
+    cited body becomes visible when that one line is included; otherwise the
+    citation remains unchanged for normal validation and bounded retry.
+    """
+
+    observations = {
+        observation.observation_id: observation
+        for observation in catalog
+        if observation.observation_id in rendered_ids
+        and observation.tool == "read_file"
+        and observation.content_hash
+        and observation.lines
+    }
+    repaired: list[SourceCitation] = []
+    for finding, citation in zip(answer.findings, answer.citations, strict=False):
+        observation = observations.get(citation.observation_id)
+        if observation is None or observation.path != citation.path:
+            repaired.append(citation)
+            continue
+        basename = citation.path.replace("\\", "/").rsplit("/", maxsplit=1)[-1].casefold()
+        if _requires_named_source_symbol(basename) and not _source_observation_has_lexical_context(
+            observation
+        ):
+            repaired.append(citation)
+            continue
+        start_offset = citation.start_line - observation.start_line
+        end_offset = citation.end_line - observation.start_line + 1
+        if start_offset <= 0 or end_offset > len(observation.lines):
+            repaired.append(citation)
+            continue
+        full_source = "\n".join(line_body(line) for line in observation.lines)
+        cited_source, cited_basename = _contextual_source_slice(
+            full_source,
+            basename,
+            start_offset,
+            end_offset,
+        )
+        declared_symbols = _visible_declaration_symbols(full_source, basename)
+        relevant_symbols = _source_symbol_mentions(finding, declared_symbols)
+        cited_declarations = _visible_declaration_symbols(cited_source, cited_basename)
+        missing_symbols = relevant_symbols - cited_declarations
+        suffix = next(
+            (candidate for candidate in _SOURCE_CODE_SUFFIXES if basename.endswith(candidate)),
+            "",
+        )
+        imported_symbols = _import_declaration_symbols(full_source, suffix)
+        if relevant_symbols - imported_symbols:
+            # Match final grounding: an imported mechanism named alongside an
+            # explicitly named local subject does not enlarge the subject
+            # anchor or block its one-line declaration repair.
+            missing_symbols -= imported_symbols
+        expanded_source, expanded_basename = _contextual_source_slice(
+            full_source,
+            basename,
+            start_offset - 1,
+            end_offset,
+        )
+        expanded_declarations = _visible_declaration_symbols(
+            expanded_source,
+            expanded_basename,
+        )
+        if not missing_symbols or not missing_symbols <= expanded_declarations:
+            repaired.append(citation)
+            continue
+        expanded = SourceCitation(
+            observation_id=citation.observation_id,
+            path=citation.path,
+            start_line=citation.start_line - 1,
+            end_line=citation.end_line,
+            note=citation.note,
+        )
+        repaired.append(
+            citation if citation_intersects_redaction(observation, expanded) else expanded
+        )
+    if len(answer.citations) > len(repaired):
+        repaired.extend(answer.citations[len(repaired) :])
+    return replace(answer, citations=tuple(repaired))
+
+
+def _trim_blank_citation_edges(
+    answer: AgentAnswer,
+    catalog: tuple[ToolObservation, ...],
+    rendered_ids: frozenset[str],
+) -> AgentAnswer:
+    """Remove visible padding and provably unrelated edge declarations."""
+
+    observations = {
+        observation.observation_id: observation
+        for observation in catalog
+        if observation.observation_id in rendered_ids
+        and observation.tool == "read_file"
+        and observation.content_hash
+        and observation.lines
+    }
+    repaired: list[SourceCitation] = []
+    for index, citation in enumerate(answer.citations):
+        observation = observations.get(citation.observation_id)
+        if observation is None or observation.path != citation.path:
+            repaired.append(citation)
+            continue
+        start_offset = citation.start_line - observation.start_line
+        end_offset = citation.end_line - observation.start_line
+        if start_offset < 0 or end_offset >= len(observation.lines):
+            repaired.append(citation)
+            continue
+        while start_offset < end_offset and not line_body(observation.lines[start_offset]).strip():
+            start_offset += 1
+        while end_offset > start_offset and not line_body(observation.lines[end_offset]).strip():
+            end_offset -= 1
+        if index < len(answer.findings):
+            finding = answer.findings[index]
+            full_source = "\n".join(line_body(line) for line in observation.lines)
+            basename = citation.path.replace("\\", "/").rsplit("/", maxsplit=1)[-1].casefold()
+            suffix = next(
+                (candidate for candidate in _SOURCE_CODE_SUFFIXES if basename.endswith(candidate)),
+                "",
+            )
+            import_sources = _import_source_symbols(full_source, suffix)
+            relevant_import_sources = _source_symbol_mentions(finding, import_sources)
+            local_symbols = _visible_declaration_symbols(full_source, basename)
+            import_bindings = _import_declaration_symbols(full_source, suffix)
+            relevant_local_subjects = (
+                _source_symbol_mentions(finding, local_symbols) - import_bindings
+            )
+            while start_offset < end_offset and relevant_local_subjects:
+                leading_source, leading_basename = _contextual_source_slice(
+                    full_source,
+                    basename,
+                    start_offset,
+                    start_offset + 1,
+                )
+                leading_declarations = _visible_declaration_symbols(
+                    leading_source,
+                    leading_basename,
+                )
+                if not leading_declarations or (leading_declarations & relevant_local_subjects):
+                    break
+                shorter_source, shorter_basename = _contextual_source_slice(
+                    full_source,
+                    basename,
+                    start_offset + 1,
+                    end_offset + 1,
+                )
+                if not relevant_local_subjects <= _visible_declaration_symbols(
+                    shorter_source,
+                    shorter_basename,
+                ):
+                    break
+                start_offset += 1
+            while end_offset > start_offset and relevant_local_subjects:
+                trailing_body = line_body(observation.lines[end_offset]).strip()
+                if trailing_body in {"}", "};"}:
+                    shorter_source, shorter_basename = _contextual_source_slice(
+                        full_source,
+                        basename,
+                        start_offset,
+                        end_offset,
+                    )
+                    if relevant_local_subjects <= _visible_declaration_symbols(
+                        shorter_source,
+                        shorter_basename,
+                    ):
+                        end_offset -= 1
+                        continue
+                trailing_source, trailing_basename = _contextual_source_slice(
+                    full_source,
+                    basename,
+                    end_offset,
+                    end_offset + 1,
+                )
+                trailing_declarations = _visible_declaration_symbols(
+                    trailing_source,
+                    trailing_basename,
+                )
+                if not trailing_declarations or (trailing_declarations & relevant_local_subjects):
+                    break
+                shorter_source, shorter_basename = _contextual_source_slice(
+                    full_source,
+                    basename,
+                    start_offset,
+                    end_offset,
+                )
+                if not relevant_local_subjects <= _visible_declaration_symbols(
+                    shorter_source,
+                    shorter_basename,
+                ):
+                    break
+                end_offset -= 1
+            if relevant_import_sources and not relevant_local_subjects:
+                while end_offset > start_offset:
+                    shorter_source = "\n".join(
+                        line_body(line) for line in observation.lines[start_offset:end_offset]
+                    )
+                    if not relevant_import_sources <= _import_source_symbols(
+                        shorter_source,
+                        suffix,
+                    ):
+                        break
+                    end_offset -= 1
+        repaired.append(
+            replace(
+                citation,
+                start_line=observation.start_line + start_offset,
+                end_line=observation.start_line + end_offset,
+            )
+        )
+    return replace(answer, citations=tuple(repaired))
+
+
 _INLINE_CITATION = re.compile(
     r"\b(obs_[A-Za-z0-9_]{8,128})\b\s+(?:lines?\s*)?(\d+)\s*[-\u2013]\s*(\d+)\b",
     re.ASCII,
@@ -713,6 +2820,45 @@ def _listed_workspace_path(
     return candidate, is_directory
 
 
+def _repair_unique_listed_read_path(
+    decision: ToolCall,
+    catalog: tuple[ToolObservation, ...],
+) -> ToolCall:
+    """Resolve a basename-only read against one unambiguous completed listing."""
+
+    if decision.tool != "read_file" or not decision.path:
+        return decision
+    requested = decision.path.replace("\\", "/")
+    if "/" in requested:
+        return decision
+    known_files: set[str] = set()
+    for observation in catalog:
+        if (
+            observation.tool != "list_files"
+            or observation.truncated
+            or observation.incomplete
+            or not observation.content_hash
+        ):
+            continue
+        for rendered in observation.lines:
+            resolved = _listed_workspace_path(observation, rendered)
+            if resolved is None:
+                continue
+            candidate, is_directory = resolved
+            if not is_directory:
+                known_files.add(candidate)
+    if requested in known_files:
+        return decision
+    candidates = tuple(
+        candidate
+        for candidate in sorted(known_files)
+        if candidate.rsplit("/", maxsplit=1)[-1] == requested
+    )
+    if len(candidates) != 1:
+        return decision
+    return replace(decision, path=candidates[0])
+
+
 def parse_decision(payload: Mapping[str, Any]) -> Decision:
     action = payload.get("action")
     if action == "final_answer":
@@ -784,12 +2930,366 @@ def _grounded_answer_structure_error(
         return "final answer must contain non-empty recommended next actions"
     if not answer.citations or len(answer.findings) != len(answer.citations):
         return "each finding must have one positionally corresponding citation"
+    if any(not _has_direct_untrusted_html_flow(finding) for finding in answer.findings):
+        return _INJECTION_PROVENANCE_ERROR
     citation_ranges = {
         (citation.path, citation.start_line, citation.end_line) for citation in answer.citations
     }
     if len(citation_ranges) != len(answer.citations):
         return "each finding must use a distinct citation range"
+    observations = {
+        observation.observation_id: observation
+        for observation in catalog
+        if observation.tool == "read_file" and observation.content_hash and observation.lines
+    }
+    for finding, citation in zip(answer.findings, answer.citations, strict=True):
+        observation = observations.get(citation.observation_id)
+        if observation is None or observation.path != citation.path:
+            continue
+        start_offset = citation.start_line - observation.start_line
+        end_offset = citation.end_line - observation.start_line + 1
+        if start_offset < 0 or end_offset > len(observation.lines):
+            continue
+        full_source = "\n".join(line_body(line) for line in observation.lines)
+        basename = citation.path.replace("\\", "/").rsplit("/", maxsplit=1)[-1].casefold()
+        if _requires_named_source_symbol(basename) and not _source_observation_has_lexical_context(
+            observation
+        ):
+            return _SOURCE_LEXICAL_CONTEXT_ERROR
+        cited_source, cited_basename = _contextual_source_slice(
+            full_source,
+            basename,
+            start_offset,
+            end_offset,
+        )
+        source_symbols = set(_visible_declaration_symbols(full_source, basename))
+        cited_symbols = set(_visible_declaration_symbols(cited_source, cited_basename))
+        suffix = next(
+            (candidate for candidate in _SOURCE_CODE_SUFFIXES if basename.endswith(candidate)),
+            "",
+        )
+        imported_symbols = set(_import_declaration_symbols(full_source, suffix))
+        import_source_symbols = _import_source_symbols(full_source, suffix)
+        source_symbols.update(import_source_symbols)
+        cited_import_source_symbols = _import_source_symbols(cited_source, suffix)
+        cited_symbols.update(cited_import_source_symbols)
+        imported_symbols.update(import_source_symbols)
+        relevant_symbols = _source_symbol_mentions(finding, source_symbols)
+        if (
+            _requires_named_source_symbol(basename)
+            and _CITATION_LABEL_FINDING.fullmatch(finding) is not None
+        ):
+            return _CITATION_LABEL_FINDING_ERROR
+        if _requires_named_source_symbol(basename) and not relevant_symbols:
+            return _SOURCE_SYMBOL_FINDING_ERROR
+        if (
+            _requires_named_source_symbol(basename)
+            and _named_source_symbol_segments(finding)
+            and not relevant_symbols
+        ):
+            return _SOURCE_SYMBOL_FINDING_ERROR
+        missing_symbols = relevant_symbols - cited_symbols
+        if missing_symbols and (
+            missing_symbols - imported_symbols
+            or not ((relevant_symbols & cited_symbols) - imported_symbols)
+        ):
+            return _SOURCE_SYMBOL_CITATION_ERROR
+        last_body = line_body(observation.lines[end_offset - 1])
+        if (
+            last_body.rstrip().endswith(":")
+            and end_offset < len(observation.lines)
+            and len(line_body(observation.lines[end_offset]))
+            - len(line_body(observation.lines[end_offset]).lstrip())
+            > len(last_body) - len(last_body.lstrip())
+        ):
+            return _SUITE_BODY_CITATION_ERROR
     return None
+
+
+def _identifier_occurs(source: str, identifier: str) -> bool:
+    return (
+        re.search(
+            rf"(?<![A-Za-z0-9_]){re.escape(identifier)}(?![A-Za-z0-9_])",
+            source,
+        )
+        is not None
+    )
+
+
+def _requires_named_source_symbol(basename: str) -> bool:
+    return basename not in _DEPENDENCY_MANIFEST_NAMES and any(
+        basename.endswith(suffix) for suffix in _SOURCE_CODE_SUFFIXES
+    )
+
+
+def _source_observation_has_lexical_context(observation: ToolObservation) -> bool:
+    """Accept only line-one source reads with raw or attested delimiter-safe context."""
+
+    return observation.start_line == 1 and (
+        (not observation.incomplete and not observation.redacted)
+        or observation.metadata.get("lexical_context_preserved") is True
+    )
+
+
+def _has_direct_untrusted_html_flow(finding: str) -> bool:
+    semantic_finding = _CODE_PATH_SPAN.sub(" ", finding)
+    sink_candidates = tuple(_DANGEROUS_HTML_SINK_CANDIDATE.finditer(semantic_finding))
+    if not sink_candidates:
+        return True
+    if any(match.group(0) != "dangerouslySetInnerHTML" for match in sink_candidates):
+        return False
+    subject_candidates = tuple(_UNSAFE_RESULT_CANDIDATE.finditer(semantic_finding))
+    if not subject_candidates or any(
+        match.group(0) != "UnsafeResult" for match in subject_candidates
+    ):
+        return False
+    finding_words = frozenset(re.findall(r"[A-Za-z]+", semantic_finding.casefold()))
+    if finding_words & (_REACT_PROTECTED_OR_NEGATED | _REACT_POST_SINK_DISCONNECTION):
+        return False
+    normalized = _REACT_LABELED_SUBJECT.sub("UnsafeResult ", semantic_finding)
+    clauses = re.split(r"(?:[;!?\n]+|\.(?=\s|$))", normalized)
+    for clause in clauses:
+        subject = _UNSAFE_RESULT_SUBJECT.search(clause)
+        sink = _DANGEROUS_HTML_SINK.search(clause)
+        if subject is None or sink is None or sink.start() <= subject.end():
+            continue
+        clause_words = frozenset(re.findall(r"[A-Za-z]+", clause.casefold()))
+        if clause_words & (_REACT_PROTECTED_OR_NEGATED | _REACT_POST_SINK_DISCONNECTION):
+            continue
+        for flow in _DIRECT_DATA_FLOW.finditer(clause, subject.end(), sink.start()):
+            for provenance in _UNTRUSTED_DATA.finditer(clause, flow.end(), sink.start()):
+                subject_flow_words = frozenset(
+                    re.findall(
+                        r"[A-Za-z]+",
+                        clause[subject.end() : flow.start()].casefold(),
+                    )
+                )
+                flow_provenance_words = frozenset(
+                    re.findall(
+                        r"[A-Za-z]+",
+                        clause[flow.end() : provenance.start()].casefold(),
+                    )
+                )
+                provenance_sink_words = tuple(
+                    re.findall(
+                        r"[A-Za-z]+",
+                        clause[provenance.end() : sink.start()].casefold(),
+                    )
+                )
+                if (
+                    subject_flow_words <= _REACT_SUBJECT_FLOW_WORDS
+                    and flow_provenance_words <= _REACT_FLOW_PROVENANCE_WORDS
+                    and frozenset(provenance_sink_words) <= _REACT_PROVENANCE_SINK_WORDS
+                    and any(word in _REACT_FLOW_CONNECTORS for word in provenance_sink_words)
+                ):
+                    return True
+    return False
+
+
+def _named_source_symbol_segments(finding: str) -> frozenset[str]:
+    segments: set[str] = set()
+    for candidate in _SOURCE_IDENTIFIER.findall(finding):
+        if (
+            "_" not in candidate
+            and "." not in candidate
+            and "::" not in candidate
+            and _CAMEL_IDENTIFIER.search(candidate) is None
+        ):
+            continue
+        segments.update(re.split(r"::|\.", candidate))
+    return frozenset(segment for segment in segments if segment)
+
+
+def _all_source_identifier_segments(value: str) -> frozenset[str]:
+    return frozenset(
+        segment
+        for candidate in _SOURCE_IDENTIFIER.findall(value)
+        for segment in re.split(r"::|\.", candidate)
+        if segment
+    )
+
+
+def _without_source_path_mentions(value: str) -> str:
+    """Mask source filenames and paths without erasing dotted code identifiers."""
+
+    extensions = "|".join(
+        sorted(
+            (re.escape(suffix.removeprefix(".")) for suffix in _SOURCE_CODE_SUFFIXES),
+            key=len,
+            reverse=True,
+        )
+    )
+    backticked = re.compile(rf"`[^`\r\n]*\.(?:{extensions})`", re.IGNORECASE)
+    bare = re.compile(
+        rf"(?<![A-Za-z0-9_.])(?:[A-Za-z]:[\\/])?"
+        rf"(?:[A-Za-z0-9_.-]+[\\/])*[A-Za-z0-9_.-]+\.(?:{extensions})"
+        rf"(?![A-Za-z0-9_.])",
+        re.IGNORECASE,
+    )
+    return bare.sub(" ", backticked.sub(" ", value))
+
+
+def _source_symbol_mentions(
+    finding: str,
+    source_symbols: frozenset[str] | set[str],
+) -> frozenset[str]:
+    """Return source symbols used as identifiers or concrete claim subjects."""
+
+    semantic_finding = _without_source_path_mentions(finding)
+    identifier_segments = _all_source_identifier_segments(semantic_finding)
+    explicit_segments = _named_source_symbol_segments(semantic_finding)
+    mentions: set[str] = set()
+    declaration_noun = (
+        r"(?i:(?:class|component|constant|constructor|endpoint|field|function|handler|"
+        r"interface|method|module|namespace|procedure|property|protocol|record|"
+        r"struct|symbol|trait|type|variable|worker))"
+    )
+    subject_predicate = (
+        r"(?i:(?:[A-Za-z]+(?:s|ed|ing)|are|can|could|did|does|had|has|is|may|"
+        r"might|must|should|was|were|will|would))"
+    )
+    ambiguous_plain_symbols = frozenset(
+        {
+            "a",
+            "abstract",
+            "although",
+            "an",
+            "and",
+            "as",
+            "at",
+            "bad",
+            "because",
+            "but",
+            "by",
+            "clean",
+            "closed",
+            "default",
+            "dirty",
+            "dynamic",
+            "encoded",
+            "external",
+            "fake",
+            "final",
+            "for",
+            "from",
+            "good",
+            "he",
+            "her",
+            "here",
+            "hers",
+            "his",
+            "i",
+            "if",
+            "immutable",
+            "in",
+            "insecure",
+            "internal",
+            "invalid",
+            "it",
+            "its",
+            "mine",
+            "my",
+            "mutable",
+            "new",
+            "old",
+            "on",
+            "open",
+            "or",
+            "our",
+            "ours",
+            "private",
+            "protected",
+            "public",
+            "raw",
+            "real",
+            "safe",
+            "sanitized",
+            "secure",
+            "she",
+            "static",
+            "that",
+            "the",
+            "their",
+            "theirs",
+            "these",
+            "there",
+            "they",
+            "this",
+            "those",
+            "to",
+            "trusted",
+            "unsafe",
+            "untrusted",
+            "valid",
+            "we",
+            "what",
+            "when",
+            "where",
+            "which",
+            "while",
+            "who",
+            "whose",
+            "with",
+            "without",
+            "you",
+            "your",
+            "yours",
+        }
+    )
+    plain_symbols = sorted(
+        (
+            symbol
+            for symbol in source_symbols
+            if re.fullmatch(r"[a-z][a-z0-9]*", symbol)
+            and symbol.casefold() not in ambiguous_plain_symbols
+        ),
+        key=len,
+        reverse=True,
+    )
+    coordinated_symbols: frozenset[str] = frozenset()
+    if plain_symbols:
+        alternatives = "|".join(re.escape(symbol) for symbol in plain_symbols)
+        coordinated_subject = re.compile(
+            rf"(?:^|[.!?;]\s+)(?:(?i:the)\s+)?(?P<subjects>(?:{alternatives})"
+            rf"(?:\s*(?:,|(?i:\band\b|\bor\b))\s*(?:{alternatives}))+?)"
+            rf"\s+(?i:[A-Za-z]+)\b"
+        )
+        coordinated_symbols = frozenset(
+            segment
+            for match in coordinated_subject.finditer(semantic_finding)
+            for segment in _all_source_identifier_segments(match.group("subjects"))
+        )
+    for symbol in source_symbols:
+        if symbol not in identifier_segments:
+            continue
+        if (
+            symbol in explicit_segments
+            or symbol in coordinated_symbols
+            or (
+                not re.fullmatch(r"[a-z][a-z0-9]*", symbol)
+                and symbol.casefold() not in ambiguous_plain_symbols
+            )
+        ):
+            mentions.add(symbol)
+            continue
+        escaped = re.escape(symbol)
+        patterns = [
+            rf"`{escaped}`",
+            rf"\b{escaped}\s*\(",
+            rf"\b{declaration_noun}\s+(?:(?i:named)\s+)?`?{escaped}`?\b",
+            rf"\b(?i:calling|invoking|using)\s+`?{escaped}`?\b",
+        ]
+        if symbol.casefold() not in ambiguous_plain_symbols:
+            patterns.extend(
+                (
+                    rf"\b`?{escaped}`?\s+{declaration_noun}\b",
+                    rf"(?:^|[.!?;]\s+)(?:(?i:the)\s+)?`?{escaped}`?\s+"
+                    rf"{subject_predicate}\b",
+                )
+            )
+        if any(re.search(pattern, semantic_finding) is not None for pattern in patterns):
+            mentions.add(symbol)
+    return frozenset(mentions)
 
 
 def _repair_non_evidentiary_answer_fields(answer: AgentAnswer) -> AgentAnswer:
@@ -807,6 +3307,89 @@ def _repair_non_evidentiary_answer_fields(answer: AgentAnswer) -> AgentAnswer:
         answer,
         next_actions=("Review and address the cited findings.",),
     )
+
+
+def _repair_citation_label_findings(
+    answer: AgentAnswer,
+    catalog: tuple[ToolObservation, ...],
+    rendered_ids: frozenset[str],
+) -> AgentAnswer:
+    """Move a uniquely grounded, model-authored summary sentence into a label slot.
+
+    Some small models put a complete conclusion in ``summary`` but emit only an
+    evidence label in the positionally corresponding finding. This repair is
+    deliberately narrow: it applies only to code-source citations, scores exact
+    source-defined symbols visible in the cited range, and requires one summary
+    sentence to have a unique highest positive score. Ambiguous cases remain
+    invalid and use the normal bounded schema retry.
+    """
+
+    if not answer.findings or len(answer.findings) != len(answer.citations):
+        return answer
+    if not any(_CITATION_LABEL_FINDING.fullmatch(finding) for finding in answer.findings):
+        return answer
+    observations = {
+        observation.observation_id: observation
+        for observation in catalog
+        if observation.observation_id in rendered_ids
+        and observation.tool == "read_file"
+        and observation.content_hash
+        and observation.lines
+    }
+    sentences = tuple(
+        sentence.strip()
+        for sentence in _SUMMARY_SENTENCE_BOUNDARY.split(answer.summary.strip())
+        if sentence.strip()
+    )
+    repaired = list(answer.findings)
+    selected_sentences: set[str] = set()
+    for index, (finding, citation) in enumerate(
+        zip(answer.findings, answer.citations, strict=True)
+    ):
+        if _CITATION_LABEL_FINDING.fullmatch(finding) is None:
+            continue
+        observation = observations.get(citation.observation_id)
+        if observation is None or observation.path != citation.path:
+            return answer
+        basename = citation.path.replace("\\", "/").rsplit("/", maxsplit=1)[-1].casefold()
+        if not _requires_named_source_symbol(basename):
+            return answer
+        if not _source_observation_has_lexical_context(observation):
+            return answer
+        start_offset = citation.start_line - observation.start_line
+        end_offset = citation.end_line - observation.start_line + 1
+        if start_offset < 0 or end_offset > len(observation.lines):
+            return answer
+        full_source = "\n".join(line_body(line) for line in observation.lines)
+        cited_source, cited_basename = _contextual_source_slice(
+            full_source,
+            basename,
+            start_offset,
+            end_offset,
+        )
+        suffix = next(
+            (
+                candidate
+                for candidate in _SOURCE_CODE_SUFFIXES
+                if cited_basename.endswith(candidate)
+            ),
+            "",
+        )
+        source_symbols = _explicit_declaration_symbols(cited_source, suffix)
+        scored = [
+            (
+                sum(_identifier_occurs(sentence, symbol) for symbol in source_symbols),
+                sentence,
+            )
+            for sentence in sentences
+        ]
+        best_score = max((score for score, _sentence in scored), default=0)
+        candidates = [sentence for score, sentence in scored if score == best_score > 0]
+        if len(candidates) != 1 or candidates[0] in selected_sentences:
+            return answer
+        repaired[index] = candidates[0]
+        selected_sentences.add(candidates[0])
+    return replace(answer, findings=tuple(repaired))
 
 
 def _merge_duplicate_citation_findings(answer: AgentAnswer) -> AgentAnswer:
@@ -901,19 +3484,14 @@ class ModelInvestigationPlanner:
             not command or len(command) > 120 for command in self.allowed_commands
         ):
             raise ValueError("allowed_commands must contain unique non-empty names")
-        dependency_targets = tuple(
-            target for target, _source in self.command_recovery_dependencies
-        )
-        if (
-            len(set(dependency_targets)) != len(dependency_targets)
-            or any(
-                type(target) is not str
-                or type(source) is not str
-                or target not in self.allowed_commands
-                or source not in self.allowed_commands
-                or target == source
-                for target, source in self.command_recovery_dependencies
-            )
+        dependency_targets = tuple(target for target, _source in self.command_recovery_dependencies)
+        if len(set(dependency_targets)) != len(dependency_targets) or any(
+            type(target) is not str
+            or type(source) is not str
+            or target not in self.allowed_commands
+            or source not in self.allowed_commands
+            or target == source
+            for target, source in self.command_recovery_dependencies
         ):
             raise ValueError(
                 "command recovery dependencies must uniquely reference distinct allowed commands"
@@ -1004,7 +3582,9 @@ class ModelInvestigationPlanner:
         for obs in catalog:
             if obs.tool == "read_file" and obs.content_hash:
                 known_file_paths.add(obs.path.replace("\\", "/"))
-            if (obs.tool == "read_file" or obs.metadata.get("citable_command")) and obs.content_hash:
+            if (
+                obs.tool == "read_file" or obs.metadata.get("citable_command")
+            ) and obs.content_hash:
                 last = obs.start_line + len(obs.lines) - 1
                 covered.setdefault(obs.path, []).append((obs.start_line, last))
             if (
@@ -1115,8 +3695,7 @@ class ModelInvestigationPlanner:
                 and not observation.truncated
                 and not observation.incomplete
                 and observation.content_hash
-                and (observation.path.replace("\\", "/").strip("/") or ".")
-                == requested_path
+                and (observation.path.replace("\\", "/").strip("/") or ".") == requested_path
                 and (observation.metadata.get("glob") or "*") == requested_glob
             ]
             if not matching:
@@ -1178,9 +3757,7 @@ class ModelInvestigationPlanner:
     ) -> int:
         remaining_budget = self.max_completion_tokens - self.completion_tokens_charged
         remaining_decisions = (
-            1
-            if final_answer_required
-            else max(1, self.max_logical_decisions - self._turn + 1)
+            1 if final_answer_required else max(1, self.max_logical_decisions - self._turn + 1)
         )
         allowance = min(MAX_MODEL_COMPLETION_TOKENS, remaining_budget // remaining_decisions)
         if complex_answer_likely and not final_answer_required:
@@ -1787,9 +4364,7 @@ class ModelInvestigationPlanner:
             self.resume_schema_retries_used = 0
             self.resume_physical_attempts_used = 0
         command_recovery_complete = self._command_recovery_is_complete(catalog)
-        complex_answer_likely = (
-            sum(_render_block(item)[1] for item in catalog) >= 3
-        )
+        complex_answer_likely = sum(_render_block(item)[1] for item in catalog) >= 3
         completion_reserve = self._completion_allowance(
             final_answer_required=command_recovery_complete,
             complex_answer_likely=complex_answer_likely,
@@ -1855,9 +4430,7 @@ class ModelInvestigationPlanner:
             2 * self.max_estimator_error_tokens,
         )
         decision_system = self._system_prompt(command_recovery_complete=command_recovery_complete)
-        decision_schema = self._decision_schema(
-            command_recovery_complete=command_recovery_complete
-        )
+        decision_schema = self._decision_schema(command_recovery_complete=command_recovery_complete)
         if (
             self._prompt_token_bound(
                 prompt,
@@ -1949,7 +4522,12 @@ class ModelInvestigationPlanner:
                 if isinstance(decision, AgentAnswer):
                     decision = _recover_inline_citations(decision, catalog, rendered_ids)
                     decision = _repair_citations(decision, catalog, rendered_ids)
+                    decision = _expand_immediate_symbol_declaration_citations(
+                        decision, catalog, rendered_ids
+                    )
+                    decision = _trim_blank_citation_edges(decision, catalog, rendered_ids)
                     decision = _merge_duplicate_citation_findings(decision)
+                    decision = _repair_citation_label_findings(decision, catalog, rendered_ids)
                     decision = _repair_non_evidentiary_answer_fields(decision)
                     answer_error = _grounded_answer_structure_error(decision, catalog)
                     if answer_error is not None:
@@ -1961,6 +4539,7 @@ class ModelInvestigationPlanner:
                 ):
                     raise ValueError("model selected a command that is unavailable in this run")
                 if isinstance(decision, ToolCall):
+                    decision = _repair_unique_listed_read_path(decision, catalog)
                     decision = self._bind_unique_failed_command_dependency(decision, catalog)
                     decision = self._recover_repeated_complete_discovery(decision, catalog)
                 pending_retry = None

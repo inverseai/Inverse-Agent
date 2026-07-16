@@ -1055,7 +1055,8 @@ def secret_spans(text: str, *, check: Callable[[], None] | None = None) -> tuple
         if check is not None:
             check()
         for match_index, match in enumerate(pattern.finditer(text), start=1):
-            found.append(SecretSpan(kind=name, start=match.start(), end=match.end()))
+            start, end = match.span(2) if name == "key-value-secret" else match.span()
+            found.append(SecretSpan(kind=name, start=start, end=end))
             if check is not None and match_index % 128 == 0:
                 check()
     if check is not None:

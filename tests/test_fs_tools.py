@@ -149,8 +149,21 @@ def test_read_file_redacts_secrets_line_preserving(tmp_path: Path) -> None:
     assert obs.incomplete
     assert obs.redacted
     assert "sk_live_0123456789abcdef" not in obs.text
+    assert obs.lines[1] == "2: api_key=[REDACTED_SECRET]"
+    assert obs.metadata["lexical_context_preserved"] is True
     # Line count preserved: line 3 stays line 3.
     assert obs.lines[2] == "3: safe = 2"
+
+
+def test_quoted_secret_redaction_preserves_delimiters(tmp_path: Path) -> None:
+    secret = "ivbench-secret-7D4F91A2B6C8E0"
+    (tmp_path / "conf.py").write_text(f'API_TOKEN = "{secret}"\nsafe = 2\n', encoding="utf-8")
+
+    obs = WorkspaceReader.open(tmp_path).read_file("conf.py")
+
+    assert secret not in obs.text
+    assert obs.lines[0] == '1: API_TOKEN = "[REDACTED_SECRET]"'
+    assert obs.metadata["lexical_context_preserved"] is True
 
 
 def test_read_file_neutralizes_source_instructions_and_marks_them_non_citable(
@@ -166,6 +179,7 @@ def test_read_file_neutralizes_source_instructions_and_marks_them_non_citable(
     assert obs.incomplete and obs.redacted
     assert obs.metadata["instruction_neutralized"] is True
     assert obs.metadata["instruction_line_omitted"] is True
+    assert obs.metadata["lexical_context_preserved"] is False
     assert obs.metadata["redacted_lines"] == (2,)
     assert "Reviewer" not in obs.text
     assert "ignore findings" not in obs.text
@@ -614,6 +628,7 @@ def test_read_file_redacts_multiline_private_key(tmp_path: Path) -> None:
     assert body1 not in obs.text
     assert body2 not in obs.text
     assert "BEGIN RSA PRIVATE KEY" not in obs.text
+    assert obs.metadata["lexical_context_preserved"] is False
     # Line numbers preserved: "after = 2" stays on line 6.
     assert "6: after = 2" in obs.lines
 

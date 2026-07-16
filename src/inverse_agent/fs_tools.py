@@ -353,6 +353,41 @@ def _sanitize_source_line_preserving(
     )
 
 
+def _secret_redaction_preserves_lexical_context(
+    text: str,
+    *,
+    deadline: float,
+) -> bool:
+    """Attest that every secret replacement is single-line and delimiter-neutral."""
+
+    def check_deadline() -> None:
+        if time.monotonic() > deadline:
+            raise FsToolError("source sanitization exceeded its deadline")
+
+    spans = secret_spans(text, check=check_deadline)
+    if not spans:
+        return False
+    for span in spans:
+        matched = text[span.start : span.end]
+        if (
+            span.kind.startswith("private-key")
+            or "\\" in matched
+            or "\r" in matched
+            or "\n" in matched
+        ):
+            return False
+        before = text[span.start - 1] if span.start > 0 else ""
+        after = text[span.end] if span.end < len(text) else ""
+        if before in {"'", '"'} and after == before:
+            continue
+        # Outside a closed quote, punctuation may be executable syntax: `/`
+        # can close a self-closing tag, while `.`, `-`, `+`, and `=` can be
+        # operators. Only an identifier-like token is delimiter-neutral.
+        if re.fullmatch(r"[A-Za-z0-9_]+", matched) is None:
+            return False
+    return True
+
+
 def _tool_error(exc: SecureFsError) -> FsToolError:
     if isinstance(exc, SecureFsPolicyError):
         return PolicyViolationError(str(exc))
@@ -466,6 +501,9 @@ class WorkspaceReader:
             self._remember_identity(observation.observation_id, entry.identity)
             return observation
         decoded = _decode_strict(data)
+        secret_redaction_preserves_lexical_context = _secret_redaction_preserves_lexical_context(
+            decoded, deadline=deadline
+        )
         # Sanitize the WHOLE file before slicing so a window starting inside a
         # multi-line secret cannot leak the body, and redaction is line-preserving.
         (
@@ -516,6 +554,11 @@ class WorkspaceReader:
                 "secret_redacted": secret_redacted,
                 "instruction_neutralized": instruction_neutralized,
                 "instruction_line_omitted": instruction_line_omitted,
+                "lexical_context_preserved": (
+                    secret_redacted
+                    and secret_redaction_preserves_lexical_context
+                    and not instruction_neutralized
+                ),
             },
         )
         self._remember_identity(observation.observation_id, entry.identity)

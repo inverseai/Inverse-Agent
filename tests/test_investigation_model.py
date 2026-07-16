@@ -20,15 +20,26 @@ from inverse_agent.investigation import (
     ToolCall,
 )
 from inverse_agent.investigation_model import (
+    _SOURCE_LEXICAL_CONTEXT_ERROR,
+    _SOURCE_SYMBOL_CITATION_ERROR,
     ModelInvestigationPlanner,
     _encoded_string_tokens,
+    _expand_immediate_symbol_declaration_citations,
+    _explicit_declaration_symbols,
+    _grounded_answer_structure_error,
+    _has_direct_untrusted_html_flow,
     _maximum_read_probe,
     _maximum_read_probe_tokens,
     _merge_duplicate_citation_findings,
     _recover_inline_citations,
     _render_catalog,
+    _repair_citation_label_findings,
     _repair_citations,
     _repair_non_evidentiary_answer_fields,
+    _repair_unique_listed_read_path,
+    _requires_named_source_symbol,
+    _trim_blank_citation_edges,
+    _visible_declaration_symbols,
     parse_decision,
 )
 from inverse_agent.planner import (
@@ -286,15 +297,15 @@ def test_three_citable_observations_reserve_full_complex_answer_allowance() -> N
             tool="read_file",
             path=f"src/file_{index}.py",
             content_hash=f"hash-{index}",
-            text="evidence",
-            lines=("1: evidence",),
+            text="def inspect_evidence(): pass",
+            lines=("1: def inspect_evidence(): pass",),
         )
         for index in range(3)
     )
     answer = _base(
         "final_answer",
         summary="done",
-        findings=["The evidence was inspected."],
+        findings=["inspect_evidence was inspected."],
         next_actions=["Keep the evidence."],
         citations=[
             {
@@ -322,39 +333,39 @@ def test_model_findings_are_not_rewritten_with_goal_subjects_or_hidden_oracles()
         tool="read_file",
         path="src/config.cpp",
         content_hash="hash-unmodified",
-        text="load_bad\n\n\n\n\n\n\nload_safe",
+        text=("std::string_view load_bad();\n\n\n\n\n\n\nstd::string_view load_safe();"),
         lines=(
-            "3: load_bad",
+            "1: std::string_view load_bad();",
+            "2: ",
+            "3: ",
             "4: ",
             "5: ",
             "6: ",
             "7: ",
-            "8: ",
-            "9: ",
-            "10: load_safe",
+            "8: std::string_view load_safe();",
         ),
-        start_line=3,
+        start_line=1,
     )
     answer = _base(
         "final_answer",
         summary="Two paths were inspected.",
         findings=[
-            "One path returns a dangling view.",
-            "Another path returns member storage.",
+            "load_bad returns a dangling view.",
+            "load_safe returns member storage.",
         ],
         next_actions=["Review both paths."],
         citations=[
             {
                 "observation_id": read.observation_id,
                 "path": read.path,
-                "start_line": 3,
-                "end_line": 3,
+                "start_line": 1,
+                "end_line": 1,
             },
             {
                 "observation_id": read.observation_id,
                 "path": read.path,
-                "start_line": 10,
-                "end_line": 10,
+                "start_line": 8,
+                "end_line": 8,
             },
         ],
     )
@@ -365,24 +376,69 @@ def test_model_findings_are_not_rewritten_with_goal_subjects_or_hidden_oracles()
 
     assert isinstance(decision, AgentAnswer)
     assert decision.findings == (
-        "One path returns a dangling view.",
-        "Another path returns member storage.",
+        "load_bad returns a dangling view.",
+        "load_safe returns member storage.",
     )
     prompt = json.loads(client.prompts[0])
     assert "required_evidence" not in prompt
     assert "required_finding_subjects" not in prompt
     assert "outstanding_required_evidence" not in prompt
     assert "dependency manifest" in client.system_prompts[0]
-    assert "unrelated secret" in client.system_prompts[0]
+    assert "lexical_context_preserved=true" in client.system_prompts[0]
+    assert "beginning at line 1" in client.system_prompts[0]
     assert "workspace-relative list entry is already complete" in client.system_prompts[0]
     assert "join the header path only for a header-relative" in client.system_prompts[0]
     assert "Never repeat an identical complete list" in client.system_prompts[0]
     assert "glob='**/*'" in client.system_prompts[0]
+    assert "a caller proves only the handoff" in client.system_prompts[0]
     assert "protection mechanism" in client.system_prompts[0]
     assert "source-defined function, class, component, or symbol" in client.system_prompts[0]
+    assert "name every observed mechanism" in client.system_prompts[0]
+    assert "Do not combine distinct unsafe and safe subjects" in client.system_prompts[0]
+    assert "positive-flow clause in this order" in client.system_prompts[0]
+    assert "HTML sink alone is not data provenance" in client.system_prompts[0]
     assert "generic phrases such as 'the same file'" in client.system_prompts[0]
     assert "exactly one sentence per finding" in prompt["instructions"]
     assert "state the protection effect" in prompt["instructions"]
+
+
+def test_basename_read_repairs_to_one_completed_listed_path() -> None:
+    listing = ToolObservation(
+        observation_id="obs_unique_listing",
+        tool="list_files",
+        path=".",
+        content_hash="listing-hash",
+        text="package.json\nprojects/views.py",
+        lines=("package.json", "projects/views.py"),
+        metadata={"recursive": True},
+    )
+
+    repaired = _repair_unique_listed_read_path(
+        ToolCall(tool="read_file", path="views.py"),
+        (listing,),
+    )
+
+    assert repaired == ToolCall(tool="read_file", path="projects/views.py")
+
+
+@pytest.mark.parametrize("incomplete", (False, True))
+def test_basename_read_does_not_guess_ambiguous_or_incomplete_listing(
+    incomplete: bool,
+) -> None:
+    lines = ("api/views.py", "projects/views.py") if not incomplete else ("projects/views.py",)
+    listing = ToolObservation(
+        observation_id="obs_unsafe_listing",
+        tool="list_files",
+        path=".",
+        content_hash="listing-hash",
+        text="\n".join(lines),
+        lines=lines,
+        incomplete=incomplete,
+        metadata={"recursive": True},
+    )
+    decision = ToolCall(tool="read_file", path="views.py")
+
+    assert _repair_unique_listed_read_path(decision, (listing,)) == decision
 
 
 def test_explicit_dependency_metadata_goal_auto_reads_only_visible_manifest() -> None:
@@ -701,6 +757,2896 @@ def test_grounded_malformed_answer_gets_one_accounted_schema_retry() -> None:
     assert "one or more non-empty findings" in correction
 
 
+def test_body_only_source_citation_expands_to_immediate_named_declaration() -> None:
+    evidence = ToolObservation(
+        observation_id="obs_search_safe",
+        tool="read_file",
+        path="views.py",
+        content_hash="source-hash",
+        text=(
+            "def search_safe(request):\n"
+            "    term = request.GET.get('q')\n"
+            "    execute('SELECT ...', [term])"
+        ),
+        lines=(
+            "1: def search_safe(request):",
+            "2:     term = request.GET.get('q')",
+            "3:     execute('SELECT ...', [term])",
+        ),
+        start_line=1,
+    )
+    body_only = _base(
+        "final_answer",
+        summary="The safe path was inspected.",
+        findings=["search_safe uses a parameterized query."],
+        next_actions=["Keep the control."],
+        citations=[
+            {
+                "observation_id": evidence.observation_id,
+                "path": evidence.path,
+                "start_line": 2,
+                "end_line": 3,
+            }
+        ],
+    )
+    client = FakeClient([body_only])
+    planner = ModelInvestigationPlanner(client=client, max_auto_reads=0, max_nudges=0)
+
+    decision = planner.decide(goal="verify search_safe", catalog=(evidence,))
+
+    assert isinstance(decision, AgentAnswer)
+    assert decision.citations[0].start_line == 1
+    assert planner.schema_retries == 0
+    assert len(client.prompts) == 1
+
+
+def test_imported_mechanism_does_not_expand_a_complete_local_subject_anchor() -> None:
+    source = (
+        'import React from "react";\n'
+        "export function UnsafeResult({ term }) {\n"
+        "  return <div dangerouslySetInnerHTML={{ __html: term }} />;\n"
+        "}\n"
+    )
+    evidence = ToolObservation(
+        observation_id="obs_react_import_mechanism",
+        tool="read_file",
+        path="SearchResults.jsx",
+        content_hash="source-hash",
+        text=source,
+        lines=tuple(f"{index}: {line}" for index, line in enumerate(source.splitlines(), 1)),
+        start_line=1,
+    )
+    answer = AgentAnswer(
+        summary="The React component was inspected.",
+        findings=(
+            "React component UnsafeResult renders untrusted content via dangerouslySetInnerHTML.",
+        ),
+        next_actions=("Remove the unsafe sink.",),
+        citations=(SourceCitation(evidence.observation_id, evidence.path, 2, 3),),
+        issue_present=True,
+    )
+
+    repaired = _expand_immediate_symbol_declaration_citations(
+        answer,
+        (evidence,),
+        frozenset({evidence.observation_id}),
+    )
+
+    assert repaired == answer
+    assert _grounded_answer_structure_error(repaired, (evidence,)) is None
+
+
+def test_imported_mechanism_does_not_block_local_subject_declaration_expansion() -> None:
+    source = (
+        "import torch\n"
+        "def evaluate_safe(model, loader):\n"
+        "    model.eval()\n"
+        "    with torch.inference_mode():\n"
+        "        return list(loader)\n"
+    )
+    evidence = ToolObservation(
+        observation_id="obs_pytorch_body_only",
+        tool="read_file",
+        path="experiment.py",
+        content_hash="source-hash",
+        text=source,
+        lines=tuple(f"{index}: {line}" for index, line in enumerate(source.splitlines(), 1)),
+        start_line=1,
+    )
+    answer = AgentAnswer(
+        summary="The safe evaluation helper was inspected.",
+        findings=("evaluate_safe wraps evaluation in torch.inference_mode, disabling gradients.",),
+        next_actions=("Keep the inference control.",),
+        citations=(SourceCitation(evidence.observation_id, evidence.path, 3, 5),),
+        issue_present=False,
+    )
+
+    repaired = _expand_immediate_symbol_declaration_citations(
+        answer,
+        (evidence,),
+        frozenset({evidence.observation_id}),
+    )
+
+    assert repaired.citations == (SourceCitation(evidence.observation_id, evidence.path, 2, 5),)
+    assert _grounded_answer_structure_error(repaired, (evidence,)) is None
+
+
+def test_python_import_module_is_a_grounded_import_only_subject() -> None:
+    source = "from django.db import connection\ndef search_unsafe(request):\n    return request\n"
+    evidence = ToolObservation(
+        observation_id="obs_django_import",
+        tool="read_file",
+        path="views.py",
+        content_hash="source-hash",
+        text=source,
+        lines=tuple(f"{index}: {line}" for index, line in enumerate(source.splitlines(), 1)),
+        start_line=1,
+    )
+    answer = AgentAnswer(
+        summary="The backend import was inspected.",
+        findings=("The code imports `django.db`, confirming the Django backend.",),
+        next_actions=("Keep the dependency manifest explicit.",),
+        citations=(SourceCitation(evidence.observation_id, evidence.path, 1, 1),),
+        issue_present=False,
+    )
+
+    assert _grounded_answer_structure_error(answer, (evidence,)) is None
+
+
+def test_import_only_citation_trims_unrelated_following_declaration() -> None:
+    source = "from django.db import connection\ndef search_unsafe(request):\n    return request\n"
+    evidence = ToolObservation(
+        observation_id="obs_django_import_trim",
+        tool="read_file",
+        path="views.py",
+        content_hash="source-hash",
+        text=source,
+        lines=tuple(f"{index}: {line}" for index, line in enumerate(source.splitlines(), 1)),
+        start_line=1,
+    )
+    answer = AgentAnswer(
+        summary="The backend import was inspected.",
+        findings=("The code imports `django.db`, confirming the Django backend.",),
+        next_actions=("Keep the dependency manifest explicit.",),
+        citations=(SourceCitation(evidence.observation_id, evidence.path, 1, 2),),
+        issue_present=False,
+    )
+
+    repaired = _trim_blank_citation_edges(
+        answer,
+        (evidence,),
+        frozenset({evidence.observation_id}),
+    )
+
+    assert repaired.citations == (SourceCitation(evidence.observation_id, evidence.path, 1, 1),)
+    assert _grounded_answer_structure_error(repaired, (evidence,)) is None
+
+
+def test_trailing_unmentioned_declaration_is_trimmed_from_subject_anchor() -> None:
+    source = (
+        "import UIKit\n"
+        "class ProfileViewController: UIViewController { func refreshProfile() { "
+        "DispatchQueue.global().async { self.nameLabel.text = self.loadName() } } }\n"
+        "class AvatarViewController: UIViewController { func refreshAvatar() { "
+        "DispatchQueue.main.async { self.avatarView.image = image } } }\n"
+    )
+    evidence = ToolObservation(
+        observation_id="obs_swift_trailing_subject",
+        tool="read_file",
+        path="ProfileViewController.swift",
+        content_hash="source-hash",
+        text=source,
+        lines=tuple(f"{index}: {line}" for index, line in enumerate(source.splitlines(), 1)),
+        start_line=1,
+    )
+    answer = AgentAnswer(
+        summary="The unsafe refresh was inspected.",
+        findings=(
+            "ProfileViewController refreshes nameLabel on DispatchQueue.global, outside the "
+            "main thread.",
+        ),
+        next_actions=("Move the UI write to the main queue.",),
+        citations=(SourceCitation(evidence.observation_id, evidence.path, 2, 3),),
+        issue_present=True,
+    )
+
+    repaired = _trim_blank_citation_edges(
+        answer,
+        (evidence,),
+        frozenset({evidence.observation_id}),
+    )
+
+    assert repaired.citations == (SourceCitation(evidence.observation_id, evidence.path, 2, 2),)
+    assert _grounded_answer_structure_error(repaired, (evidence,)) is None
+
+
+def test_trailing_standalone_brace_is_trimmed_from_subject_anchor() -> None:
+    source = (
+        "export function UnsafeResult({ userSuppliedTerm }) {\n"
+        "  return <div dangerouslySetInnerHTML={{ __html: userSuppliedTerm }} />;\n"
+        "}\n"
+    )
+    evidence = ToolObservation(
+        observation_id="obs_jsx_trailing_brace",
+        tool="read_file",
+        path="SearchResults.jsx",
+        content_hash="source-hash",
+        text=source,
+        lines=tuple(f"{index}: {line}" for index, line in enumerate(source.splitlines(), 1)),
+        start_line=1,
+    )
+    answer = AgentAnswer(
+        summary="The unsafe component was inspected.",
+        findings=("UnsafeResult renders userSuppliedTerm via dangerouslySetInnerHTML.",),
+        next_actions=("Remove the unsafe sink.",),
+        citations=(SourceCitation(evidence.observation_id, evidence.path, 1, 3),),
+        issue_present=True,
+    )
+
+    repaired = _trim_blank_citation_edges(
+        answer,
+        (evidence,),
+        frozenset({evidence.observation_id}),
+    )
+
+    assert repaired.citations == (SourceCitation(evidence.observation_id, evidence.path, 1, 2),)
+    assert _grounded_answer_structure_error(repaired, (evidence,)) is None
+
+
+def test_leading_unmentioned_import_is_trimmed_from_local_subject_anchor() -> None:
+    source = (
+        "from django.db import connection\n"
+        "def search_unsafe(request):\n"
+        "    term = request.GET.get('q')\n"
+        '    connection.cursor().execute("SELECT * FROM p WHERE n = \'" + term + "\'")\n'
+    )
+    evidence = ToolObservation(
+        observation_id="obs_python_leading_import",
+        tool="read_file",
+        path="views.py",
+        content_hash="source-hash",
+        text=source,
+        lines=tuple(f"{index}: {line}" for index, line in enumerate(source.splitlines(), 1)),
+        start_line=1,
+    )
+    answer = AgentAnswer(
+        summary="The unsafe query was inspected.",
+        findings=(
+            "The Django view search_unsafe concatenates user input into raw SQL, enabling "
+            "SQL injection.",
+        ),
+        next_actions=("Replace concatenation with parameter binding.",),
+        citations=(SourceCitation(evidence.observation_id, evidence.path, 1, 4),),
+        issue_present=True,
+    )
+
+    repaired = _trim_blank_citation_edges(
+        answer,
+        (evidence,),
+        frozenset({evidence.observation_id}),
+    )
+
+    assert repaired.citations == (SourceCitation(evidence.observation_id, evidence.path, 2, 4),)
+    assert _grounded_answer_structure_error(repaired, (evidence,)) is None
+
+
+def test_comment_cannot_masquerade_as_declaration_for_citation_expansion() -> None:
+    evidence = ToolObservation(
+        observation_id="obs_comment",
+        tool="read_file",
+        path="views.py",
+        content_hash="source-hash",
+        text="# search_safe declaration\nexecute('SELECT ...', [term])",
+        lines=(
+            "5: # search_safe declaration",
+            "6: execute('SELECT ...', [term])",
+        ),
+        start_line=5,
+    )
+    answer = AgentAnswer(
+        summary="The query path was inspected.",
+        findings=("search_safe uses a parameterized query.",),
+        next_actions=("Keep parameter binding.",),
+        citations=(SourceCitation(evidence.observation_id, evidence.path, 6, 6),),
+        issue_present=False,
+    )
+
+    repaired = _expand_immediate_symbol_declaration_citations(
+        answer,
+        (evidence,),
+        frozenset({evidence.observation_id}),
+    )
+
+    assert repaired == answer
+
+
+def test_multiline_string_cannot_trigger_declaration_citation_expansion() -> None:
+    source = (
+        "class search_safe:\n"
+        "    pass\n"
+        "blob = '''\n"
+        "def search_safe(request):\n"
+        "    execute('SELECT ...', [term])\n"
+        "'''"
+    )
+    evidence = ToolObservation(
+        observation_id="obs_contextual_expansion",
+        tool="read_file",
+        path="views.py",
+        content_hash="source-hash",
+        text=source,
+        lines=tuple(f"{index}: {line}" for index, line in enumerate(source.splitlines(), 1)),
+        start_line=1,
+    )
+    answer = AgentAnswer(
+        summary="The query path was inspected.",
+        findings=("`search_safe` uses a parameterized query.",),
+        next_actions=("Keep parameter binding.",),
+        citations=(SourceCitation(evidence.observation_id, evidence.path, 5, 5),),
+        issue_present=False,
+    )
+
+    repaired = _expand_immediate_symbol_declaration_citations(
+        answer,
+        (evidence,),
+        frozenset({evidence.observation_id}),
+    )
+
+    assert repaired == answer
+
+
+def test_multiline_markup_attribute_citation_expands_to_subject_line() -> None:
+    source = (
+        "<manifest>\n"
+        '  <activity android:name=".InternalSettingsActivity"\n'
+        '      android:exported="false"/>\n'
+        "</manifest>"
+    )
+    evidence = ToolObservation(
+        observation_id="obs_markup_expansion",
+        tool="read_file",
+        path="AndroidManifest.xml",
+        content_hash="source-hash",
+        text=source,
+        lines=tuple(f"{index}: {line}" for index, line in enumerate(source.splitlines(), 1)),
+        start_line=1,
+    )
+    answer = AgentAnswer(
+        summary="The private activity was inspected.",
+        findings=("`InternalSettingsActivity` is not exported.",),
+        next_actions=("Keep the activity private.",),
+        citations=(SourceCitation(evidence.observation_id, evidence.path, 3, 3),),
+        issue_present=False,
+    )
+
+    repaired = _expand_immediate_symbol_declaration_citations(
+        answer,
+        (evidence,),
+        frozenset({evidence.observation_id}),
+    )
+
+    assert repaired.citations == (SourceCitation(evidence.observation_id, evidence.path, 2, 3),)
+    assert _grounded_answer_structure_error(repaired, (evidence,)) is None
+
+
+@pytest.mark.parametrize(
+    "preceding_line",
+    (
+        "marker = 1  # def search_safe(request):",
+        'marker = "def search_safe(request):"',
+        "marker = /def search_safe(request):/",
+    ),
+)
+def test_inline_comment_or_string_cannot_masquerade_as_declaration(
+    preceding_line: str,
+) -> None:
+    evidence = ToolObservation(
+        observation_id="obs_inline_fake",
+        tool="read_file",
+        path="views.py",
+        content_hash="source-hash",
+        text=f"{preceding_line}\nexecute('SELECT ...', [term])",
+        lines=(f"5: {preceding_line}", "6: execute('SELECT ...', [term])"),
+        start_line=5,
+    )
+    answer = AgentAnswer(
+        summary="The query path was inspected.",
+        findings=("search_safe uses a parameterized query.",),
+        next_actions=("Keep parameter binding.",),
+        citations=(SourceCitation(evidence.observation_id, evidence.path, 6, 6),),
+        issue_present=False,
+    )
+
+    repaired = _expand_immediate_symbol_declaration_citations(
+        answer,
+        (evidence,),
+        frozenset({evidence.observation_id}),
+    )
+
+    assert repaired == answer
+
+
+@pytest.mark.parametrize(
+    "preceding_line",
+    (
+        "return search_safe();",
+        "throw search_safe();",
+        "await search_safe();",
+        "if search_safe()",
+        "while search_safe()",
+    ),
+)
+def test_call_statement_cannot_masquerade_as_declaration(preceding_line: str) -> None:
+    evidence = ToolObservation(
+        observation_id="obs_call_statement",
+        tool="read_file",
+        path="views.cpp",
+        content_hash="source-hash",
+        text=f"{preceding_line}\nexecute_query(term);",
+        lines=(f"5: {preceding_line}", "6: execute_query(term);"),
+        start_line=5,
+    )
+    answer = AgentAnswer(
+        summary="The query path was inspected.",
+        findings=("search_safe uses a parameterized query.",),
+        next_actions=("Keep parameter binding.",),
+        citations=(SourceCitation(evidence.observation_id, evidence.path, 6, 6),),
+        issue_present=False,
+    )
+
+    repaired = _expand_immediate_symbol_declaration_citations(
+        answer,
+        (evidence,),
+        frozenset({evidence.observation_id}),
+    )
+
+    assert "search_safe" not in _explicit_declaration_symbols(preceding_line)
+    assert repaired == answer
+
+
+@pytest.mark.parametrize(
+    "source",
+    (
+        "// search_safe declaration\nexecute(query);",
+        'marker = "search_safe declaration";\nexecute(query);',
+        "marker = /search_safe declaration/;\nexecute(query);",
+        "search_safe();\nexecute(query);",
+    ),
+)
+def test_non_declaration_cannot_satisfy_named_symbol_validation(source: str) -> None:
+    source_lines = source.splitlines()
+    evidence = ToolObservation(
+        observation_id="obs_fake_symbol",
+        tool="read_file",
+        path="x.js",
+        content_hash="source-hash",
+        text=source,
+        lines=tuple(f"{index}: {line}" for index, line in enumerate(source_lines, 1)),
+        start_line=1,
+    )
+    answer = AgentAnswer(
+        summary="The query path was inspected.",
+        findings=("search_safe uses parameter binding.",),
+        next_actions=("Keep parameter binding.",),
+        citations=(SourceCitation(evidence.observation_id, evidence.path, 1, 2),),
+        issue_present=False,
+    )
+
+    assert "search_safe" not in _visible_declaration_symbols(source, "x.js")
+    assert _grounded_answer_structure_error(answer, (evidence,)) == (
+        "each code-source finding must name a concrete source-defined identifier supported "
+        "by the cited declaration"
+    )
+
+
+def test_visible_blank_citation_padding_is_trimmed() -> None:
+    evidence = ToolObservation(
+        observation_id="obs_gateway",
+        tool="read_file",
+        path="gateway.py",
+        content_hash="source-hash",
+        text="def handle(request):\n    return worker.enqueue(request)\n",
+        lines=(
+            "1: def handle(request):",
+            "2:     return worker.enqueue(request)",
+            "3: ",
+        ),
+        start_line=1,
+    )
+    answer = _base(
+        "final_answer",
+        summary="The gateway path was inspected.",
+        findings=["handle returns worker.enqueue(request)."],
+        next_actions=["Keep the handoff observable."],
+        citations=[
+            {
+                "observation_id": evidence.observation_id,
+                "path": evidence.path,
+                "start_line": 1,
+                "end_line": 3,
+            }
+        ],
+    )
+    client = FakeClient([answer])
+    planner = ModelInvestigationPlanner(client=client, max_auto_reads=0, max_nudges=0)
+
+    decision = planner.decide(goal="trace the gateway handoff", catalog=(evidence,))
+
+    assert isinstance(decision, AgentAnswer)
+    assert decision.citations[0].start_line == 1
+    assert decision.citations[0].end_line == 2
+    assert planner.schema_retries == 0
+
+
+def test_html_sink_without_untrusted_flow_gets_one_accounted_schema_retry() -> None:
+    evidence = ToolObservation(
+        observation_id="obs_unsafe_result",
+        tool="read_file",
+        path="SearchResults.jsx",
+        content_hash="source-hash",
+        text=(
+            "export function UnsafeResult({ term }) {\n"
+            "  return <div dangerouslySetInnerHTML={{ __html: term }} />;\n"
+            "}"
+        ),
+        lines=(
+            "1: export function UnsafeResult({ term }) {",
+            "2:   return <div dangerouslySetInnerHTML={{ __html: term }} />;",
+            "3: }",
+        ),
+        start_line=1,
+    )
+    weak = _base(
+        "final_answer",
+        summary="The browser path was inspected.",
+        findings=["UnsafeResult renders raw HTML via dangerouslySetInnerHTML."],
+        next_actions=["Remove the unsafe sink."],
+        citations=[
+            {
+                "observation_id": evidence.observation_id,
+                "path": evidence.path,
+                "start_line": 1,
+                "end_line": 2,
+            }
+        ],
+    )
+    corrected = _base(
+        "final_answer",
+        summary="The browser path was inspected.",
+        findings=["UnsafeResult renders untrusted user-supplied data via dangerouslySetInnerHTML."],
+        next_actions=["Remove the unsafe sink."],
+        citations=weak["citations"],
+    )
+    client = FakeClient([weak, corrected])
+    planner = ModelInvestigationPlanner(client=client, max_auto_reads=0, max_nudges=0)
+
+    decision = planner.decide(goal="audit browser injection", catalog=(evidence,))
+
+    assert isinstance(decision, AgentAnswer)
+    assert "untrusted" in decision.findings[0]
+    assert planner.schema_retries == 1
+    correction = json.loads(client.prompts[1])["retry_correction"]
+    assert "explicitly untrusted" in correction
+    assert "do not substitute only 'raw HTML' or 'term prop'" in correction
+
+
+@pytest.mark.parametrize(
+    "finding",
+    (
+        "UnsafeResult refuses to pass untrusted input to dangerouslySetInnerHTML.",
+        (
+            "UnsafeResult passes untrusted input to an audit logger before using "
+            "dangerouslySetInnerHTML."
+        ),
+        "UnsafeResult passes sanitized untrusted input to dangerouslySetInnerHTML.",
+        (
+            "UnsafeResult passes untrusted input to dangerouslySetInnerHTML, but it "
+            "does not actually do so."
+        ),
+        (
+            "UnsafeResult passes untrusted input to dangerouslySetInnerHTML only after "
+            "sanitizing it."
+        ),
+        (
+            "UnsafeResult passes untrusted input to dangerouslySetInnerHTML only in the "
+            "audit logger."
+        ),
+        "It is false that UnsafeResult passes untrusted input to dangerouslySetInnerHTML.",
+        "After sanitizing it, UnsafeResult passes untrusted input to dangerouslySetInnerHTML.",
+        (
+            "The audit logger reports that UnsafeResult passes untrusted input to "
+            "dangerouslySetInnerHTML."
+        ),
+        (
+            "UnsafeResult passes untrusted input to dangerouslySetInnerHTML, which is "
+            "prevented by the wrapper."
+        ),
+        "It is false; UnsafeResult passes untrusted input to dangerouslySetInnerHTML.",
+        (
+            "UnsafeResult passes untrusted input to dangerouslySetInnerHTML; but it is "
+            "prevented by a wrapper."
+        ),
+        (
+            "UnsafeResult passes untrusted input to dangerouslySetInnerHTML. It is "
+            "prevented by a wrapper."
+        ),
+        (
+            "UnsafeResult passes untrusted input to dangerouslySetInnerHTML, but it "
+            "doesn't actually do so."
+        ),
+        "It isn't true that UnsafeResult passes untrusted input to dangerouslySetInnerHTML.",
+        (
+            "UnsafeResult passes untrusted input to dangerouslySetInnerHTML, but cannot "
+            "actually do so."
+        ),
+        "After escaping it, UnsafeResult passes untrusted input to dangerouslySetInnerHTML.",
+        "After filtering it, UnsafeResult passes untrusted input to dangerouslySetInnerHTML.",
+    ),
+)
+def test_production_react_flow_rejects_negated_disconnected_or_protected_edges(
+    finding: str,
+) -> None:
+    assert not _has_direct_untrusted_html_flow(finding)
+
+
+def test_production_react_flow_accepts_direct_explicit_edge() -> None:
+    assert _has_direct_untrusted_html_flow(
+        "UnsafeResult renders user-supplied term via dangerouslySetInnerHTML."
+    )
+
+
+def test_production_react_flow_accepts_explicit_untrusted_prop_edge() -> None:
+    assert _has_direct_untrusted_html_flow(
+        "UnsafeResult renders untrusted term prop directly into dangerouslySetInnerHTML."
+    )
+
+
+def test_production_react_flow_accepts_user_provided_content_edge() -> None:
+    assert _has_direct_untrusted_html_flow(
+        "UnsafeResult renders user-provided content via dangerouslySetInnerHTML."
+    )
+
+
+@pytest.mark.parametrize(
+    "identifier", ("userControlledTerm", "userProvidedHtml", "userSuppliedTerm")
+)
+def test_production_react_flow_accepts_explicit_provenance_identifier(
+    identifier: str,
+) -> None:
+    assert _has_direct_untrusted_html_flow(
+        f"UnsafeResult renders {identifier} via dangerouslySetInnerHTML."
+    )
+
+
+def test_production_react_flow_accepts_unsafe_adverb_after_provenance() -> None:
+    assert _has_direct_untrusted_html_flow(
+        "UnsafeResult component renders userSuppliedTerm unsafely via dangerouslySetInnerHTML."
+    )
+
+
+@pytest.mark.parametrize(
+    "path",
+    (
+        "projects/static/projects/SearchResults.jsx",
+        "/projects/static/projects/SearchResults.jsx",
+        "C:\\projects\\static\\projects\\SearchResults.jsx",
+        "D:\\Office Repos\\LLM AGENT\\projects\\static\\projects\\SearchResults.jsx",
+        "projects/static files/projects/SearchResults.jsx",
+    ),
+)
+def test_production_react_flow_ignores_static_directory_in_code_path(
+    path: str,
+) -> None:
+    assert _has_direct_untrusted_html_flow(
+        f"`{path}` contains component "
+        "`UnsafeResult` that renders user-supplied `term` via "
+        "`dangerouslySetInnerHTML`, exposing XSS risk."
+    )
+
+
+@pytest.mark.parametrize(
+    "path",
+    (
+        "projects/UnsafeRESULT/static.jsx",
+        "projects/DangerouslySetInnerHTML/static.jsx",
+    ),
+)
+def test_production_react_flow_ignores_wrong_case_candidates_in_code_path(
+    path: str,
+) -> None:
+    assert _has_direct_untrusted_html_flow(
+        f"`{path}` contains component `UnsafeResult` that renders user-supplied "
+        "`term` via `dangerouslySetInnerHTML`."
+    )
+
+
+@pytest.mark.parametrize(
+    "protection",
+    (
+        "The content is `trusted/sanitized`.",
+        "The content passes through `sanitize(term)/encode(term)`.",
+    ),
+)
+def test_production_react_flow_does_not_erase_slash_bearing_protection(
+    protection: str,
+) -> None:
+    assert not _has_direct_untrusted_html_flow(
+        "UnsafeResult renders user-supplied term via dangerouslySetInnerHTML, "
+        f"exposing XSS risk. {protection}"
+    )
+
+
+def test_code_finding_without_named_source_symbol_gets_schema_retry() -> None:
+    evidence = ToolObservation(
+        observation_id="obs_load_safe",
+        tool="read_file",
+        path="config.cpp",
+        content_hash="source-hash",
+        text="std::string_view load_safe() { return storage_; }",
+        lines=("1: std::string_view load_safe() { return storage_; }",),
+        start_line=1,
+    )
+    citation = {
+        "observation_id": evidence.observation_id,
+        "path": evidence.path,
+        "start_line": 1,
+        "end_line": 1,
+    }
+    weak = _base(
+        "final_answer",
+        summary="The safe path was inspected.",
+        findings=["Citation: obs_load_safe line 1."],
+        next_actions=["Keep owning storage."],
+        citations=[citation],
+    )
+    corrected = _base(
+        "final_answer",
+        summary="The safe path was inspected.",
+        findings=["load_safe returns a string_view backed by member storage_."],
+        next_actions=["Keep owning storage."],
+        citations=[citation],
+    )
+    client = FakeClient([weak, corrected])
+    planner = ModelInvestigationPlanner(client=client, max_auto_reads=0, max_nudges=0)
+
+    decision = planner.decide(goal="compare lifetime paths", catalog=(evidence,))
+
+    assert isinstance(decision, AgentAnswer)
+    assert decision.findings == (corrected["findings"][0],)
+    assert planner.schema_retries == 1
+    correction = json.loads(client.prompts[1])["retry_correction"]
+    assert "do not use a citation label as a finding" in correction
+
+
+def test_generic_code_finding_without_declared_symbol_gets_schema_retry() -> None:
+    evidence = ToolObservation(
+        observation_id="obs_config_function",
+        tool="read_file",
+        path="config.cpp",
+        content_hash="source-hash",
+        text="std::string_view load_safe() { return storage_; }",
+        lines=("1: std::string_view load_safe() { return storage_; }",),
+        start_line=1,
+    )
+    citation = {
+        "observation_id": evidence.observation_id,
+        "path": evidence.path,
+        "start_line": 1,
+        "end_line": 1,
+    }
+    weak = _base(
+        "final_answer",
+        summary="The safe path was inspected.",
+        findings=["The safe path returns a durable view."],
+        next_actions=["Keep owning storage."],
+        citations=[citation],
+    )
+    corrected = _base(
+        "final_answer",
+        summary="The safe path was inspected.",
+        findings=["load_safe returns a durable view."],
+        next_actions=["Keep owning storage."],
+        citations=[citation],
+    )
+    client = FakeClient([weak, corrected])
+    planner = ModelInvestigationPlanner(client=client, max_auto_reads=0, max_nudges=0)
+
+    decision = planner.decide(goal="compare lifetime paths", catalog=(evidence,))
+
+    assert isinstance(decision, AgentAnswer)
+    assert decision.findings == (corrected["findings"][0],)
+    assert planner.schema_retries == 1
+    correction = json.loads(client.prompts[1])["retry_correction"]
+    assert "identifier visible in the cited source" in correction
+
+
+@pytest.mark.parametrize(
+    "finding",
+    (
+        "The operation is safe.",
+        "The cited code remains safe.",
+        "Function Safe returns dangerous behavior.",
+        "safe paths remain dangerous.",
+        "safe operations remain dangerous.",
+        "safe handling remains dangerous.",
+        "safe methods are vulnerable.",
+    ),
+)
+def test_plain_lowercase_symbol_cannot_be_satisfied_as_incidental_prose(
+    finding: str,
+) -> None:
+    evidence = ToolObservation(
+        observation_id="obs_safe_prose",
+        tool="read_file",
+        path="ops.py",
+        content_hash="source-hash",
+        text="def safe():\n    return destroy_everything()",
+        lines=("1: def safe():", "2:     return destroy_everything()"),
+        start_line=1,
+    )
+    answer = AgentAnswer(
+        summary="The operation was inspected.",
+        findings=(finding,),
+        next_actions=("Review the cited behavior.",),
+        citations=(SourceCitation(evidence.observation_id, evidence.path, 1, 2),),
+        issue_present=True,
+    )
+
+    assert _grounded_answer_structure_error(answer, (evidence,)) == (
+        "each code-source finding must name a concrete source-defined identifier supported "
+        "by the cited declaration"
+    )
+
+
+@pytest.mark.parametrize(
+    "finding",
+    (
+        "enqueue places requests on the billing queue.",
+        "The enqueue function places requests on the billing queue.",
+        "Function enqueue places requests on the billing queue.",
+        "Calling enqueue places requests on the billing queue.",
+        "enqueue submits requests to the billing queue.",
+        "enqueue puts requests on the billing queue.",
+        "enqueue placed requests on the billing queue.",
+        "enqueue sends requests to the billing queue.",
+    ),
+)
+def test_plain_lowercase_symbol_is_valid_as_a_concrete_subject(finding: str) -> None:
+    evidence = ToolObservation(
+        observation_id="obs_enqueue_subject",
+        tool="read_file",
+        path="worker.py",
+        content_hash="source-hash",
+        text="def enqueue(request):\n    BILLING_QUEUE.put(request)",
+        lines=(
+            "1: def enqueue(request):",
+            "2:     BILLING_QUEUE.put(request)",
+        ),
+        start_line=1,
+    )
+    answer = AgentAnswer(
+        summary="The worker was inspected.",
+        findings=(finding,),
+        next_actions=("Keep the queue behavior intentional.",),
+        citations=(SourceCitation(evidence.observation_id, evidence.path, 1, 2),),
+        issue_present=False,
+    )
+
+    assert _grounded_answer_structure_error(answer, (evidence,)) is None
+
+
+@pytest.mark.parametrize(
+    "finding",
+    (
+        "The file `src/safe.py` contains dangerous behavior.",
+        "The `safe.py` file contains dangerous behavior.",
+        "The path src/safe.py was inspected.",
+    ),
+)
+def test_source_path_cannot_launder_a_plain_symbol_mention(finding: str) -> None:
+    evidence = ToolObservation(
+        observation_id="obs_safe_path",
+        tool="read_file",
+        path="safe.py",
+        content_hash="source-hash",
+        text="def safe():\n    return destroy_everything()",
+        lines=("1: def safe():", "2:     return destroy_everything()"),
+        start_line=1,
+    )
+    answer = AgentAnswer(
+        summary="The path was inspected.",
+        findings=(finding,),
+        next_actions=("Review the cited behavior.",),
+        citations=(SourceCitation(evidence.observation_id, evidence.path, 1, 2),),
+        issue_present=True,
+    )
+
+    assert _grounded_answer_structure_error(answer, (evidence,)) == (
+        "each code-source finding must name a concrete source-defined identifier supported "
+        "by the cited declaration"
+    )
+
+
+@pytest.mark.parametrize("symbol", ("Safe", "Default", "Open"))
+def test_ambiguous_pascal_symbol_cannot_be_used_only_as_an_adjective(
+    symbol: str,
+) -> None:
+    evidence = ToolObservation(
+        observation_id="obs_pascal_adjective",
+        tool="read_file",
+        path="Ops.java",
+        content_hash="source-hash",
+        text=f"class {symbol} {{}}",
+        lines=(f"1: class {symbol} {{}}",),
+        start_line=1,
+    )
+    answer = AgentAnswer(
+        summary="The operation was inspected.",
+        findings=(f"The operation is {symbol}.",),
+        next_actions=("Review the cited behavior.",),
+        citations=(SourceCitation(evidence.observation_id, evidence.path, 1, 1),),
+        issue_present=True,
+    )
+
+    assert _grounded_answer_structure_error(answer, (evidence,)) == (
+        "each code-source finding must name a concrete source-defined identifier supported "
+        "by the cited declaration"
+    )
+
+
+@pytest.mark.parametrize(
+    ("symbol", "finding"),
+    (
+        ("The", "The implementation fails."),
+        ("This", "This code crashes."),
+        ("That", "That path fails."),
+        ("These", "These calls fail."),
+        ("Those", "Those calls fail."),
+        ("A", "A bug exists."),
+        ("An", "An error occurs."),
+        ("The", "The component fails."),
+        ("This", "This function crashes."),
+        ("A", "A class is insecure."),
+        ("An", "An interface fails."),
+        ("That", "That method throws."),
+        ("I", "I found a bug."),
+        ("It", "It fails while loading."),
+        ("We", "We found a bug."),
+        ("You", "You found a bug."),
+        ("He", "He found a bug."),
+        ("She", "She found a bug."),
+        ("They", "They fail while loading."),
+        ("There", "There is a bug."),
+        ("Here", "Here is a bug."),
+        ("When", "When loading, a bug occurs."),
+        ("Where", "Where loading occurs, a bug follows."),
+        ("Who", "Who found the bug?"),
+        ("Which", "Which path fails?"),
+        ("What", "What fails while loading?"),
+        ("My", "My path fails."),
+        ("Your", "Your path fails."),
+        ("His", "His path fails."),
+        ("Her", "Her path fails."),
+        ("Its", "Its path fails."),
+        ("Our", "Our path fails."),
+        ("Their", "Their path fails."),
+        ("Whose", "Whose path fails?"),
+        ("Safe", "Safe component fails."),
+        ("Default", "Default function crashes."),
+        ("Open", "Open method leaks."),
+        ("Raw", "Raw component fails."),
+        ("Static", "Static class breaks."),
+    ),
+)
+def test_grammatical_article_or_pronoun_cannot_launder_a_class_symbol(
+    symbol: str,
+    finding: str,
+) -> None:
+    evidence = ToolObservation(
+        observation_id="obs_grammar_symbol",
+        tool="read_file",
+        path="Ops.java",
+        content_hash="source-hash",
+        text=f"class {symbol} {{}}",
+        lines=(f"1: class {symbol} {{}}",),
+        start_line=1,
+    )
+    answer = AgentAnswer(
+        summary="The class was inspected.",
+        findings=(finding,),
+        next_actions=("Review the cited behavior.",),
+        citations=(SourceCitation(evidence.observation_id, evidence.path, 1, 1),),
+        issue_present=True,
+    )
+
+    assert _grounded_answer_structure_error(answer, (evidence,)) == (
+        "each code-source finding must name a concrete source-defined identifier supported "
+        "by the cited declaration"
+    )
+
+
+@pytest.mark.parametrize(
+    "symbol",
+    (
+        "In",
+        "On",
+        "At",
+        "For",
+        "From",
+        "To",
+        "By",
+        "With",
+        "Without",
+        "As",
+        "And",
+        "Or",
+        "But",
+        "Because",
+        "Although",
+        "While",
+        "If",
+    ),
+)
+def test_sentence_connector_cannot_launder_a_class_symbol(symbol: str) -> None:
+    evidence = ToolObservation(
+        observation_id="obs_connector_symbol",
+        tool="read_file",
+        path="Ops.java",
+        content_hash="source-hash",
+        text=f"class {symbol} {{}}",
+        lines=(f"1: class {symbol} {{}}",),
+        start_line=1,
+    )
+    answer = AgentAnswer(
+        summary="The class was inspected.",
+        findings=(f"{symbol} this path, a bug exists.",),
+        next_actions=("Review the cited behavior.",),
+        citations=(SourceCitation(evidence.observation_id, evidence.path, 1, 1),),
+        issue_present=True,
+    )
+
+    assert _grounded_answer_structure_error(answer, (evidence,)) == (
+        "each code-source finding must name a concrete source-defined identifier supported "
+        "by the cited declaration"
+    )
+
+
+def test_ambiguous_symbol_is_valid_with_explicit_code_formatting() -> None:
+    evidence = ToolObservation(
+        observation_id="obs_safe_identifier",
+        tool="read_file",
+        path="ops.py",
+        content_hash="source-hash",
+        text="def safe():\n    return False",
+        lines=("1: def safe():", "2:     return False"),
+        start_line=1,
+    )
+    answer = AgentAnswer(
+        summary="The function was inspected.",
+        findings=("`safe` returns False.",),
+        next_actions=("Review the cited behavior.",),
+        citations=(SourceCitation(evidence.observation_id, evidence.path, 1, 2),),
+        issue_present=True,
+    )
+
+    assert _grounded_answer_structure_error(answer, (evidence,)) is None
+
+
+def test_unique_grounded_summary_sentence_repairs_citation_label_finding() -> None:
+    evidence = ToolObservation(
+        observation_id="obs_config_source",
+        tool="read_file",
+        path="config.cpp",
+        content_hash="source-hash",
+        text=(
+            "std::string_view load_bad() { return local; }\n"
+            "class ConfigCache { std::string storage_; public: "
+            "std::string_view load_safe() { return storage_; } };"
+        ),
+        lines=(
+            "1: std::string_view load_bad() { return local; }",
+            "2: class ConfigCache { std::string storage_; public: "
+            "std::string_view load_safe() { return storage_; } };",
+        ),
+        start_line=1,
+    )
+    safe_sentence = "ConfigCache::load_safe returns a string_view backed by member storage_."
+    answer = _base(
+        "final_answer",
+        summary=(f"load_bad returns a view over local storage. {safe_sentence}"),
+        findings=[
+            "load_bad returns a view over local storage.",
+            "Citation: obs_config_source line 2.",
+        ],
+        next_actions=["Keep returned views backed by durable storage."],
+        citations=[
+            {
+                "observation_id": evidence.observation_id,
+                "path": evidence.path,
+                "start_line": 1,
+                "end_line": 1,
+            },
+            {
+                "observation_id": evidence.observation_id,
+                "path": evidence.path,
+                "start_line": 2,
+                "end_line": 2,
+            },
+        ],
+    )
+    client = FakeClient([answer])
+    planner = ModelInvestigationPlanner(client=client, max_auto_reads=0, max_nudges=0)
+
+    decision = planner.decide(goal="compare lifetime paths", catalog=(evidence,))
+
+    assert isinstance(decision, AgentAnswer)
+    assert decision.findings == (answer["findings"][0], safe_sentence)
+    assert planner.schema_retries == 0
+
+
+def test_citation_label_repair_ignores_declaration_inside_multiline_string() -> None:
+    source = "class Fake:\n    pass\nblob = '''\nclass Fake:\n    pass\n'''"
+    evidence = ToolObservation(
+        observation_id="obs_contextual_label",
+        tool="read_file",
+        path="config.py",
+        content_hash="source-hash",
+        text=source,
+        lines=tuple(f"{index}: {line}" for index, line in enumerate(source.splitlines(), 1)),
+        start_line=1,
+    )
+    answer = AgentAnswer(
+        summary="Fake fails while loading configuration.",
+        findings=("Citation: obs_contextual_label line 4.",),
+        next_actions=("Review the failure.",),
+        citations=(SourceCitation(evidence.observation_id, evidence.path, 4, 4),),
+        issue_present=True,
+    )
+
+    repaired = _repair_citation_label_findings(
+        answer,
+        (evidence,),
+        frozenset({evidence.observation_id}),
+    )
+
+    assert repaired == answer
+
+
+def test_citation_label_repair_cannot_reuse_one_summary_sentence() -> None:
+    evidence = ToolObservation(
+        observation_id="obs_duplicate_class",
+        tool="read_file",
+        path="config.cpp",
+        content_hash="source-hash",
+        text="class ConfigCache {};\nclass ConfigCache {};",
+        lines=("1: class ConfigCache {};", "2: class ConfigCache {};"),
+        start_line=1,
+    )
+    answer = AgentAnswer(
+        summary="ConfigCache is safe.",
+        findings=(
+            "Citation: obs_duplicate_class line 1.",
+            "Citation: obs_duplicate_class line 2.",
+        ),
+        next_actions=("Keep durable storage.",),
+        citations=(
+            SourceCitation(evidence.observation_id, evidence.path, 1, 1),
+            SourceCitation(evidence.observation_id, evidence.path, 2, 2),
+        ),
+        issue_present=False,
+    )
+
+    repaired = _repair_citation_label_findings(
+        answer,
+        (evidence,),
+        frozenset({evidence.observation_id}),
+    )
+
+    assert repaired == answer
+
+
+def test_lowercase_summary_sentence_boundary_prevents_claim_laundering() -> None:
+    evidence = ToolObservation(
+        observation_id="obs_lowercase",
+        tool="read_file",
+        path="config.py",
+        content_hash="source-hash",
+        text="def load_safe(): return storage",
+        lines=("1: def load_safe(): return storage",),
+        start_line=1,
+    )
+    grounded_sentence = "load_safe returns durable storage."
+    answer = AgentAnswer(
+        summary=f"An unrelated uncited vulnerability exists. {grounded_sentence}",
+        findings=("Citation: obs_lowercase line 1.",),
+        next_actions=("Keep durable storage.",),
+        citations=(SourceCitation(evidence.observation_id, evidence.path, 1, 1),),
+        issue_present=False,
+    )
+
+    repaired = _repair_citation_label_findings(
+        answer,
+        (evidence,),
+        frozenset({evidence.observation_id}),
+    )
+
+    assert repaired.findings == (grounded_sentence,)
+
+
+def test_citation_label_repair_ignores_unrendered_observation() -> None:
+    evidence = ToolObservation(
+        observation_id="obs_hidden_config",
+        tool="read_file",
+        path="config.cpp",
+        content_hash="source-hash",
+        text="std::string_view load_safe() { return storage_; }",
+        lines=("7: std::string_view load_safe() { return storage_; }",),
+        start_line=7,
+    )
+    answer = AgentAnswer(
+        summary="load_safe returns a view backed by storage_.",
+        findings=("Citation: obs_hidden_config line 7.",),
+        next_actions=("Keep durable storage.",),
+        citations=(SourceCitation(evidence.observation_id, evidence.path, 7, 7),),
+        issue_present=False,
+    )
+
+    repaired = _repair_citation_label_findings(answer, (evidence,), frozenset())
+
+    assert repaired == answer
+
+
+def test_non_code_finding_does_not_require_a_source_symbol() -> None:
+    evidence = ToolObservation(
+        observation_id="obs_readme",
+        tool="read_file",
+        path="README.md",
+        content_hash="readme-hash",
+        text="The investigation mode is read-only by design.",
+        lines=("4: The investigation mode is read-only by design.",),
+        start_line=4,
+    )
+    answer = _base(
+        "final_answer",
+        summary="The documented constraint was inspected.",
+        findings=["The documentation describes investigation mode as read-only."],
+        next_actions=["Keep the documented constraint."],
+        citations=[
+            {
+                "observation_id": evidence.observation_id,
+                "path": evidence.path,
+                "start_line": 4,
+                "end_line": 4,
+            }
+        ],
+    )
+    client = FakeClient([answer])
+    planner = ModelInvestigationPlanner(client=client, max_auto_reads=0, max_nudges=0)
+
+    decision = planner.decide(goal="inspect the documented constraint", catalog=(evidence,))
+
+    assert isinstance(decision, AgentAnswer)
+    assert planner.schema_retries == 0
+
+
+@pytest.mark.parametrize("basename", ("build.sh", "schema.sql", "index.html"))
+def test_common_executable_source_formats_require_named_symbols(basename: str) -> None:
+    assert _requires_named_source_symbol(basename)
+
+
+@pytest.mark.parametrize(
+    ("path", "source", "symbol"),
+    (
+        (
+            "config.cpp",
+            "std::string_view load_safe()\n{\n    return storage_;\n}",
+            "load_safe",
+        ),
+        ("config.hpp", "std::string_view load_safe() const;", "load_safe"),
+        ("build.sh", "build_safe()\n{\n    echo ok\n}", "build_safe"),
+        ("Config.java", "String loadSafe()\n{\n    return value;\n}", "loadSafe"),
+        ("config.cpp", "constexpr int config_limit = 5;", "config_limit"),
+        (
+            "config.cpp",
+            "auto load_safe() -> std::string_view { return storage_; }",
+            "load_safe",
+        ),
+        (
+            "config.cpp",
+            "Config::Config(std::string value) { storage_ = value; }",
+            "Config",
+        ),
+        ("Config.java", "Config(String value) { this.value = value; }", "Config"),
+        ("config.cpp", "std::string storage_ = value;", "storage_"),
+        ("config.cpp", "std::string* storage_ = value;", "storage_"),
+        ("config.cpp", "std::string& storage_ = value;", "storage_"),
+        ("search.js", "searchSafe(term) { return term; }", "searchSafe"),
+        ("search.js", "import { searchSafe } from './search.js';", "searchSafe"),
+        (
+            "search.js",
+            "import DefaultSafe, { searchSafe } from './search.js';",
+            "searchSafe",
+        ),
+        (
+            "search.js",
+            "import {\n  searchSafe,\n} from './search.js';",
+            "searchSafe",
+        ),
+        ("experiment.py", "import torch as th", "th"),
+        (
+            "experiment.py",
+            "from torch import inference_mode as infer",
+            "infer",
+        ),
+        ("Search.kt", "fun searchSafe(term: String) = term", "searchSafe"),
+        ("Search.kt", "val searchSafe = { term: String -> term }", "searchSafe"),
+        ("lib.rs", "let mut search_safe = value;", "search_safe"),
+        ("schema.sql", 'CREATE TABLE "search_results" (id INTEGER);', "search_results"),
+        ("index.html", '<div id="search_results"></div>', "search_results"),
+    ),
+)
+def test_common_visible_declarations_require_symbol_named_finding(
+    path: str,
+    source: str,
+    symbol: str,
+) -> None:
+    source_lines = source.splitlines()
+    evidence = ToolObservation(
+        observation_id="obs_visible_declaration",
+        tool="read_file",
+        path=path,
+        content_hash="source-hash",
+        text=source,
+        lines=tuple(f"{index}: {line}" for index, line in enumerate(source_lines, 1)),
+        start_line=1,
+    )
+    answer = AgentAnswer(
+        summary="The safe path was inspected.",
+        findings=("The safe path returns durable storage.",),
+        next_actions=("Keep the safe path.",),
+        citations=(SourceCitation(evidence.observation_id, path, 1, len(source_lines)),),
+        issue_present=False,
+    )
+
+    assert symbol in _visible_declaration_symbols(source, path.casefold())
+    assert _grounded_answer_structure_error(answer, (evidence,)) == (
+        "each code-source finding must name a concrete source-defined identifier supported "
+        "by the cited declaration"
+    )
+
+
+def test_commented_markup_declaration_cannot_ground_a_finding() -> None:
+    source = '<!-- <activity android:name=".FakeActivity" /> -->\n<manifest />'
+    evidence = ToolObservation(
+        observation_id="obs_commented_markup",
+        tool="read_file",
+        path="AndroidManifest.xml",
+        content_hash="source-hash",
+        text=source,
+        lines=tuple(f"{index}: {line}" for index, line in enumerate(source.splitlines(), 1)),
+        start_line=1,
+    )
+    answer = AgentAnswer(
+        summary="The manifest was inspected.",
+        findings=("FakeActivity is exported.",),
+        next_actions=("Keep exported components intentional.",),
+        citations=(SourceCitation(evidence.observation_id, evidence.path, 1, 2),),
+        issue_present=True,
+    )
+
+    assert "FakeActivity" not in _visible_declaration_symbols(source, "androidmanifest.xml")
+    assert _grounded_answer_structure_error(answer, (evidence,)) == (
+        "each code-source finding must name a concrete source-defined identifier supported "
+        "by the cited declaration"
+    )
+
+
+@pytest.mark.parametrize(
+    "source",
+    (
+        '<!-- <activity android:name=".FakeActivity" />\n<manifest />',
+        "<script>const text = 'id=\"FakeActivity\"';</script>",
+        '<p>The example uses id="FakeActivity" in prose.</p>',
+        '<![CDATA[<activity android:name=".FakeActivity" />]]>',
+    ),
+)
+def test_non_tag_markup_text_cannot_declare_a_symbol(source: str) -> None:
+    assert "FakeActivity" not in _visible_declaration_symbols(source, "androidmanifest.xml")
+
+
+def test_truncated_sql_comment_cannot_declare_a_symbol() -> None:
+    source = '/*\nCREATE TABLE "fake_results" (id INT);'
+
+    assert "fake_results" not in _visible_declaration_symbols(source, "schema.sql")
+
+
+@pytest.mark.parametrize("quoted_comment", ("'/*'", "'--'"))
+def test_sql_comment_marker_in_string_does_not_hide_later_declaration(
+    quoted_comment: str,
+) -> None:
+    source = f"SELECT {quoted_comment};\nCREATE TABLE real_results (id INT);"
+
+    assert "real_results" in _visible_declaration_symbols(source, "schema.sql")
+
+
+def test_nested_sql_comment_cannot_declare_a_symbol() -> None:
+    source = "/* outer\n/* inner */\nCREATE TABLE fake_results (id INT);\n*/"
+
+    assert "fake_results" not in _visible_declaration_symbols(source, "schema.sql")
+
+
+def test_sql_dollar_string_masks_fake_declarations_but_not_later_source() -> None:
+    source = (
+        "SELECT $tag$/*\n"
+        "CREATE TABLE fake_results (id INT);\n"
+        "$tag$;\n"
+        "CREATE TABLE real_results (id INT);"
+    )
+    symbols = _visible_declaration_symbols(source, "schema.sql")
+
+    assert "fake_results" not in symbols
+    assert "real_results" in symbols
+
+
+@pytest.mark.parametrize(
+    "literal",
+    (
+        "$tag$class FakeResult {}$tag$",
+        "'class FakeResult {}'",
+        "'first line\nclass FakeResult {}\nlast line'",
+    ),
+)
+def test_sql_strings_do_not_create_generic_declaration_symbols(literal: str) -> None:
+    source = f"SELECT {literal};\nCREATE TABLE real_results (id INT);"
+    symbols = _visible_declaration_symbols(source, "schema.sql")
+
+    assert "FakeResult" not in symbols
+    assert "real_results" in symbols
+
+
+@pytest.mark.parametrize("prefix", ("", "E"))
+def test_sql_backslash_escaped_quote_keeps_fake_create_masked(prefix: str) -> None:
+    source = (
+        f"SELECT {prefix}'hello \\'\n"
+        "CREATE TABLE fake_results (id INT);\n"
+        "';\n"
+        "CREATE TABLE real_results (id INT);"
+    )
+    symbols = _visible_declaration_symbols(source, "schema.sql")
+
+    assert "fake_results" not in symbols
+    assert "real_results" in symbols
+
+
+@pytest.mark.parametrize(
+    ("opening", "closing"),
+    (("[", "]"), ('"', '"'), ("`", "`")),
+)
+def test_multiline_sql_quoted_span_cannot_create_a_fake_declaration(
+    opening: str,
+    closing: str,
+) -> None:
+    source = (
+        f"SELECT {opening}hello\n"
+        "CREATE TABLE fake_results (id INT);\n"
+        f"{closing};\n"
+        "CREATE TABLE real_results (id INT);"
+    )
+    symbols = _visible_declaration_symbols(source, "schema.sql")
+
+    assert "fake_results" not in symbols
+    assert "real_results" in symbols
+
+
+def test_mysql_multiline_double_quote_honors_backslash_escaped_quote() -> None:
+    source = (
+        'SELECT "hello \\"\n'
+        "CREATE TABLE fake_results (id INT);\n"
+        '";\n'
+        "CREATE TABLE real_results (id INT);"
+    )
+    symbols = _visible_declaration_symbols(source, "schema.sql")
+
+    assert "fake_results" not in symbols
+    assert "real_results" in symbols
+
+
+def test_oracle_alternative_quote_keeps_fake_create_masked() -> None:
+    source = (
+        "DECLARE\n"
+        " value VARCHAR2(100) := q'[it's text\n"
+        "CREATE TABLE FakeResults(id int);\n"
+        "]';\n"
+        "CREATE TABLE RealResults(id int);\n"
+    )
+    symbols = _visible_declaration_symbols(source, "schema.sql")
+
+    assert "FakeResults" not in symbols
+    assert "RealResults" in symbols
+
+
+@pytest.mark.parametrize(
+    "source",
+    (
+        "CREATE TABLE IF NOT EXISTS RealResults(id int);",
+        "CREATE VIEW IF NOT EXISTS RealResults AS SELECT 1;",
+        "CREATE TEMP TABLE IF NOT EXISTS RealResults(id int);",
+        "CREATE TEMPORARY VIEW RealResults AS SELECT 1;",
+    ),
+)
+def test_sql_create_options_do_not_become_the_declaration_symbol(source: str) -> None:
+    symbols = _visible_declaration_symbols(source, "schema.sql")
+
+    assert "RealResults" in symbols
+    assert "IF" not in symbols
+
+
+@pytest.mark.parametrize("quoted_name", ('"IF"', "`IF`", "[IF]"))
+def test_quoted_sql_reserved_word_remains_a_valid_identifier(
+    quoted_name: str,
+) -> None:
+    assert "IF" in _visible_declaration_symbols(
+        f"CREATE TABLE {quoted_name}(id int);", "schema.sql"
+    )
+
+
+@pytest.mark.parametrize("basename", ("result.html", "result.xml"))
+def test_markup_body_text_does_not_create_generic_declaration_symbols(
+    basename: str,
+) -> None:
+    source = '<div id="real_result">\nclass FakeResult {}\n</div>'
+    symbols = _visible_declaration_symbols(source, basename)
+
+    assert "FakeResult" not in symbols
+    assert "real_result" in symbols
+
+
+@pytest.mark.parametrize("basename", ("result.htm", "result.html"))
+def test_html_script_body_is_code_but_page_text_is_not(basename: str) -> None:
+    source = "<p>function fakeResult() {}</p>\n<script>function realResult() {}</script>"
+    symbols = _visible_declaration_symbols(source, basename)
+
+    assert "fakeResult" not in symbols
+    assert "realResult" in symbols
+
+
+@pytest.mark.parametrize(
+    "script_type",
+    ("text/plain", "application/ld+json", "importmap"),
+)
+def test_non_executable_html_script_data_is_not_source_code(script_type: str) -> None:
+    source = (
+        f'<script type="{script_type}">\nclass FakeResult {{}}\n</script>'
+        '<div id="real_result"></div>'
+    )
+    symbols = _visible_declaration_symbols(source, "result.html")
+
+    assert "FakeResult" not in symbols
+    assert "real_result" in symbols
+
+
+@pytest.mark.parametrize(
+    "script_type",
+    (" text/javascript ", " module ", "text/javascript ; charset=utf-8"),
+)
+def test_executable_html_script_type_ignores_surrounding_whitespace(
+    script_type: str,
+) -> None:
+    source = f'<script type="{script_type}">\nfunction RealResult() {{}}\n</script>'
+
+    assert "RealResult" in _visible_declaration_symbols(source, "result.html")
+
+
+@pytest.mark.parametrize(
+    "attribute",
+    ('id="delete-account"', 'name="user[email]"'),
+)
+def test_fragmented_html_attribute_is_not_a_standalone_symbol(attribute: str) -> None:
+    source = f"<div {attribute}></div>"
+
+    assert not _visible_declaration_symbols(source, "result.html")
+
+
+@pytest.mark.parametrize("basename", ("Result.vue", "Result.svelte"))
+def test_component_template_text_is_not_code_but_script_body_is(
+    basename: str,
+) -> None:
+    source = (
+        "<template><div>\nclass FakeResult {}\n</div></template>\n"
+        "<script>\nclass RealResult {}\n</script>\n"
+    )
+    symbols = _visible_declaration_symbols(source, basename)
+
+    assert "FakeResult" not in symbols
+    assert "RealResult" in symbols
+
+
+@pytest.mark.parametrize(
+    "literal",
+    (
+        "/hello\nclass FakeResult {}\n/",
+        "$/hello\nclass FakeResult {}\n/$",
+    ),
+)
+def test_gradle_multiline_literal_keeps_fake_class_masked(literal: str) -> None:
+    source = f"def text = {literal}\nclass RealResult {{}}\n"
+    symbols = _visible_declaration_symbols(source, "build.gradle")
+
+    assert "FakeResult" not in symbols
+    assert "RealResult" in symbols
+
+
+def test_gradle_dollar_slashy_escape_does_not_close_the_literal() -> None:
+    source = "def text = $/\n$/$$\nclass FakeResult {}\n/$\nclass RealResult {}\n"
+    symbols = _visible_declaration_symbols(source, "build.gradle")
+
+    assert "FakeResult" not in symbols
+    assert "RealResult" in symbols
+
+
+@pytest.mark.parametrize("basename", ("Result.jsx", "Result.tsx"))
+def test_jsx_literal_text_cannot_create_a_fake_declaration(basename: str) -> None:
+    source = "export function RealResult() { return <div>\nclass FakeResult {}\n</div>; }"
+    symbols = _visible_declaration_symbols(source, basename)
+
+    assert "FakeResult" not in symbols
+    assert "RealResult" in symbols
+
+
+def test_jsx_fragment_text_cannot_create_a_fake_declaration() -> None:
+    source = "export function RealResult() { return <>\nclass FakeResult {}\n</>; }"
+    symbols = _visible_declaration_symbols(source, "Result.jsx")
+
+    assert "FakeResult" not in symbols
+    assert "RealResult" in symbols
+
+
+@pytest.mark.parametrize("basename", ("Result.jsx", "Result.tsx"))
+def test_unmatched_jsx_tag_masks_literal_text_through_observation_end(
+    basename: str,
+) -> None:
+    source = "class Fake {}\nexport function Real() { return <div>\nclass Fake {}\n"
+    symbols = _visible_declaration_symbols(source, basename)
+
+    assert {"Fake", "Real"} <= symbols
+    evidence = ToolObservation(
+        observation_id="obs_truncated_jsx",
+        tool="read_file",
+        path=basename,
+        content_hash="source-hash",
+        text=source,
+        lines=tuple(f"{index}: {line}" for index, line in enumerate(source.splitlines(), 1)),
+        start_line=1,
+        truncated=True,
+    )
+    answer = AgentAnswer(
+        summary="The fake class was inspected.",
+        findings=("The `Fake` class fails.",),
+        next_actions=("Fix Fake.",),
+        citations=(SourceCitation(evidence.observation_id, evidence.path, 3, 3),),
+        issue_present=True,
+    )
+
+    assert _grounded_answer_structure_error(answer, (evidence,)) == (_SOURCE_SYMBOL_CITATION_ERROR)
+
+
+@pytest.mark.parametrize(
+    "generic_expression",
+    (
+        "const identity = <T extends object>(value: T) => value;",
+        "type Box = Wrapper<Item>;",
+        "const identity = <T,>(value: T) => value;",
+        "const compared = a < b > c;",
+    ),
+)
+def test_tsx_generic_or_comparison_does_not_hide_later_declaration(
+    generic_expression: str,
+) -> None:
+    source = f"{generic_expression}\nclass RealResult {{}}"
+
+    assert "RealResult" in _visible_declaration_symbols(source, "Result.tsx")
+
+
+def test_literal_zero_preprocessor_branch_is_not_source_code() -> None:
+    source = (
+        "#if 0\n"
+        "class FakeResult {};\n"
+        "#if 1\n"
+        "class NestedFakeResult {};\n"
+        "#endif\n"
+        "#elif 0\n"
+        "class OtherFakeResult {};\n"
+        "#else\n"
+        "class RealResult {};\n"
+        "#endif"
+    )
+    symbols = _visible_declaration_symbols(source, "result.cpp")
+
+    assert "RealResult" in symbols
+    assert not {"FakeResult", "NestedFakeResult", "OtherFakeResult"} & symbols
+
+
+@pytest.mark.parametrize(
+    "zero_literal",
+    ("00", "0'0", "0x0", "0X00UL", "0b0", "0B00u"),
+)
+def test_all_zero_integer_literal_preprocessor_branch_is_not_source_code(
+    zero_literal: str,
+) -> None:
+    source = f"#if {zero_literal}\nclass FakeResult {{}};\n#else\nclass RealResult {{}};\n#endif"
+    symbols = _visible_declaration_symbols(source, "result.cpp")
+
+    assert "RealResult" in symbols
+    assert "FakeResult" not in symbols
+
+
+def test_literal_zero_nested_branch_inside_unknown_condition_is_masked() -> None:
+    source = (
+        "#if FEATURE_FLAG\n"
+        "#if (0L)\n"
+        "class FakeResult {};\n"
+        "#else\n"
+        "class RealResult {};\n"
+        "#endif\n"
+        "#endif"
+    )
+    symbols = _visible_declaration_symbols(source, "result.h")
+
+    assert "RealResult" in symbols
+    assert "FakeResult" not in symbols
+
+
+@pytest.mark.parametrize("newline", ("\n", "\r\n"))
+@pytest.mark.parametrize("splice", ("\\", "??/"))
+@pytest.mark.parametrize(
+    ("condition_start", "condition_end"),
+    (("#if ", "0"), ("#if (0 ", ")")),
+)
+def test_spliced_literal_zero_preprocessor_branch_is_not_source_code(
+    newline: str,
+    splice: str,
+    condition_start: str,
+    condition_end: str,
+) -> None:
+    source = newline.join(
+        (
+            f"{condition_start}{splice}",
+            condition_end,
+            "class FakeResult {};",
+            "#else",
+            "class RealResult {};",
+            "#endif",
+        )
+    )
+    symbols = _visible_declaration_symbols(source, "result.cpp")
+
+    assert "RealResult" in symbols
+    assert "FakeResult" not in symbols
+
+
+def test_exact_nonzero_preprocessor_branch_masks_later_branches() -> None:
+    source = (
+        "#if 1\n"
+        "class RealResult {};\n"
+        "#elif UNKNOWN_FLAG\n"
+        "class FakeElifResult {};\n"
+        "#else\n"
+        "class FakeElseResult {};\n"
+        "#endif"
+    )
+    symbols = _visible_declaration_symbols(source, "result.cpp")
+
+    assert "RealResult" in symbols
+    assert not {"FakeElifResult", "FakeElseResult"} & symbols
+
+
+@pytest.mark.parametrize(
+    ("condition", "expected", "excluded"),
+    (("false", "RealResult", "FakeResult"), ("true", "FakeResult", "RealResult")),
+)
+def test_csharp_boolean_preprocessor_condition_masks_inactive_branch(
+    condition: str,
+    expected: str,
+    excluded: str,
+) -> None:
+    source = f"#if {condition}\nclass FakeResult {{}}\n#else\nclass RealResult {{}}\n#endif"
+    symbols = _visible_declaration_symbols(source, "Result.cs")
+
+    assert expected in symbols
+    assert excluded not in symbols
+
+
+def test_c_family_operator_sequence_is_not_an_html_block_comment() -> None:
+    source = "bool value = a <!--b;\nclass RealResult {};"
+
+    assert "RealResult" in _visible_declaration_symbols(source, "result.cpp")
+
+
+def test_ruby_end_marker_makes_remaining_bytes_data() -> None:
+    source = "class RealResult\nend\n__END__\nclass FakeResult\nend"
+    symbols = _visible_declaration_symbols(source, "result.rb")
+
+    assert "RealResult" in symbols
+    assert "FakeResult" not in symbols
+
+
+def test_php_halt_compiler_makes_remaining_bytes_data() -> None:
+    source = "function RealResult() {}\n__halt_compiler();\nfunction FakeResult() {}"
+    symbols = _visible_declaration_symbols(source, "result.php")
+
+    assert "RealResult" in symbols
+    assert "FakeResult" not in symbols
+
+
+@pytest.mark.parametrize(
+    ("path", "source", "start_line", "end_line"),
+    (
+        (
+            "fake.cpp",
+            "class Fake {};\n#if 0\nclass Fake {};\n#endif",
+            3,
+            3,
+        ),
+        (
+            "fake.cs",
+            "class Fake {}\n#if false\nclass Fake {}\n#endif",
+            3,
+            3,
+        ),
+        (
+            "fake.rb",
+            "class Fake\nend\n__END__\nclass Fake\nend",
+            4,
+            5,
+        ),
+        (
+            "fake.php",
+            "function Fake() {}\n__halt_compiler();\nfunction Fake() {}",
+            3,
+            3,
+        ),
+    ),
+)
+def test_non_code_tail_cannot_ground_a_real_symbol_finding(
+    path: str,
+    source: str,
+    start_line: int,
+    end_line: int,
+) -> None:
+    evidence = ToolObservation(
+        observation_id="obs_non_code_tail",
+        tool="read_file",
+        path=path,
+        content_hash="source-hash",
+        text=source,
+        lines=tuple(f"{index}: {line}" for index, line in enumerate(source.splitlines(), 1)),
+        start_line=1,
+    )
+    answer = AgentAnswer(
+        summary="The fake path was inspected.",
+        findings=("`Fake` fails.",),
+        next_actions=("Fix Fake.",),
+        citations=(SourceCitation(evidence.observation_id, evidence.path, start_line, end_line),),
+        issue_present=True,
+    )
+
+    assert _grounded_answer_structure_error(answer, (evidence,)) == (_SOURCE_SYMBOL_CITATION_ERROR)
+
+
+@pytest.mark.parametrize(
+    ("opening", "closing"),
+    (("<span>", "</span>"), ("<>", "</>")),
+)
+def test_jsx_nested_in_braced_expression_masks_literal_text(
+    opening: str,
+    closing: str,
+) -> None:
+    source = (
+        f"export function RealResult() {{ return <div>{{ok && {opening}\n"
+        "class FakeResult {}\n"
+        f"{closing}}}</div>; }}"
+    )
+    symbols = _visible_declaration_symbols(source, "Result.jsx")
+
+    assert "FakeResult" not in symbols
+    assert "RealResult" in symbols
+
+
+@pytest.mark.parametrize("path", ("result.html", "Result.vue", "Result.svelte"))
+def test_markup_script_body_citation_is_reparsed_in_script_context(path: str) -> None:
+    source = "<script>\nfunction realResult() {\n  return true;\n}\n</script>"
+    evidence = ToolObservation(
+        observation_id="obs_script_body",
+        tool="read_file",
+        path=path,
+        content_hash="source-hash",
+        text=source,
+        lines=tuple(f"{index}: {line}" for index, line in enumerate(source.splitlines(), 1)),
+        start_line=1,
+    )
+    answer = AgentAnswer(
+        summary="The script was inspected.",
+        findings=("realResult returns true.",),
+        next_actions=("Keep the behavior intentional.",),
+        citations=(SourceCitation(evidence.observation_id, path, 2, 3),),
+        issue_present=False,
+    )
+
+    assert _grounded_answer_structure_error(answer, (evidence,)) is None
+
+
+@pytest.mark.parametrize(
+    ("path", "source", "start_line", "end_line"),
+    (
+        (
+            "fake.py",
+            "class Fake:\n    pass\nblob = '''\nclass Fake:\n    pass\n'''",
+            4,
+            5,
+        ),
+        (
+            "fake.cpp",
+            "class Fake {};\n/*\nclass Fake {};\n*/",
+            3,
+            3,
+        ),
+        (
+            "Fake.vue",
+            (
+                '<script lang="tsx">\n'
+                "export function Fake() { return <div>\n"
+                "class Fake {}\n"
+                "</div>; }\n"
+                "</script>"
+            ),
+            3,
+            3,
+        ),
+    ),
+)
+def test_cited_declaration_is_masked_in_full_lexical_context(
+    path: str,
+    source: str,
+    start_line: int,
+    end_line: int,
+) -> None:
+    evidence = ToolObservation(
+        observation_id="obs_contextual_grounding",
+        tool="read_file",
+        path=path,
+        content_hash="source-hash",
+        text=source,
+        lines=tuple(f"{index}: {line}" for index, line in enumerate(source.splitlines(), 1)),
+        start_line=1,
+    )
+    answer = AgentAnswer(
+        summary="The fake path was inspected.",
+        findings=("`Fake` fails.",),
+        next_actions=("Fix Fake.",),
+        citations=(SourceCitation(evidence.observation_id, evidence.path, start_line, end_line),),
+        issue_present=True,
+    )
+
+    assert _grounded_answer_structure_error(answer, (evidence,)) == (_SOURCE_SYMBOL_CITATION_ERROR)
+
+
+@pytest.mark.parametrize(
+    ("start_line", "incomplete", "redacted"),
+    (
+        (20, False, False),
+        (1, True, False),
+        (1, False, True),
+    ),
+)
+def test_code_source_anchor_requires_complete_line_one_lexical_context(
+    start_line: int,
+    incomplete: bool,
+    redacted: bool,
+) -> None:
+    source = "class Fake:\n    pass"
+    evidence = ToolObservation(
+        observation_id="obs_missing_lexical_context",
+        tool="read_file",
+        path="fake.py",
+        content_hash="source-hash",
+        text=source,
+        lines=(f"{start_line}: class Fake:", f"{start_line + 1}:     pass"),
+        start_line=start_line,
+        incomplete=incomplete,
+        redacted=redacted,
+    )
+    answer = AgentAnswer(
+        summary="The class was inspected.",
+        findings=("`Fake` has an empty body.",),
+        next_actions=("Implement Fake.",),
+        citations=(
+            SourceCitation(
+                evidence.observation_id,
+                evidence.path,
+                start_line,
+                start_line + 1,
+            ),
+        ),
+        issue_present=True,
+    )
+
+    assert _grounded_answer_structure_error(answer, (evidence,)) == (_SOURCE_LEXICAL_CONTEXT_ERROR)
+
+
+def test_delimiter_safe_secret_redaction_preserves_code_source_context(
+    tmp_path: Path,
+) -> None:
+    source = (
+        'API_TOKEN = "ivbench-secret-7D4F91A2B6C8E0"\n'
+        'WORKSPACE_NOTE = "ordinary note"\n'
+        "def enqueue(request):\n"
+        "    BILLING_QUEUE.put(request)\n"
+    )
+    (tmp_path / "billing_worker.py").write_text(source, encoding="utf-8")
+
+    evidence = WorkspaceReader.open(tmp_path).read_file("billing_worker.py")
+
+    assert evidence.incomplete and evidence.redacted
+    assert evidence.metadata["lexical_context_preserved"] is True
+    assert evidence.lines[0] == '1: API_TOKEN = "[REDACTED_SECRET]"'
+    assert "ivbench-secret-7D4F91A2B6C8E0" not in evidence.text
+    answer = AgentAnswer(
+        summary="The worker queue path was inspected.",
+        findings=("`enqueue` puts requests on `BILLING_QUEUE`.",),
+        next_actions=("Keep the queue boundary explicit.",),
+        citations=(SourceCitation(evidence.observation_id, evidence.path, 3, 4),),
+        issue_present=False,
+    )
+
+    assert _grounded_answer_structure_error(answer, (evidence,)) is None
+
+
+def test_secret_redaction_cannot_turn_self_closing_script_into_code_context(
+    tmp_path: Path,
+) -> None:
+    source = '<div id="Fake"></div>\n<script token=abcdefgh/>\nclass Fake {}\n</script>\n'
+    (tmp_path / "hostile.html").write_text(source, encoding="utf-8")
+
+    evidence = WorkspaceReader.open(tmp_path).read_file("hostile.html")
+
+    assert evidence.lines[1] == "2: <script token=[REDACTED_SECRET]>"
+    assert evidence.metadata["lexical_context_preserved"] is False
+    answer = AgentAnswer(
+        summary="The alleged class was inspected.",
+        findings=("The Fake class fails.",),
+        next_actions=("Verify executable script context.",),
+        citations=(SourceCitation(evidence.observation_id, evidence.path, 3, 3),),
+        issue_present=True,
+    )
+
+    assert _grounded_answer_structure_error(answer, (evidence,)) == (_SOURCE_LEXICAL_CONTEXT_ERROR)
+
+
+def test_javascript_regex_literal_does_not_hide_later_declaration() -> None:
+    source = "/[/*]/.test(token);\nfunction SafeResult(term) { return term; }"
+
+    assert "SafeResult" in _visible_declaration_symbols(source, "result.js")
+
+
+@pytest.mark.parametrize("quote", ("'", '"'))
+def test_unterminated_single_line_string_does_not_hide_later_declaration(
+    quote: str,
+) -> None:
+    source = f"API_[REDACTED_SECRET]{quote}\ndef enqueue(request):\n    BILLING_QUEUE.put(request)"
+
+    assert "enqueue" in _visible_declaration_symbols(source, "billing_worker.py")
+
+
+@pytest.mark.parametrize("quote", ("'", '"'))
+def test_crlf_escaped_string_continuation_keeps_fake_declaration_masked(
+    quote: str,
+) -> None:
+    source = (
+        f"marker = {quote}continued\\\r\n"
+        "def hidden():\r\n"
+        f"{quote}\r\n"
+        "def visible():\r\n"
+        "    return True\r\n"
+    )
+    symbols = _explicit_declaration_symbols(source)
+
+    assert "hidden" not in symbols
+    assert "visible" in symbols
+
+
+@pytest.mark.parametrize("quote", ("'", '"'))
+def test_cr_only_unterminated_string_resets_before_later_declaration(
+    quote: str,
+) -> None:
+    source = f"marker = {quote}redacted\rdef visible():\r    return True\r"
+
+    assert "visible" in _explicit_declaration_symbols(source)
+
+
+@pytest.mark.parametrize("quote", ("'", '"'))
+def test_cr_only_escaped_string_continuation_keeps_fake_declaration_masked(
+    quote: str,
+) -> None:
+    source = (
+        f"marker = {quote}continued\\\rdef hidden():\r{quote}\rdef visible():\r    return True\r"
+    )
+    symbols = _explicit_declaration_symbols(source)
+
+    assert "hidden" not in symbols
+    assert "visible" in symbols
+
+
+@pytest.mark.parametrize("quote", ("'", '"'))
+def test_shell_multiline_quote_keeps_fake_function_masked(quote: str) -> None:
+    source = f"payload={quote}hello\nfake() {{ :; }}\n{quote}\nreal() {{ :; }}\n"
+    symbols = _visible_declaration_symbols(source, "script.sh")
+
+    assert "fake" not in symbols
+    assert "real" in symbols
+
+
+def test_csharp_verbatim_string_keeps_fake_class_masked() -> None:
+    source = 'var text = @"hello\nclass FakeResult {}\n";\nclass RealResult {}\n'
+    symbols = _visible_declaration_symbols(source, "Result.cs")
+
+    assert "FakeResult" not in symbols
+    assert "RealResult" in symbols
+
+
+@pytest.mark.parametrize("opening", ('@$"', '$@"'))
+def test_csharp_interpolated_verbatim_string_keeps_fake_class_masked(
+    opening: str,
+) -> None:
+    source = f'var text = {opening}hello\nclass FakeResult {{}}\n";\nclass RealResult {{}}\n'
+    symbols = _visible_declaration_symbols(source, "Result.cs")
+
+    assert "FakeResult" not in symbols
+    assert "RealResult" in symbols
+
+
+@pytest.mark.parametrize("interpolation", ("", "$", "$$"))
+def test_csharp_four_quote_raw_string_does_not_close_on_three_quotes(
+    interpolation: str,
+) -> None:
+    source = (
+        f'var text = {interpolation}""""\n'
+        "class FakeResult {}\n"
+        '"""\n'
+        '"""";\n'
+        "class RealResult {}\n"
+    )
+    symbols = _visible_declaration_symbols(source, "Result.cs")
+
+    assert "FakeResult" not in symbols
+    assert "RealResult" in symbols
+
+
+@pytest.mark.parametrize("basename", ("Result.cs", "Result.java"))
+def test_cpp_raw_prefix_is_not_applied_to_other_c_like_languages(
+    basename: str,
+) -> None:
+    source = 'var text = R"(redacted\nclass VisibleResult {}\n'
+
+    assert "VisibleResult" in _visible_declaration_symbols(source, basename)
+
+
+def test_cpp_raw_prefix_is_not_applied_to_c() -> None:
+    source = 'const char *text = R"(redacted\nint visible_result(void) { return 1; }\n'
+
+    assert "visible_result" in _visible_declaration_symbols(source, "result.c")
+
+
+def test_cpp_raw_string_keeps_fake_class_masked() -> None:
+    source = 'auto text = R"tag(hello\nclass FakeResult {}\n)tag";\nclass RealResult {};\n'
+    symbols = _visible_declaration_symbols(source, "result.cpp")
+
+    assert "FakeResult" not in symbols
+    assert "RealResult" in symbols
+
+
+@pytest.mark.parametrize(
+    "literal",
+    (
+        '"hello\nfn fake() {}\n"',
+        'r#"hello\nfn fake() {}\n"#',
+    ),
+)
+def test_rust_multiline_string_keeps_fake_function_masked(literal: str) -> None:
+    source = f"let text = {literal};\nfn real() {{}}\n"
+    symbols = _visible_declaration_symbols(source, "result.rs")
+
+    assert "fake" not in symbols
+    assert "real" in symbols
+
+
+@pytest.mark.parametrize(
+    ("basename", "source"),
+    (
+        ("result.rb", 'text = "hello\ndef fake\nend\n"\ndef real\nend\n'),
+        (
+            "result.php",
+            '$text = "hello\nfunction fake() {}\n";\nfunction real() {}\n',
+        ),
+    ),
+)
+def test_dynamic_language_multiline_string_keeps_fake_declaration_masked(
+    basename: str,
+    source: str,
+) -> None:
+    symbols = _visible_declaration_symbols(source, basename)
+
+    assert "fake" not in symbols
+    assert "real" in symbols
+
+
+def test_shell_single_quote_does_not_treat_backslash_as_an_escape() -> None:
+    source = r"payload='trailing\'" + "\nreal() { :; }\n"
+
+    assert "real" in _visible_declaration_symbols(source, "script.sh")
+
+
+def test_shell_heredoc_keeps_fake_function_masked() -> None:
+    source = "cat <<'EOF'\nfake() { :; }\nEOF\nreal() { :; }\n"
+    symbols = _visible_declaration_symbols(source, "script.sh")
+
+    assert "fake" not in symbols
+    assert "real" in symbols
+
+
+@pytest.mark.parametrize("opening", ("<<'END-MARKER'", r"<<\END-MARKER"))
+def test_shell_quoted_heredoc_supports_non_identifier_delimiters(
+    opening: str,
+) -> None:
+    source = f"cat {opening}\nfake() {{ :; }}\nEND-MARKER\nreal() {{ :; }}\n"
+    symbols = _visible_declaration_symbols(source, "script.sh")
+
+    assert "fake" not in symbols
+    assert "real" in symbols
+
+
+@pytest.mark.parametrize("basename", ("script.sh", "script.zsh"))
+def test_shell_arithmetic_shift_is_not_treated_as_a_heredoc(basename: str) -> None:
+    source = "value=$((1 << COUNT))\nreal() { :; }\n"
+
+    assert "real" in _visible_declaration_symbols(source, basename)
+
+
+@pytest.mark.parametrize("basename", ("script.sh", "script.zsh"))
+def test_shell_arithmetic_command_shift_is_not_treated_as_a_heredoc(
+    basename: str,
+) -> None:
+    source = "((value = 1 << COUNT))\nreal() { :; }\n"
+
+    assert "real" in _visible_declaration_symbols(source, basename)
+
+
+@pytest.mark.parametrize("quoted_prefix", ('echo "((" ', "printf '(( ' "))
+def test_quoted_shell_parentheses_do_not_disable_a_real_heredoc(
+    quoted_prefix: str,
+) -> None:
+    source = f"{quoted_prefix}<<EOF\nfake() {{ :; }}\nEOF\nreal() {{ :; }}\n"
+    symbols = _visible_declaration_symbols(source, "script.sh")
+
+    assert "fake" not in symbols
+    assert "real" in symbols
+
+
+def test_shell_heredoc_terminator_rejects_trailing_blanks() -> None:
+    source = "cat <<EOF\nEOF \nfake() { :; }\nEOF\nreal() { :; }\n"
+    symbols = _visible_declaration_symbols(source, "script.sh")
+
+    assert "fake" not in symbols
+    assert "real" in symbols
+
+
+def test_multiple_shell_heredocs_are_consumed_in_declaration_order() -> None:
+    source = "cat <<A <<B\nfirst\nA\nfake() { :; }\nB\nreal() { :; }\n"
+    symbols = _visible_declaration_symbols(source, "script.sh")
+
+    assert "fake" not in symbols
+    assert "real" in symbols
+
+
+def test_ruby_heredoc_keeps_fake_method_masked() -> None:
+    source = "text = <<~RUBY\n  def fake\n  end\nRUBY\ndef real\nend\n"
+    symbols = _visible_declaration_symbols(source, "result.rb")
+
+    assert "fake" not in symbols
+    assert "real" in symbols
+
+
+def test_ruby_quoted_heredoc_supports_non_identifier_delimiter() -> None:
+    source = "text = <<'END-MARKER'\ndef fake\nend\nEND-MARKER\ndef real\nend\n"
+    symbols = _visible_declaration_symbols(source, "result.rb")
+
+    assert "fake" not in symbols
+    assert "real" in symbols
+
+
+def test_ruby_shift_operator_is_not_treated_as_a_heredoc() -> None:
+    source = "items << VALUE\ndef real\nend\n"
+
+    assert "real" in _visible_declaration_symbols(source, "result.rb")
+
+
+@pytest.mark.parametrize(
+    "operator_line",
+    ("items = []\nitems <<Widget", "value = 2 <<CONST"),
+)
+def test_ruby_no_space_shift_operator_is_not_treated_as_a_heredoc(
+    operator_line: str,
+) -> None:
+    source = f"{operator_line}\nclass RealResult\nend\n"
+
+    assert "RealResult" in _visible_declaration_symbols(source, "result.rb")
+
+
+def test_ruby_heredoc_terminator_rejects_trailing_blanks() -> None:
+    source = "text = <<DOC\nDOC \ndef fake\nend\nDOC\ndef real\nend\n"
+    symbols = _visible_declaration_symbols(source, "result.rb")
+
+    assert "fake" not in symbols
+    assert "real" in symbols
+
+
+def test_multiple_ruby_heredocs_are_consumed_in_declaration_order() -> None:
+    source = "puts <<A, <<B\nfirst\nA\ndef fake\nend\nB\ndef real\nend\n"
+    symbols = _visible_declaration_symbols(source, "result.rb")
+
+    assert "fake" not in symbols
+    assert "real" in symbols
+
+
+@pytest.mark.parametrize(
+    "literal",
+    (
+        "%q{hello\ndef fake\nend\n}",
+        "%Q(hello\ndef fake\nend\n)",
+        "%q{outer { nested }\ndef fake\nend\n}",
+        "%r{hello\ndef fake\nend\n}",
+        "%{hello\ndef fake\nend\n}",
+        "%w[hello\ndef fake\nend\n]",
+        "%x{hello\ndef fake\nend\n}",
+    ),
+)
+def test_ruby_percent_literal_keeps_fake_method_masked(literal: str) -> None:
+    source = f"text = {literal}\ndef real\nend\n"
+    symbols = _visible_declaration_symbols(source, "result.rb")
+
+    assert "fake" not in symbols
+    assert "real" in symbols
+
+
+def test_php_nowdoc_keeps_fake_function_masked() -> None:
+    source = "$text = <<<'TXT'\nfunction fake() {}\nTXT;\nfunction real() {}\n"
+    symbols = _visible_declaration_symbols(source, "result.php")
+
+    assert "fake" not in symbols
+    assert "real" in symbols
+
+
+@pytest.mark.parametrize(
+    "closing_line",
+    ('END, "tail"];', 'END , "tail"];', 'END /*comment*/ , "tail"];'),
+)
+def test_php_flexible_heredoc_closing_marker_preserves_following_tokens(
+    closing_line: str,
+) -> None:
+    source = f"$values = [<<<END\ntext\n{closing_line}\nfunction RealResult() {{}}\n"
+
+    assert "RealResult" in _visible_declaration_symbols(source, "result.php")
+
+
+def test_ruby_multiline_regex_keeps_fake_method_masked() -> None:
+    source = "pattern = /hello\ndef fake\nend\n/\ndef real\nend\n"
+    symbols = _visible_declaration_symbols(source, "result.rb")
+
+    assert "fake" not in symbols
+    assert "real" in symbols
+
+
+@pytest.mark.parametrize("operator", ("=~", "!~"))
+def test_ruby_match_operator_can_introduce_a_multiline_regex(operator: str) -> None:
+    source = f"if value {operator} /hello\ndef fake\nend\n/\nend\ndef real\nend\n"
+    symbols = _visible_declaration_symbols(source, "result.rb")
+
+    assert "fake" not in symbols
+    assert "real" in symbols
+
+
+@pytest.mark.parametrize("prefix", ("puts ", "when "))
+def test_ruby_command_and_when_can_introduce_a_multiline_regex(prefix: str) -> None:
+    source = f"{prefix}/hello\ndef fake\nend\n/\ndef real\nend\n"
+    symbols = _visible_declaration_symbols(source, "result.rb")
+
+    assert "fake" not in symbols
+    assert "real" in symbols
+
+
+@pytest.mark.parametrize("prefix", ("pattern = ", "if value =~ "))
+def test_unterminated_ruby_multiline_regex_masks_through_eof(prefix: str) -> None:
+    source = f"{prefix}/hello\ndef fake\nend\n"
+    symbols = _visible_declaration_symbols(source, "result.rb")
+
+    assert "fake" not in symbols
+
+
+def test_ruby_begin_comment_keeps_fake_method_masked() -> None:
+    source = "=begin\ndef fake\nend\n=end\ndef real\nend\n"
+    symbols = _visible_declaration_symbols(source, "result.rb")
+
+    assert "fake" not in symbols
+    assert "real" in symbols
+
+
+def test_ruby_begin_comment_supports_cr_only_line_endings() -> None:
+    source = "=begin\rdef fake\rend\r=end\rdef real\rend\r"
+    symbols = _visible_declaration_symbols(source, "result.rb")
+
+    assert "fake" not in symbols
+    assert "real" in symbols
+
+
+def test_swift_extended_multiline_string_keeps_fake_class_masked() -> None:
+    source = '#"""\nclass FakeResult {}\n"""#\nclass RealResult {}\n'
+    symbols = _visible_declaration_symbols(source, "Result.swift")
+
+    assert "FakeResult" not in symbols
+    assert "RealResult" in symbols
+
+
+@pytest.mark.parametrize(
+    ("basename", "declaration"),
+    (("result.rs", "struct"), ("Result.swift", "class")),
+)
+def test_nested_block_comment_keeps_fake_declaration_masked(
+    basename: str,
+    declaration: str,
+) -> None:
+    source = (
+        f"/* outer\n/* inner */\n{declaration} FakeResult {{}}\n*/\n{declaration} RealResult {{}}\n"
+    )
+    symbols = _visible_declaration_symbols(source, basename)
+
+    assert "FakeResult" not in symbols
+    assert "RealResult" in symbols
+
+
+@pytest.mark.parametrize("newline", ("\n", "\r\n"))
+@pytest.mark.parametrize("kind", ("comment", "macro"))
+def test_c_line_splice_keeps_fake_class_masked(newline: str, kind: str) -> None:
+    prefix = "// comment \\" if kind == "comment" else "#define DECLARE_FAKE \\"
+    source = newline.join(
+        (
+            prefix,
+            "class FakeResult {};",
+            "class RealResult {};",
+            "",
+        )
+    )
+    symbols = _visible_declaration_symbols(source, "result.cpp")
+
+    assert "FakeResult" not in symbols
+    assert "RealResult" in symbols
+
+
+def test_jsx_dollar_prefixed_component_masks_literal_child_text() -> None:
+    source = (
+        "const $Widget = () => null;\n"
+        "export function RealResult() { return <$Widget>\n"
+        "class FakeResult {}\n"
+        "</$Widget>; }"
+    )
+    symbols = _visible_declaration_symbols(source, "Result.jsx")
+
+    assert "FakeResult" not in symbols
+    assert "RealResult" in symbols
+
+
+@pytest.mark.parametrize(
+    "source",
+    (
+        "/\\\n*\nclass FakeResult {};\n*/\nclass RealResult {};\n",
+        "/*\nclass FakeResult {};\n*\\\n/\nclass RealResult {};\n",
+        "/\\\n*\nclass FakeResult {};\n*\\\n/\nclass RealResult {};\n",
+    ),
+)
+def test_cpp_block_comment_delimiters_honor_line_splices(source: str) -> None:
+    symbols = _visible_declaration_symbols(source, "result.cpp")
+
+    assert "FakeResult" not in symbols
+    assert "RealResult" in symbols
+
+
+@pytest.mark.parametrize("basename", ("result.c", "result.h", "result.m"))
+@pytest.mark.parametrize(
+    "source",
+    (
+        "/??/\n*\nint FakeResult(void) {}\n*/\nint RealResult(void) {}\n",
+        "/*\nint FakeResult(void) {}\n*??/\n/\nint RealResult(void) {}\n",
+    ),
+)
+def test_c_family_trigraph_splices_form_block_comment_delimiters(
+    basename: str,
+    source: str,
+) -> None:
+    symbols = _visible_declaration_symbols(source, basename)
+
+    assert "FakeResult" not in symbols
+    assert "RealResult" in symbols
+
+
+def test_c_trigraph_splice_continues_a_string_literal() -> None:
+    source = (
+        'const char *text = "value??/\nint FakeResult(void) {}??/\n";\nint RealResult(void) {}\n'
+    )
+    symbols = _visible_declaration_symbols(source, "result.c")
+
+    assert "FakeResult" not in symbols
+    assert "RealResult" in symbols
+
+
+def test_java_unicode_escapes_can_form_block_comment_delimiters() -> None:
+    source = "\\u002f\\u002a\nclass FakeResult {}\n\\u002a\\u002f\nclass RealResult {}\n"
+    symbols = _visible_declaration_symbols(source, "Result.java")
+
+    assert "FakeResult" not in symbols
+    assert "RealResult" in symbols
+
+
+def test_java_unicode_escapes_can_form_text_block_delimiters() -> None:
+    source = (
+        "String value = \\u0022\\u0022\\u0022\n"
+        "class FakeResult {}\n"
+        "\\u0022\\u0022\\u0022;\n"
+        "class RealResult {}\n"
+    )
+    symbols = _visible_declaration_symbols(source, "Result.java")
+
+    assert "FakeResult" not in symbols
+    assert "RealResult" in symbols
+
+
+def test_jsx_unicode_component_masks_literal_child_text() -> None:
+    source = (
+        "const \u00c9vil = () => null;\n"
+        "export function RealResult() { return <\u00c9vil>\n"
+        "class FakeResult {}\n"
+        "</\u00c9vil>; }"
+    )
+    symbols = _visible_declaration_symbols(source, "Result.jsx")
+
+    assert "FakeResult" not in symbols
+    assert "RealResult" in symbols
+
+
+def test_jsx_combining_mark_component_masks_literal_child_text() -> None:
+    source = (
+        "const E\u0301vil = () => null;\n"
+        "export function RealResult() { return <E\u0301vil>\n"
+        "class FakeResult {}\n"
+        "</E\u0301vil>; }"
+    )
+    symbols = _visible_declaration_symbols(source, "Result.jsx")
+
+    assert "FakeResult" not in symbols
+    assert "RealResult" in symbols
+
+
+@pytest.mark.parametrize(
+    ("source", "expected", "rejected"),
+    (
+        ("class Fake\\u0045vil {}", "FakeEvil", "Fake"),
+        ("class R\\u0065al {}", "Real", "R"),
+        ("\\u0063lass Real {}", "Real", "lass"),
+        ("// comment \\u000a class Real {}", "Real", "comment"),
+    ),
+)
+def test_java_unicode_escapes_are_translated_before_declaration_extraction(
+    source: str,
+    expected: str,
+    rejected: str,
+) -> None:
+    symbols = _visible_declaration_symbols(source, "Result.java")
+
+    assert expected in symbols
+    assert rejected not in symbols
+
+
+def test_java_unicode_escape_eligibility_uses_translated_backslash_parity() -> None:
+    source = "// \\u005c\\u000a class FakeResult {}\nclass RealResult {}\n"
+    symbols = _visible_declaration_symbols(source, "Result.java")
+
+    assert "FakeResult" not in symbols
+    assert "RealResult" in symbols
+
+
+@pytest.mark.parametrize("basename", ("Result.vue", "Result.svelte"))
+def test_component_tsx_script_masks_jsx_literal_text(basename: str) -> None:
+    source = (
+        '<script lang="tsx">\n'
+        "export function RealResult() { return <div>\n"
+        "class FakeResult {}\n"
+        "</div>; }\n"
+        "</script>"
+    )
+    symbols = _visible_declaration_symbols(source, basename)
+
+    assert "FakeResult" not in symbols
+    assert "RealResult" in symbols
+
+
+@pytest.mark.parametrize(
+    ("basename", "source"),
+    (
+        ("result.py", "class Fake\u00c9vil:\n    pass\nclass RealResult:\n    pass"),
+        ("Result.java", "class Fake\u00c9vil {}\nclass RealResult {}"),
+        ("Result.kt", "class Fake\u00c9vil {}\nclass RealResult {}"),
+        ("result.js", "class Fake\u00c9vil {}\nclass RealResult {}"),
+        ("result.cpp", "class Fake\u00c9vil {};\nclass RealResult {};"),
+        ("result.rs", "struct Fake\u00c9vil {}\nstruct RealResult {}"),
+        ("result.js", "class Fake$Evil {}\nclass RealResult {}"),
+        ("result.py", "class Fake\u0301vil:\n    pass\nclass RealResult:\n    pass"),
+        ("result.js", "class Fake\u0301vil {}\nclass RealResult {}"),
+        ("Result.java", "class Fake\u0301vil {}\nclass RealResult {}"),
+    ),
+)
+def test_unsupported_identifier_continuation_never_emits_ascii_prefix(
+    basename: str,
+    source: str,
+) -> None:
+    symbols = _visible_declaration_symbols(source, basename)
+
+    assert "Fake" not in symbols
+    assert "RealResult" in symbols
+
+
+@pytest.mark.parametrize(
+    ("basename", "source", "expected"),
+    (
+        ("result.rs", "pub fn RealResult() {}", "RealResult"),
+        ("result.rs", "pub struct Thing {}", "Thing"),
+        ("Result.cs", "internal class RealResult {}", "RealResult"),
+        ("result.js", "function* Generate() {}", "Generate"),
+        ("result.ts", "declare class RealResult {}", "RealResult"),
+        ("Result.kt", "data class RealResult(val id: Int)", "RealResult"),
+        ("Result.kt", "object Single {}", "Single"),
+        ("Result.scala", "object RealResult {}", "RealResult"),
+        ("Result.swift", "actor RealResult {}", "RealResult"),
+        ("Result.kt", "enum class RealResult {}", "RealResult"),
+        ("result.cpp", "enum struct RealResult {};", "RealResult"),
+        ("Result.kt", "annotation class RealResult", "RealResult"),
+        ("Result.kt", "value class RealResult(val id: Int)", "RealResult"),
+        ("Result.scala", "case class RealResult(id: Int)", "RealResult"),
+        ("Result.cs", "record class RealResult {}", "RealResult"),
+        ("Result.cs", "record struct RealResult {}", "RealResult"),
+        ("Result.cs", "readonly record struct RealResult {}", "RealResult"),
+        ("Result.cs", "ref struct RealResult {}", "RealResult"),
+    ),
+)
+def test_common_modified_declaration_forms_are_visible(
+    basename: str,
+    source: str,
+    expected: str,
+) -> None:
+    assert expected in _visible_declaration_symbols(source, basename)
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    (
+        ("class func RealResult() {}", "RealResult"),
+        ("class var value: Int { 1 }", "value"),
+    ),
+)
+def test_swift_class_member_modifier_extracts_the_member_name(
+    source: str,
+    expected: str,
+) -> None:
+    symbols = _visible_declaration_symbols(source, "Result.swift")
+
+    assert expected in symbols
+    assert not ({"func", "var", "subscript"} & symbols)
+
+
+def test_swift_class_subscript_does_not_emit_a_keyword_symbol() -> None:
+    source = "class subscript(index: Int) -> Int { index }"
+
+    assert "subscript" not in _visible_declaration_symbols(source, "Result.swift")
+
+
+@pytest.mark.parametrize("basename", ("result.py", "result.js"))
+@pytest.mark.parametrize("symbol", ("Record", "Object", "Actor", "Module", "Type"))
+def test_pascal_identifier_matching_a_keyword_remains_visible(
+    basename: str,
+    symbol: str,
+) -> None:
+    assert symbol in _visible_declaration_symbols(f"class {symbol} {{}}", basename)
+
+
+def test_go_type_and_receiver_method_are_visible_declarations() -> None:
+    source = (
+        "type Server struct {}\n"
+        "func (s *Server) Handle() {}\n"
+        "// type Fake struct {}\n"
+        "var text = `func (s *Server) Fake() {}`\n"
+    )
+    symbols = _visible_declaration_symbols(source, "server.go")
+
+    assert {"Server", "Handle"} <= symbols
+    assert "Fake" not in symbols
+
+
+@pytest.mark.parametrize("basename", ("Result.m", "Result.mm"))
+def test_objective_c_types_methods_and_c_functions_are_visible(
+    basename: str,
+) -> None:
+    source = "@interface Widget : NSObject\n- (void)performAction;\n@end\nvoid Helper(void) {}\n"
+    symbols = _visible_declaration_symbols(source, basename)
+
+    assert {"Widget", "performAction", "Helper"} <= symbols
+
+
+def test_javascript_arrow_regex_does_not_hide_later_declaration() -> None:
+    source = "const check = () => /[/*]/.test(token);\nfunction SafeResult(term) { return term; }"
+
+    assert "SafeResult" in _visible_declaration_symbols(source, "result.js")
+
+
+@pytest.mark.parametrize(
+    "prefix",
+    (
+        "if (ok) ",
+        "do ",
+        "if (ok) action(); else ",
+        "for (const item of items) ",
+    ),
+)
+def test_javascript_control_flow_regex_does_not_hide_later_declaration(
+    prefix: str,
+) -> None:
+    source = f"{prefix}/[/*]/.test(token);\nfunction SafeResult(term) {{ return term; }}"
+
+    assert "SafeResult" in _visible_declaration_symbols(source, "result.js")
+
+
+def test_javascript_for_of_expression_regex_does_not_hide_later_declaration() -> None:
+    source = "for (const token of /[/*]/.source) {}\nfunction SafeResult(term) { return term; }"
+
+    assert "SafeResult" in _visible_declaration_symbols(source, "result.js")
+
+
+@pytest.mark.parametrize(
+    ("import_line", "local_name"),
+    (
+        ("import torch as th", "th"),
+        ("from torch import inference_mode as infer", "infer"),
+        ("from .torch import inference_mode as infer", "infer"),
+        ("from . import inference_mode as infer", "infer"),
+        (
+            "from torch import (\n    inference_mode as infer,\n    no_grad,\n)",
+            "infer",
+        ),
+    ),
+)
+def test_python_alias_fallback_survives_truncated_rendered_window(
+    import_line: str,
+    local_name: str,
+) -> None:
+    source = f"{import_line}\nif ("
+
+    assert local_name in _visible_declaration_symbols(source, "experiment.py")
+
+
+def test_generic_code_finding_fails_closed_without_an_extracted_symbol() -> None:
+    source = "@[/*"
+    evidence = ToolObservation(
+        observation_id="obs_no_symbol",
+        tool="read_file",
+        path="result.js",
+        content_hash="source-hash",
+        text=source,
+        lines=(f"1: {source}",),
+        start_line=1,
+    )
+    answer = AgentAnswer(
+        summary="The source was inspected.",
+        findings=("The safe component returns the term.",),
+        next_actions=("Keep the safe behavior.",),
+        citations=(SourceCitation(evidence.observation_id, evidence.path, 1, 1),),
+        issue_present=False,
+    )
+
+    assert _grounded_answer_structure_error(answer, (evidence,)) == (
+        "each code-source finding must name a concrete source-defined identifier supported "
+        "by the cited declaration"
+    )
+
+
+def test_imported_mechanism_does_not_require_a_second_subject_citation() -> None:
+    source = (
+        "import torch\n"
+        "def evaluate_safe(model, loader):\n"
+        "    model.eval()\n"
+        "    with torch.inference_mode():\n"
+        "        return list(loader)\n"
+    )
+    evidence = ToolObservation(
+        observation_id="obs_imported_mechanism",
+        tool="read_file",
+        path="experiment.py",
+        content_hash="source-hash",
+        text=source,
+        lines=tuple(f"{index}: {line}" for index, line in enumerate(source.splitlines(), 1)),
+        start_line=1,
+    )
+    answer = AgentAnswer(
+        summary="The evaluation helper was inspected.",
+        findings=("evaluate_safe uses model.eval and torch.inference_mode for inference.",),
+        next_actions=("Keep the inference control.",),
+        citations=(SourceCitation(evidence.observation_id, evidence.path, 2, 5),),
+        issue_present=False,
+    )
+
+    assert _grounded_answer_structure_error(answer, (evidence,)) is None
+
+
+def test_import_only_finding_must_cite_the_import_declaration() -> None:
+    source = (
+        "import torch\n"
+        "def evaluate_safe(model, loader):\n"
+        "    model.eval()\n"
+        "    with torch.inference_mode():\n"
+        "        return list(loader)\n"
+    )
+    evidence = ToolObservation(
+        observation_id="obs_import_only",
+        tool="read_file",
+        path="experiment.py",
+        content_hash="source-hash",
+        text=source,
+        lines=tuple(f"{index}: {line}" for index, line in enumerate(source.splitlines(), 1)),
+        start_line=1,
+    )
+    answer = AgentAnswer(
+        summary="The inference module was inspected.",
+        findings=("torch provides inference_mode.",),
+        next_actions=("Keep the dependency explicit.",),
+        citations=(SourceCitation(evidence.observation_id, evidence.path, 3, 5),),
+        issue_present=False,
+    )
+
+    assert _grounded_answer_structure_error(answer, (evidence,)) == (
+        "each source citation must include the source-defined symbol named in its finding "
+        "plus the decisive behavior; expand body-only ranges to the declaration"
+    )
+
+
+def test_one_import_cannot_stand_in_for_another_missing_import() -> None:
+    source = "import torch\nimport numpy\n"
+    evidence = ToolObservation(
+        observation_id="obs_two_imports",
+        tool="read_file",
+        path="experiment.py",
+        content_hash="source-hash",
+        text=source,
+        lines=("1: import torch", "2: import numpy"),
+        start_line=1,
+    )
+    answer = AgentAnswer(
+        summary="The inference imports were inspected.",
+        findings=("torch and numpy provide inference mechanisms.",),
+        next_actions=("Keep both dependencies explicit.",),
+        citations=(SourceCitation(evidence.observation_id, evidence.path, 2, 2),),
+        issue_present=False,
+    )
+
+    assert _grounded_answer_structure_error(answer, (evidence,)) == (
+        "each source citation must include the source-defined symbol named in its finding "
+        "plus the decisive behavior; expand body-only ranges to the declaration"
+    )
+
+
 def test_empty_recommendations_get_a_fixed_non_evidentiary_default() -> None:
     evidence = _command_observation("obs_parent_failed", "generic.parent_commit")
     answer = AgentAnswer(
@@ -825,7 +3771,7 @@ def test_inline_citation_recovery_replaces_partial_array_only_when_every_finding
     first = ToolObservation(
         observation_id="obs_0123456789abcdef",
         tool="read_file",
-        path="a.py",
+        path="a.txt",
         content_hash="hash-first",
         text="unsafe",
         lines=("2: unsafe",),
@@ -868,10 +3814,7 @@ def test_inline_citation_recovery_replaces_partial_array_only_when_every_finding
     (
         "unknown (obs_aaaaaaaaaaaaaaaa 2-3)",
         "outside range (obs_0123456789abcdef 2-99)",
-        (
-            "ambiguous (obs_0123456789abcdef 2-3 and "
-            "obs_0123456789abcdef 2-3)"
-        ),
+        ("ambiguous (obs_0123456789abcdef 2-3 and obs_0123456789abcdef 2-3)"),
     ),
 )
 def test_inline_citation_recovery_fails_closed(finding: str) -> None:
@@ -1195,6 +4138,7 @@ def test_loop_maps_repeated_final_boolean_schema_failure_to_protocol_failure(
     assert report.completion_tokens_used == 0
     assert report.completion_tokens_charged == planner.completion_tokens_charged
     assert report.completion_tokens_requested == planner.completion_tokens_requested
+    assert report.decisions_used == 1
     assert [call.outcome for call in report.model_calls] == ["schema_error", "schema_error"]
 
 
@@ -1743,7 +4687,7 @@ def test_grounded_answer_is_not_nudged() -> None:
     read = ToolObservation(
         observation_id="obs_real",
         tool="read_file",
-        path="a.py",
+        path="a.txt",
         content_hash="h",
         text="x",
         lines=("1: alpha", "2: beta"),
@@ -1755,7 +4699,7 @@ def test_grounded_answer_is_not_nudged() -> None:
         findings=["found"],
         next_actions=["verify"],
         citations=[
-            {"observation_id": "mis-copied", "path": "a.py", "start_line": 2, "end_line": 2}
+            {"observation_id": "mis-copied", "path": "a.txt", "start_line": 2, "end_line": 2}
         ],
     )
     client = FakeClient([answer])
@@ -1890,16 +4834,14 @@ def test_exact_rendered_command_id_repairs_a_miscopied_virtual_path() -> None:
     decision = ModelInvestigationPlanner(client=client).decide(goal="x", catalog=(command,))
 
     assert isinstance(decision, AgentAnswer)
-    assert decision.citations == (
-        SourceCitation(command.observation_id, command.path, 1, 1),
-    )
+    assert decision.citations == (SourceCitation(command.observation_id, command.path, 1, 1),)
 
 
 def test_auto_read_skipped_when_path_already_read() -> None:
     already = ToolObservation(
         observation_id="obs_r",
         tool="read_file",
-        path="experiment.py",
+        path="experiment.txt",
         content_hash="abc",
         text="model.train()",
         lines=("2: model.train()",),
@@ -1911,7 +4853,7 @@ def test_auto_read_skipped_when_path_already_read() -> None:
         findings=["f"],
         next_actions=["verify"],
         citations=[
-            {"observation_id": "wrong", "path": "experiment.py", "start_line": 2, "end_line": 2}
+            {"observation_id": "wrong", "path": "experiment.txt", "start_line": 2, "end_line": 2}
         ],
     )
     client = FakeClient([answer])

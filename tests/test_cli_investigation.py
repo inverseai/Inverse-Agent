@@ -35,6 +35,7 @@ def test_deterministic_path_passes_and_writes_output(tmp_path: Path) -> None:
     assert summary["integrity_failures"] == []
     assert summary["model_provenance"] is None
     first = summary["variants"][0]
+    assert first["variant"]
     assert first["physical_requests_used"] >= 1
     assert first["completion_tokens_charged"] == 0
     assert first["model_calls"] == []

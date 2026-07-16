@@ -918,6 +918,15 @@ class InvestigationLoop:
                 try:
                     decision = self.planner.decide(goal=goal, catalog=tuple(catalog))
                 except Exception as exc:  # planner/model protocol failure
+                    attempted_decisions = (
+                        call.logical_decision
+                        for call in self._model_calls()
+                        if call.request_kind == "decision"
+                    )
+                    # A logical decision is consumed once its decision request
+                    # starts, even when every permitted response fails protocol
+                    # validation and ``decide`` raises without returning a value.
+                    decisions = max((decisions, *attempted_decisions))
                     physical = self._physical_count(decisions + 1)
                     attestation_stop = isinstance(exc, PlannerAttestationError)
                     budget_stop = isinstance(exc, PlannerBudgetError)

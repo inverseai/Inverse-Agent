@@ -822,6 +822,7 @@ def benchmark_investigation_command(args: argparse.Namespace) -> int:
         "variants": [
             {
                 "case": variant.case,
+                "variant": variant.variant,
                 "passed": variant.passed,
                 "verdict": variant.verdict,
                 "reason": variant.reason,

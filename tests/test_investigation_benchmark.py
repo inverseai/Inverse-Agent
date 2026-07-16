@@ -35,7 +35,9 @@ from inverse_agent.investigation_benchmark import (
     _integrity_failures,
     _model_planner_is_trusted,
     _parent_probe_proves_missing_revision,
+    _react_untrusted_flow_matches,
     _score_variant_model,
+    _semantic_match,
     _start_model_endpoint_audit,
     _suite_definition_is_valid,
     default_cases,
@@ -46,6 +48,89 @@ from inverse_agent.investigation_benchmark import (
 )
 from inverse_agent.investigation_model import ModelInvestigationPlanner
 from inverse_agent.planner import OpenAICompatibleClient
+
+
+@pytest.mark.parametrize(
+    "path",
+    (
+        "projects/static/projects/SearchResults.jsx",
+        "/projects/static/projects/SearchResults.jsx",
+        "C:\\projects\\static\\projects\\SearchResults.jsx",
+        "D:\\Office Repos\\LLM AGENT\\projects\\static\\projects\\SearchResults.jsx",
+        "projects/static files/projects/SearchResults.jsx",
+    ),
+)
+def test_benchmark_react_flow_ignores_static_directory_in_code_path(
+    path: str,
+) -> None:
+    assert _react_untrusted_flow_matches(
+        f"`{path}` contains component "
+        "`UnsafeResult` that renders user-supplied `term` via "
+        "`dangerouslySetInnerHTML`, exposing XSS risk."
+    )
+
+
+def test_benchmark_react_flow_accepts_user_provided_content() -> None:
+    assert _react_untrusted_flow_matches(
+        "UnsafeResult renders user-provided content via dangerouslySetInnerHTML."
+    )
+
+
+def test_benchmark_react_flow_accepts_unsafe_adverb_after_provenance() -> None:
+    assert _react_untrusted_flow_matches(
+        "UnsafeResult component renders userSuppliedTerm unsafely via dangerouslySetInnerHTML."
+    )
+
+
+def test_benchmark_react_safe_control_accepts_escapes_html_by_default() -> None:
+    case = next(item for item in default_cases() if item.name == "django_react_injection")
+    claim = next(item for item in case.claims if item.claim_id == "react-jsx-control")
+
+    assert _semantic_match(
+        claim,
+        "SafeResult renders content using JSX interpolation, which escapes HTML by default.",
+        (*case.claims, *case.supplemental_claims),
+    )
+
+
+def test_react_dependency_accepts_framework_as_grammatical_subject() -> None:
+    case = next(item for item in default_cases() if item.name == "django_react_injection")
+    claim = next(item for item in case.claims if item.claim_id == "react-dependency")
+
+    assert _semantic_match(
+        claim,
+        "React framework is declared in package.json dependencies as react:18.3.1.",
+        (*case.claims, *case.supplemental_claims),
+    )
+
+
+def test_ios_unsafe_claim_accepts_unicode_non_main_thread() -> None:
+    case = next(item for item in default_cases() if item.name == "ios_main_thread_ui")
+    claim = next(item for item in case.claims if item.claim_id == "ios-background-ui")
+
+    assert _semantic_match(
+        claim,
+        "ProfileViewController.refreshProfile updates nameLabel.text inside "
+        "DispatchQueue.global().async, causing UI changes on a non\u2011main thread - an unsafe "
+        "UIKit refresh path.",
+        (*case.claims, *case.supplemental_claims),
+    )
+
+
+@pytest.mark.parametrize(
+    "protection",
+    (
+        "The content is `trusted/sanitized`.",
+        "The content passes through `sanitize(term)/encode(term)`.",
+    ),
+)
+def test_benchmark_react_flow_does_not_erase_slash_bearing_protection(
+    protection: str,
+) -> None:
+    assert not _react_untrusted_flow_matches(
+        "UnsafeResult renders user-supplied term via dangerouslySetInnerHTML, "
+        f"exposing XSS risk. {protection}"
+    )
 
 
 def test_control_plane_git_wait_uses_the_active_deadline(
@@ -110,7 +195,8 @@ def test_seven_cases_cover_priority_stacks_and_real_git() -> None:
     full_stack = next(case for case in cases if case.name == "django_react_injection")
     react_source = full_stack.files["projects/static/projects/SearchResults.jsx"]
     assert "dangerouslySetInnerHTML" in react_source
-    assert "return <div>{term}</div>" in react_source
+    assert "__html: userSuppliedTerm" in react_source
+    assert "return <div>{userSuppliedTerm}</div>" in react_source
     assert any(item.path == "package.json" for item in full_stack.required_observations)
 
     git_case = next(case for case in cases if case.name == "git_approval_replanning")
@@ -282,12 +368,11 @@ def test_semantic_scorer_accepts_live_uikit_type_names_with_complete_anchors(
             summary="The profile path is unsafe while the avatar control uses the main queue.",
             findings=(
                 (
-                    "Unsafe path: `ProfileViewController.refresh()` updates a UILabel "
-                    "inside a global async block, violating UIKit's requirement that UI "
-                    "updates occur on the main thread."
+                    "Unsafe path: `ProfileViewController.refreshProfile()` updates a UILabel "
+                    "inside a global async block, violating UIKit's main-thread requirement."
                 ),
                 (
-                    "Safe path: `AvatarViewController.refresh()` loads an image in the "
+                    "Safe path: `AvatarViewController.refreshAvatar()` loads an image in the "
                     "background, then dispatches the UI update to the main queue."
                 ),
             ),
@@ -350,6 +435,35 @@ def test_semantic_scorer_does_not_treat_requirement_as_observed_safe_state(
     assert "semantic claims" in reason
 
 
+@pytest.mark.parametrize("compliance", ["meets", "satisfies"])
+def test_semantic_scorer_rejects_claim_that_meets_opposite_requirement(
+    tmp_path: Path,
+    compliance: str,
+) -> None:
+    case = next(item for item in default_cases() if item.name == "ios_main_thread_ui")
+
+    def answer(catalog: tuple[ToolObservation, ...]) -> AgentAnswer:
+        return AgentAnswer(
+            summary="The profile path makes contradictory thread assertions.",
+            findings=(
+                (
+                    "refreshProfile updates nameLabel on a global queue but also "
+                    f"{compliance} the main-thread requirement."
+                ),
+                case.claims[1].answer_text,
+            ),
+            next_actions=("Keep every UIKit mutation on the main queue.",),
+            citations=_case_citations(case, catalog),
+            issue_present=True,
+        )
+
+    report, workspace = _run_source_answer(case, tmp_path, answer)
+    assert report.verdict is InvestigationVerdict.PASS
+    passed, reason = _score_variant_model(case, report, workspace)
+    assert not passed
+    assert "semantic claims" in reason
+
+
 def test_semantic_scorer_accepts_live_pytorch_clause_with_complete_anchors(
     tmp_path: Path,
 ) -> None:
@@ -389,8 +503,8 @@ def test_semantic_scorer_accepts_absent_inference_guard_with_autograd_enabled(
             summary="The bad helper leaves training state active; the safe helper disables it.",
             findings=(
                 (
-                    "evaluate_bad calls model.train and computes loss without an inference-mode "
-                    "guard, leaving autograd enabled. This violates inference-state correctness."
+                    "evaluate_bad calls model.train and performs loss calculations without "
+                    "disabling gradient tracking or inference mode."
                 ),
                 (
                     "evaluate_safe calls model.eval and torch.inference_mode, disabling "
@@ -417,11 +531,9 @@ def test_semantic_scorer_accepts_manifest_boolean_and_internal_only_wording(
         return AgentAnswer(
             summary="The manifest exposes one activity and restricts the control.",
             findings=(
+                ('DeepLinkActivity is externally reachable because android:exported="true".'),
                 (
-                    'DeepLinkActivity is externally reachable because android:exported="true".'
-                ),
-                (
-                    "InternalSettingsActivity has android:exported=\"false\", indicating "
+                    'InternalSettingsActivity has android:exported="false", indicating '
                     "it cannot be launched from outside the app."
                 ),
             ),
@@ -483,6 +595,28 @@ def test_semantic_scorer_accepts_returning_as_a_forwarding_relation(
     assert passed, reason
 
 
+def test_semantic_scorer_accepts_live_ios_ui_update_wording(tmp_path: Path) -> None:
+    case = next(item for item in default_cases() if item.name == "ios_main_thread_ui")
+
+    def answer(catalog: tuple[ToolObservation, ...]) -> AgentAnswer:
+        return AgentAnswer(
+            summary="The unsafe and safe UIKit paths were inspected.",
+            findings=(
+                "ProfileViewController.refreshProfile updates UI on a background thread "
+                "via DispatchQueue.global().async.",
+                "AvatarViewController.refreshAvatar dispatches UI updates to the main "
+                "queue using DispatchQueue.main.async.",
+            ),
+            next_actions=("Move all UI work to the main queue.",),
+            citations=_case_citations(case, catalog),
+            issue_present=True,
+        )
+
+    report, workspace = _run_source_answer(case, tmp_path, answer)
+    passed, reason = _score_variant_model(case, report, workspace)
+    assert passed, reason
+
+
 def test_semantic_scorer_accepts_live_full_stack_equivalent_wording(
     tmp_path: Path,
 ) -> None:
@@ -514,7 +648,9 @@ def test_semantic_scorer_accepts_live_full_stack_equivalent_wording(
     assert passed, reason
 
 
-def test_semantic_scorer_accepts_user_input_for_unsafe_react_value(tmp_path: Path) -> None:
+def test_semantic_scorer_accepts_untrusted_input_for_unsafe_react_value(
+    tmp_path: Path,
+) -> None:
     case = next(item for item in default_cases() if item.name == "django_react_injection")
 
     def answer(catalog: tuple[ToolObservation, ...]) -> AgentAnswer:
@@ -523,10 +659,85 @@ def test_semantic_scorer_accepts_user_input_for_unsafe_react_value(tmp_path: Pat
             findings=(
                 "search_unsafe concatenates user input into a SQL query, creating injection risk.",
                 "search_safe uses parameterized placeholders to bind user input safely.",
-                "UnsafeResult renders user input via dangerouslySetInnerHTML, exposing XSS risk.",
+                (
+                    "UnsafeResult renders untrusted user input via dangerouslySetInnerHTML, "
+                    "exposing XSS risk."
+                ),
                 "SafeResult renders content as a JSX child, preventing script execution.",
-                "Dependency metadata declares React 18.3.1.",
+                "package.json declares React 18.3.1.",
             ),
+            next_actions=("Remove both unsafe paths.",),
+            citations=_case_citations(case, catalog),
+            issue_present=True,
+        )
+
+    report, workspace = _run_source_answer(case, tmp_path, answer)
+    passed, reason = _score_variant_model(case, report, workspace)
+    assert passed, reason
+
+
+def test_semantic_scorer_accepts_user_supplied_term_for_unsafe_react_value(
+    tmp_path: Path,
+) -> None:
+    case = next(item for item in default_cases() if item.name == "django_react_injection")
+    findings = [claim.answer_text for claim in case.claims]
+    findings[2] = (
+        "UnsafeResult renders the user-supplied term via dangerouslySetInnerHTML, "
+        "exposing XSS risk."
+    )
+
+    def answer(catalog: tuple[ToolObservation, ...]) -> AgentAnswer:
+        return AgentAnswer(
+            summary="Both stacks contain an unsafe path and a safe control.",
+            findings=tuple(findings),
+            next_actions=("Remove both unsafe paths.",),
+            citations=_case_citations(case, catalog),
+            issue_present=True,
+        )
+
+    report, workspace = _run_source_answer(case, tmp_path, answer)
+    passed, reason = _score_variant_model(case, report, workspace)
+    assert passed, reason
+
+
+def test_semantic_scorer_accepts_term_inside_jsx_tags_control(
+    tmp_path: Path,
+) -> None:
+    case = next(item for item in default_cases() if item.name == "django_react_injection")
+    findings = [claim.answer_text for claim in case.claims]
+    findings[3] = (
+        "SafeResult safely outputs term inside JSX tags, ensuring proper escaping and "
+        "preventing XSS."
+    )
+
+    def answer(catalog: tuple[ToolObservation, ...]) -> AgentAnswer:
+        return AgentAnswer(
+            summary="Both stacks contain an unsafe path and a safe control.",
+            findings=tuple(findings),
+            next_actions=("Remove both unsafe paths.",),
+            citations=_case_citations(case, catalog),
+            issue_present=True,
+        )
+
+    report, workspace = _run_source_answer(case, tmp_path, answer)
+    passed, reason = _score_variant_model(case, report, workspace)
+    assert passed, reason
+
+
+def test_semantic_scorer_accepts_labeled_react_subject_behavior_edge(
+    tmp_path: Path,
+) -> None:
+    case = next(item for item in default_cases() if item.name == "django_react_injection")
+    findings = [claim.answer_text for claim in case.claims]
+    findings[2] = (
+        "subject: UnsafeResult component in SearchResults.jsx; behavior: injects untrusted "
+        "term into the DOM via dangerouslySetInnerHTML, exposing XSS risk"
+    )
+
+    def answer(catalog: tuple[ToolObservation, ...]) -> AgentAnswer:
+        return AgentAnswer(
+            summary="Both stacks contain an unsafe path and a safe control.",
+            findings=tuple(findings),
             next_actions=("Remove both unsafe paths.",),
             citations=_case_citations(case, catalog),
             issue_present=True,
@@ -548,7 +759,10 @@ def test_semantic_scorer_accepts_raw_html_and_explicit_content_escaping(
             findings=(
                 "search_unsafe concatenates user input into a SQL query, enabling injection.",
                 "search_safe uses a parameterized query to prevent SQL injection.",
-                "UnsafeResult assigns raw HTML via dangerouslySetInnerHTML, exposing XSS risk.",
+                (
+                    "UnsafeResult assigns untrusted raw HTML via dangerouslySetInnerHTML, "
+                    "exposing XSS risk."
+                ),
                 "SafeResult renders content as plain text, preventing DOM injection.",
                 "package.json includes the React 18.3.1 dependency.",
             ),
@@ -571,7 +785,10 @@ def test_semantic_scorer_accepts_jsx_that_escapes_content(tmp_path: Path) -> Non
             findings=(
                 "search_unsafe concatenates user input into a SQL query, enabling injection.",
                 "search_safe uses a parameterized query to prevent SQL injection.",
-                "UnsafeResult renders term via dangerouslySetInnerHTML, exposing DOM injection.",
+                (
+                    "UnsafeResult renders an untrusted term via dangerouslySetInnerHTML, "
+                    "exposing DOM injection."
+                ),
                 (
                     "SafeResult outputs term as plain JSX children, thereby escaping malicious "
                     "markup and mitigating DOM injection."
@@ -588,6 +805,136 @@ def test_semantic_scorer_accepts_jsx_that_escapes_content(tmp_path: Path) -> Non
     assert passed, reason
 
 
+@pytest.mark.parametrize(
+    "unsafe_finding",
+    [
+        "UnsafeResult uses dangerouslySetInnerHTML with __html.",
+        ("UnsafeResult passes trusted constant raw HTML into dangerouslySetInnerHTML."),
+        "UnsafeResult passes escaped user input to dangerouslySetInnerHTML.",
+        "UnsafeResult passes safe user input to dangerouslySetInnerHTML.",
+        "UnsafeResult passes HTML-encoded user input to dangerouslySetInnerHTML.",
+        "UnsafeResult passes encoded user input to dangerouslySetInnerHTML.",
+        "UnsafeResult passes HTML-encoded untrusted input to dangerouslySetInnerHTML.",
+        "UnsafeResult passes safe user-controlled input to dangerouslySetInnerHTML.",
+        (
+            "UnsafeResult passes untrusted input to dangerouslySetInnerHTML, but it does "
+            "not actually do so."
+        ),
+        "It is false that UnsafeResult passes untrusted input to dangerouslySetInnerHTML.",
+        "After sanitizing it, UnsafeResult passes untrusted input to dangerouslySetInnerHTML.",
+        (
+            "The audit logger reports that UnsafeResult passes untrusted input to "
+            "dangerouslySetInnerHTML."
+        ),
+        (
+            "UnsafeResult passes untrusted input to dangerouslySetInnerHTML, which is "
+            "prevented by the wrapper."
+        ),
+        (
+            "UnsafeResult passes untrusted input to dangerouslySetInnerHTML, but it "
+            "doesn't actually do so."
+        ),
+        "It isn't true that UnsafeResult passes untrusted input to dangerouslySetInnerHTML.",
+        (
+            "UnsafeResult passes untrusted input to dangerouslySetInnerHTML, but cannot "
+            "actually do so."
+        ),
+        "After escaping it, UnsafeResult passes untrusted input to dangerouslySetInnerHTML.",
+        "After filtering it, UnsafeResult passes untrusted input to dangerouslySetInnerHTML.",
+        "UnsafeResult passes hardcoded raw HTML to dangerouslySetInnerHTML.",
+        "UnsafeResult passes literal raw HTML to dangerouslySetInnerHTML.",
+        "UnsafeResult passes predefined raw HTML to dangerouslySetInnerHTML.",
+        "UnsafeResult passes developer-controlled raw HTML to dangerouslySetInnerHTML.",
+        "UnsafeResult prevents untrusted input from reaching dangerouslySetInnerHTML.",
+        "UnsafeResult keeps untrusted content away from dangerouslySetInnerHTML.",
+        "UnsafeResult blocks untrusted input before it reaches dangerouslySetInnerHTML.",
+        "UnsafeResult filters out untrusted input before dangerouslySetInnerHTML.",
+        (
+            "UnsafeResult passes untrusted input to an audit logger and uses "
+            "dangerouslySetInnerHTML for help text."
+        ),
+        (
+            "UnsafeResult sends untrusted input to validation, then uses "
+            "dangerouslySetInnerHTML for a separate template."
+        ),
+        "UnsafeResult refuses to pass untrusted input to dangerouslySetInnerHTML.",
+        "UnsafeResult fails to pass untrusted input to dangerouslySetInnerHTML.",
+        (
+            "UnsafeResult passes untrusted input to a sanitizer before using "
+            "dangerouslySetInnerHTML."
+        ),
+        (
+            "UnsafeResult refuses under all circumstances to pass untrusted input to "
+            "dangerouslySetInnerHTML."
+        ),
+        ("UnsafeResult does everything except pass untrusted input to dangerouslySetInnerHTML."),
+        ("UnsafeResult avoids any attempt to pass untrusted input to dangerouslySetInnerHTML."),
+        "UnsafeResult is forbidden to pass untrusted input to dangerouslySetInnerHTML.",
+        "FakeUnsafeResult passes untrusted input to dangerouslySetInnerHTML.",
+        "LegacyUnsafeResult passes untrusted input to dangerouslySetInnerHTML.",
+        "MockUnsafeResult passes untrusted input to dangerouslySetInnerHTML.",
+        "UnsafeResultFactory passes untrusted input to dangerouslySetInnerHTML.",
+        "$UnsafeResult passes untrusted input to dangerouslySetInnerHTML.",
+        "UnsafeResult$ passes untrusted input to dangerouslySetInnerHTML.",
+        "ÉUnsafeResult passes untrusted input to dangerouslySetInnerHTML.",
+        "UnsafeResulté passes untrusted input to dangerouslySetInnerHTML.",
+        "UnsafeRESULT passes untrusted input to dangerouslySetInnerHTML.",
+        "UnsafeResult́ passes untrusted input to dangerouslySetInnerHTML.",
+        "UnsafeResult‿ passes untrusted input to dangerouslySetInnerHTML.",
+        (
+            "UnsafeResult is unrelated. UnsafeRESULT passes untrusted input to "
+            "dangerouslySetInnerHTML."
+        ),
+        (
+            "The unsafe React path is unrelated. UnsafeRESULT passes untrusted input to "
+            "dangerouslySetInnerHTML."
+        ),
+        (
+            "UnsafeResult is unrelated. The unsafe result passes untrusted input to "
+            "dangerouslySetInnerHTML."
+        ),
+        (
+            "UnsafeResult is unrelated. unsafe-result passes untrusted input to "
+            "dangerouslySetInnerHTML."
+        ),
+        (
+            "The unsafe React path is unrelated. The unsafe result passes untrusted input "
+            "to dangerouslySetInnerHTML."
+        ),
+        ("UnsafeResult passes untrusted input to dangerouslySetInnerHTMLFactory."),
+        "UnsafeResult passes untrusted input to dangerouslySetInnerHTML$.",
+        "UnsafeResult passes untrusted input to dangerouslySetInnerHTMĹ.",
+        "UnsafeResult passes untrusted input to DangerouslySetInnerHTML.",
+        (
+            "UnsafeResult is unrelated. The unsafe result reactunsafeedgesubject passes "
+            "untrusted input to dangerouslySetInnerHTML."
+        ),
+    ],
+)
+def test_semantic_scorer_requires_untrusted_react_provenance(
+    tmp_path: Path,
+    unsafe_finding: str,
+) -> None:
+    case = next(item for item in default_cases() if item.name == "django_react_injection")
+    findings = [claim.answer_text for claim in case.claims]
+    findings[2] = unsafe_finding
+
+    def answer(catalog: tuple[ToolObservation, ...]) -> AgentAnswer:
+        return AgentAnswer(
+            summary="Both stacks were inspected.",
+            findings=tuple(findings),
+            next_actions=("Remove both unsafe paths.",),
+            citations=_case_citations(case, catalog),
+            issue_present=True,
+        )
+
+    report, workspace = _run_source_answer(case, tmp_path, answer)
+    assert report.verdict is InvestigationVerdict.PASS
+    passed, reason = _score_variant_model(case, report, workspace)
+    assert not passed
+    assert "semantic claims" in reason
+
+
 def test_semantic_scorer_requires_grounded_manifest_finding(
     tmp_path: Path,
 ) -> None:
@@ -601,10 +948,43 @@ def test_semantic_scorer_requires_grounded_manifest_finding(
                 "Safe Django path uses a parameterized SQL placeholder.",
                 "Unsafe React path renders untrusted content with dangerouslySetInnerHTML.",
                 "Safe React path renders content as escaped plain text through JSX interpolation.",
-                "package.json declares React 18.3.1 as a dependency.",
+                "package.json declares React v18.3.1 as a dependency.",
             ),
             next_actions=("Remove the two unsafe paths and retain both controls.",),
             citations=_case_citations(case, catalog),
+            issue_present=True,
+        )
+
+    report, workspace = _run_source_answer(case, tmp_path, answer)
+    passed, reason = _score_variant_model(case, report, workspace)
+    assert passed, reason
+
+
+def test_semantic_scorer_allows_only_bounded_supplemental_framework_finding(
+    tmp_path: Path,
+) -> None:
+    case = next(item for item in default_cases() if item.name == "django_react_injection")
+
+    def answer(catalog: tuple[ToolObservation, ...]) -> AgentAnswer:
+        views = next(
+            item
+            for item in catalog
+            if item.tool == "read_file" and item.path == "projects/views.py"
+        )
+        return AgentAnswer(
+            summary="The requested controls and both framework signals were checked.",
+            findings=(
+                *(claim.answer_text for claim in case.claims),
+                (
+                    "subject: Dependency metadata in projects/views.py; behavior: imports "
+                    "django.db, indicating use of the Django backend"
+                ),
+            ),
+            next_actions=("Remove the unsafe paths.",),
+            citations=(
+                *_case_citations(case, catalog),
+                SourceCitation(views.observation_id, views.path, 1, 1),
+            ),
             issue_present=True,
         )
 
@@ -618,7 +998,9 @@ def test_semantic_scorer_rejects_false_extra_finding(tmp_path: Path) -> None:
 
     def answer(catalog: tuple[ToolObservation, ...]) -> AgentAnswer:
         views = next(
-            item for item in catalog if item.tool == "read_file" and item.path == "projects/views.py"
+            item
+            for item in catalog
+            if item.tool == "read_file" and item.path == "projects/views.py"
         )
         return AgentAnswer(
             summary="The requested controls and dependency were checked.",
@@ -651,8 +1033,9 @@ def test_semantic_scorer_accepts_live_cpp_wording_with_complete_anchors(
             summary="The local-backed view dangles; the member-backed view is safe.",
             findings=(
                 (
-                    "load_bad returns std::string_view(local), where local goes out of "
-                    "scope; unsafe."
+                    "In function load_bad, a std::string named local is created on the stack "
+                    "and a std::string_view pointing to it is returned, causing the view to "
+                    "dangle after the function exits."
                 ),
                 (
                     "load_safe returns a view of member storage_, which remains valid for "
@@ -1470,25 +1853,50 @@ def test_semantic_scorer_rejects_broad_overlapping_anchor_ranges(tmp_path: Path)
     assert "validated evidence anchors" in reason
 
 
+def test_semantic_scorer_rejects_source_citation_larger_than_exact_anchor(
+    tmp_path: Path,
+) -> None:
+    case = next(item for item in default_cases() if item.name == "cpp_dangling_view")
+
+    def answer(catalog: tuple[ToolObservation, ...]) -> AgentAnswer:
+        citations = _case_citations(case, catalog)
+        return AgentAnswer(
+            summary="Both return paths were inspected.",
+            findings=tuple(claim.answer_text for claim in case.claims),
+            next_actions=("Keep returned views backed by owning storage.",),
+            citations=(
+                replace(citations[0], start_line=citations[0].start_line - 1),
+                citations[1],
+            ),
+            issue_present=True,
+        )
+
+    report, workspace = _run_source_answer(case, tmp_path, answer)
+    assert report.verdict is InvestigationVerdict.PASS
+    passed, reason = _score_variant_model(case, report, workspace)
+    assert not passed
+    assert "validated evidence anchors" in reason
+
+
 def test_semantic_scorer_rejects_decisive_line_without_subject_anchor(
     tmp_path: Path,
 ) -> None:
-    case = next(item for item in default_cases() if item.name == "ios_main_thread_ui")
+    case = next(item for item in default_cases() if item.name == "django_react_injection")
     first_anchor = case.claims[0].anchor
 
     def answer(catalog: tuple[ToolObservation, ...]) -> AgentAnswer:
         citations = _case_citations(case, catalog)
         return AgentAnswer(
-            summary="Both UI paths were inspected.",
+            summary="The full-stack paths were inspected.",
             findings=tuple(claim.answer_text for claim in case.claims),
-            next_actions=("Move the unsafe mutation to the main queue.",),
+            next_actions=("Remove the unsafe paths.",),
             citations=(
                 replace(
                     citations[0],
                     start_line=first_anchor.end_line,
                     end_line=first_anchor.end_line,
                 ),
-                citations[1],
+                *citations[1:],
             ),
             issue_present=True,
         )
@@ -1515,12 +1923,12 @@ def test_claims_use_hashed_minimal_evidence_ranges() -> None:
     cases = {case.name: case for case in default_cases()}
     ios_anchor = cases["ios_main_thread_ui"].claims[0].anchor
     pytorch_anchor = cases["pytorch_eval_mode"].claims[1].anchor
-    assert ios_anchor.end_line - ios_anchor.start_line + 1 == 4
-    assert pytorch_anchor.end_line - pytorch_anchor.start_line + 1 == 3
+    assert ios_anchor.end_line - ios_anchor.start_line + 1 == 1
+    assert pytorch_anchor.end_line - pytorch_anchor.start_line + 1 == 4
     assert ios_anchor.content_sha256
     assert pytorch_anchor.content_sha256
     for case in cases.values():
-        for claim in case.claims:
+        for claim in (*case.claims, *case.supplemental_claims):
             if claim.anchor.command is not None:
                 continue
             lines = case.files[claim.anchor.path].splitlines()
@@ -2288,6 +2696,32 @@ def test_retry_accounting_requires_failure_typed_transitions() -> None:
         expected_model=None,
     )
     assert "model_call_sequence_invalid" in failures
+
+
+def test_terminal_schema_retry_is_accounted_without_inventing_an_extra_retry() -> None:
+    case = default_cases()[0]
+    calls = (
+        ModelCallRecord(1, 1, 100, 10, 20, 10, "requested", 0.1, "schema_error"),
+        ModelCallRecord(2, 1, 100, 10, 20, 10, "requested", 0.1, "schema_error"),
+    )
+
+    failures = _integrity_failures(
+        case,
+        _report(
+            decisions_used=1,
+            physical_requests_used=2,
+            model_calls=calls,
+            completion_tokens_requested=200,
+            completion_tokens_charged=20,
+            completion_tokens_used=20,
+            schema_retries=1,
+        ),
+        AgentBudget(),
+        expected_model=None,
+    )
+
+    assert "model_call_accounting_invalid" not in failures
+    assert "retry_accounting_invalid" not in failures
 
 
 def test_integrity_reconciles_per_call_completion_ledger_and_cap() -> None:

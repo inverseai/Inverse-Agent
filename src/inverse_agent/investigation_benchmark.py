@@ -26,6 +26,7 @@ import secrets
 import subprocess
 import tempfile
 import time
+import unicodedata
 from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
@@ -170,6 +171,19 @@ _REQUIREMENT_TOKENS = frozenset(
 _REQUIREMENT_SCOPE_BOUNDARIES = frozenset(
     {"and", "although", "because", "but", "hence", "however", "so", "therefore"}
 )
+_REQUIREMENT_COMPLIANCE_TOKENS = frozenset(
+    {
+        "complies",
+        "conforms",
+        "follows",
+        "fulfills",
+        "meets",
+        "met",
+        "obeys",
+        "satisfied",
+        "satisfies",
+    }
+)
 _UNRESOLVED_ANAPHORIC_NEGATION = re.compile(
     r"\b(?:it|that|these|they|this|those)\s+"
     rf"(?:(?:{'|'.join(sorted(_NEGATING_AUXILIARIES))})\s+"
@@ -201,6 +215,133 @@ _CONTRACTION_EXPANSIONS = (
     (re.compile(r"\b(?:wouldn'?t|wouldnt)\b", re.IGNORECASE), "would not"),
     (re.compile(r"\b(?:can'?t|cant)\b", re.IGNORECASE), "cannot"),
     (re.compile(r"\b(?:won'?t|wont)\b", re.IGNORECASE), "will not"),
+)
+_REACT_DIRECT_FLOW_ALIASES = (
+    "assigns",
+    "feeds",
+    "forwards",
+    "injects",
+    "inserts",
+    "pass",
+    "passes",
+    "renders",
+    "sends",
+    "sets",
+)
+_REACT_UNSAFE_SUBJECT_ALIASES = ("UnsafeResult", "unsafe React path")
+_REACT_EDGE_SUBJECT_SENTINEL = "reactunsafeedgesubject"
+_REACT_EDGE_SINK_SENTINEL = "reactdangeroushtmlsink"
+_REACT_LABELED_EDGE = re.compile(
+    rf"\bsubject\s*:\s*[^;\n]{{0,200}}\b{_REACT_EDGE_SUBJECT_SENTINEL}\b"
+    rf"[^;\n]{{0,200}}(?:;|\n)\s*behavior\s*:\s*",
+    re.IGNORECASE,
+)
+_REACT_IDENTIFIER_CANDIDATE = re.compile(r"UnsafeResult", re.IGNORECASE)
+_REACT_SINK_CANDIDATE = re.compile(r"dangerouslySetInnerHTML", re.IGNORECASE)
+_REACT_CODE_PATH_SPAN = re.compile(
+    r"`(?=[^`\r\n]*[/\\])[^`\r\n]*\."
+    r"(?:cjs|js|jsx|mjs|svelte|ts|tsx|vue)`",
+    re.IGNORECASE,
+)
+_REACT_NATURAL_SUBJECT_CANDIDATE = re.compile(
+    r"unsafe[\s_-]+react[\s_-]+path\b",
+    re.IGNORECASE | re.ASCII,
+)
+_REACT_NATURAL_SUBJECT_PREFIX = re.compile(
+    r"\s*(?:[-*`#]+\s*)*(?:the\s+)?\Z",
+    re.IGNORECASE | re.ASCII,
+)
+_JS_IDENTIFIER_PART_CATEGORIES = frozenset(
+    {"Ll", "Lm", "Lo", "Lt", "Lu", "Mc", "Mn", "Nd", "Nl", "Pc"}
+)
+_JS_OTHER_IDENTIFIER_PARTS = frozenset(
+    {"$", "\u00b7", "\u0387", "\u1369", "\u1370", "\u1371", "\u19da", "\u200c", "\u200d"}
+)
+_REACT_UNTRUSTED_PROVENANCE_ALIASES = (
+    "untrusted raw HTML",
+    "untrusted HTML",
+    "untrusted input",
+    "untrusted user input",
+    "untrusted content",
+    "untrusted term",
+    "user-controlled HTML",
+    "user controlled HTML",
+    "user-supplied HTML",
+    "user supplied HTML",
+    "user-provided HTML",
+    "user provided HTML",
+    "user-supplied data",
+    "user supplied data",
+    "user-provided data",
+    "user provided data",
+    "user-controlled input",
+    "user controlled input",
+    "user-supplied input",
+    "user supplied input",
+    "user-provided input",
+    "user provided input",
+    "user-supplied term",
+    "user supplied term",
+    "user-provided term",
+    "user provided term",
+    "user-supplied content",
+    "user supplied content",
+    "user-provided content",
+    "user provided content",
+)
+_REACT_FLOW_CONNECTORS = frozenset({"into", "through", "to", "via", "with"})
+_REACT_FLOW_BRIDGE_TOKENS = _REACT_FLOW_CONNECTORS | frozenset(
+    {"directly", "dom", "react", "s", "the", "unsafely"}
+)
+_REACT_FLOW_LEAD_TOKENS = frozenset({"a", "an", "directly", "its", "the"})
+_REACT_SUBJECT_FLOW_TOKENS = frozenset({"component", "directly", "explicitly", "that"})
+_REACT_DEPENDENCY_SUBJECT_INVERSION = re.compile(
+    r"\bReact\s+(?:framework|dependency)\s+is\s+declared\s+in\s+"
+    r"package\.json\s+dependencies\b",
+    re.IGNORECASE,
+)
+_REACT_EDGE_INVALID_TOKENS = frozenset(
+    {
+        "audit",
+        "avoid",
+        "avoids",
+        "block",
+        "blocks",
+        "cannot",
+        "encoded",
+        "escaped",
+        "escaping",
+        "false",
+        "filter",
+        "filtered",
+        "filtering",
+        "filters",
+        "logger",
+        "never",
+        "no",
+        "not",
+        "only",
+        "prevent",
+        "prevented",
+        "prevents",
+        "protected",
+        "refuse",
+        "refuses",
+        "safe",
+        "sanitise",
+        "sanitised",
+        "sanitises",
+        "sanitising",
+        "sanitize",
+        "sanitized",
+        "sanitizes",
+        "sanitizing",
+        "static",
+        "trusted",
+        "validated",
+        "without",
+        "wrapper",
+    }
 )
 
 
@@ -249,6 +390,7 @@ class BenchmarkCase:
     steps: tuple[ToolCall, ...]
     claims: tuple[SemanticClaim, ...]
     required_observations: tuple[ObservationRequirement, ...]
+    supplemental_claims: tuple[SemanticClaim, ...] = ()
     expected_issue: bool = True
     forbidden_secrets: tuple[str, ...] = ()
     model_hint: str = ""
@@ -479,6 +621,12 @@ def _normalize_semantics(value: str) -> str:
     # words (label, image view) match without substring matching.
     expanded = re.sub(r"(?<=[A-Z])(?=[A-Z][a-z])", " ", value)
     expanded = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", expanded)
+    expanded = re.sub(
+        r"\bnon(?:\s|[-\u2010-\u2015])+main\s+thread\b",
+        "background thread",
+        expanded,
+        flags=re.IGNORECASE,
+    )
     expanded = expanded.translate(_SEMANTIC_PUNCTUATION_TRANSLATION)
     for pattern, replacement in _CONTRACTION_EXPANSIONS:
         expanded = pattern.sub(replacement, expanded)
@@ -622,12 +770,33 @@ def _bound_polarity_status(
                     ),
                     default=-1,
                 )
-                if any(
+                requirement_before = any(
                     token in _REQUIREMENT_TOKENS
                     for token in tokens[requirement_boundary + 1 : start]
-                ):
+                )
+                requirement_after = any(
+                    token in _REQUIREMENT_TOKENS for token in tokens[end : end + 2]
+                )
+                scope_end = min(
+                    (
+                        index
+                        for index in range(end, len(tokens))
+                        if tokens[index] in _REQUIREMENT_SCOPE_BOUNDARIES
+                    ),
+                    default=len(tokens),
+                )
+                positive_compliance = any(
+                    token in _REQUIREMENT_COMPLIANCE_TOKENS
+                    and not _occurrence_is_negated(tokens, index, index + 1)
+                    for index, token in enumerate(tokens)
+                    if requirement_boundary < index < scope_end
+                )
+                if (requirement_before or requirement_after) and not positive_compliance:
                     # A recommendation or framework requirement describes the
                     # desired state, not the state observed for this subject.
+                    # Compound forms such as "main-thread requirement" remain
+                    # observed assertions when a positive compliance verb says
+                    # that the subject meets or satisfies the requirement.
                     continue
                 if any(
                     is_target and mention_start <= start and end <= mention_end
@@ -741,6 +910,116 @@ def _semantic_sentences(value: str) -> tuple[tuple[tuple[str, ...], ...], ...]:
     return tuple(clauses for sentence in sentences if (clauses := _semantic_clauses(sentence)))
 
 
+def _is_js_identifier_part(character: str) -> bool:
+    return (
+        character in _JS_OTHER_IDENTIFIER_PARTS
+        or unicodedata.category(character) in _JS_IDENTIFIER_PART_CATEGORIES
+    )
+
+
+def _mark_react_edge_symbols(finding: str) -> str | None:
+    finding = _REACT_CODE_PATH_SPAN.sub(" ", finding)
+    normalized_finding = finding.casefold()
+    if any(
+        sentinel.casefold() in normalized_finding
+        for sentinel in (_REACT_EDGE_SUBJECT_SENTINEL, _REACT_EDGE_SINK_SENTINEL)
+    ):
+        return None
+    exact_subject = False
+    for match in _REACT_IDENTIFIER_CANDIDATE.finditer(finding):
+        before = finding[match.start() - 1] if match.start() else ""
+        after = finding[match.end()] if match.end() < len(finding) else ""
+        if (
+            match.group(0) != "UnsafeResult"
+            or (before and _is_js_identifier_part(before))
+            or (after and _is_js_identifier_part(after))
+        ):
+            return None
+        exact_subject = True
+    natural_subject = False
+    for match in _REACT_NATURAL_SUBJECT_CANDIDATE.finditer(finding):
+        if _REACT_NATURAL_SUBJECT_PREFIX.fullmatch(finding[: match.start()]) is None:
+            return None
+        natural_subject = True
+    exact_sink = False
+    for match in _REACT_SINK_CANDIDATE.finditer(finding):
+        before = finding[match.start() - 1] if match.start() else ""
+        after = finding[match.end()] if match.end() < len(finding) else ""
+        if (
+            match.group(0) != "dangerouslySetInnerHTML"
+            or (before and _is_js_identifier_part(before))
+            or (after and _is_js_identifier_part(after))
+        ):
+            return None
+        exact_sink = True
+    if not (exact_subject or natural_subject) or not exact_sink:
+        return None
+    marked = _REACT_IDENTIFIER_CANDIDATE.sub(_REACT_EDGE_SUBJECT_SENTINEL, finding)
+    marked = _REACT_NATURAL_SUBJECT_CANDIDATE.sub(_REACT_EDGE_SUBJECT_SENTINEL, marked)
+    return _REACT_SINK_CANDIDATE.sub(_REACT_EDGE_SINK_SENTINEL, marked)
+
+
+def _react_untrusted_flow_matches(finding: str) -> bool:
+    """Require one direct, positive UnsafeResult data-flow edge into the HTML sink."""
+
+    marked_finding = _mark_react_edge_symbols(finding)
+    if marked_finding is None:
+        return False
+    marked_finding = _REACT_LABELED_EDGE.sub(
+        f"{_REACT_EDGE_SUBJECT_SENTINEL} ",
+        marked_finding,
+    )
+    if any(token in _REACT_EDGE_INVALID_TOKENS for token in _semantic_tokens(marked_finding)):
+        return False
+    for sentence in _semantic_sentences(marked_finding):
+        for clause in sentence:
+            if any(token in _REACT_EDGE_INVALID_TOKENS for token in clause):
+                continue
+            subjects = _semantic_phrase_positions(
+                clause,
+                _REACT_EDGE_SUBJECT_SENTINEL,
+            )
+            sinks = _semantic_phrase_positions(clause, _REACT_EDGE_SINK_SENTINEL)
+            flows = tuple(
+                position
+                for alias in _REACT_DIRECT_FLOW_ALIASES
+                for position in _semantic_phrase_positions(clause, alias)
+            )
+            provenance = tuple(
+                position
+                for alias in _REACT_UNTRUSTED_PROVENANCE_ALIASES
+                for position in _semantic_phrase_positions(clause, alias)
+            )
+            for flow_start, flow_end in flows:
+                direct_subject = any(
+                    subject_end <= flow_start
+                    and all(
+                        token in _REACT_SUBJECT_FLOW_TOKENS
+                        for token in clause[subject_end:flow_start]
+                    )
+                    for _subject_start, subject_end in subjects
+                )
+                if _occurrence_is_negated(clause, flow_start, flow_end) or not direct_subject:
+                    continue
+                for provenance_start, provenance_end in provenance:
+                    if provenance_start < flow_end or any(
+                        token not in _REACT_FLOW_LEAD_TOKENS
+                        for token in clause[flow_end:provenance_start]
+                    ):
+                        continue
+                    for sink_start, _sink_end in sinks:
+                        if sink_start < provenance_end:
+                            continue
+                        bridge = clause[provenance_end:sink_start]
+                        if (
+                            bridge
+                            and any(token in _REACT_FLOW_CONNECTORS for token in bridge)
+                            and all(token in _REACT_FLOW_BRIDGE_TOKENS for token in bridge)
+                        ):
+                            return True
+    return False
+
+
 def _semantic_match(
     claim: SemanticClaim,
     finding: str,
@@ -748,6 +1027,11 @@ def _semantic_match(
 ) -> bool:
     if not claim.term_groups or not claim.polarity_rules:
         return False
+    if claim.claim_id == "react-dependency":
+        finding = _REACT_DEPENDENCY_SUBJECT_INVERSION.sub(
+            "package.json declares React dependency",
+            finding,
+        )
     normalized_finding = _normalize_semantics(finding)
     if _UNRESOLVED_ANAPHORIC_NEGATION.search(normalized_finding) is not None:
         explicit_manifest_negative = (
@@ -973,6 +1257,8 @@ def _claim_pair_matches(
     workspace: Path,
     all_claims: tuple[SemanticClaim, ...],
 ) -> bool:
+    if claim.claim_id == "react-dangerous-html" and not _react_untrusted_flow_matches(finding):
+        return False
     explicit_hashes_match: bool | None = None
     if claim.claim_id == "git-head":
         if _git_identity_has_unresolved_language(finding):
@@ -1004,18 +1290,19 @@ def _claims_have_distinct_matches(
     report: InvestigationReport,
     workspace: Path,
 ) -> bool:
-    if len(answer.findings) != len(case.claims):
+    all_claims = (*case.claims, *case.supplemental_claims)
+    if not len(case.claims) <= len(answer.findings) <= len(all_claims):
         return False
     if any(claim.negative_control and not claim.polarity_rules for claim in case.claims):
         return False
     pairs = tuple(zip(answer.findings, answer.citations, strict=True))
 
-    def assign(claim_index: int, used: frozenset[int]) -> bool:
-        if claim_index == len(case.claims):
-            return True
-        claim = case.claims[claim_index]
-        for pair_index, (finding, citation) in enumerate(pairs):
-            if pair_index in used:
+    def assign(pair_index: int, used_claims: frozenset[int]) -> bool:
+        if pair_index == len(pairs):
+            return all(index in used_claims for index in range(len(case.claims)))
+        finding, citation = pairs[pair_index]
+        for claim_index, claim in enumerate(all_claims):
+            if claim_index in used_claims:
                 continue
             if _claim_pair_matches(
                 claim,
@@ -1023,8 +1310,8 @@ def _claims_have_distinct_matches(
                 citation,
                 report,
                 workspace,
-                case.claims,
-            ) and assign(claim_index + 1, used | {pair_index}):
+                all_claims,
+            ) and assign(pair_index + 1, used_claims | {claim_index}):
                 return True
         return False
 
@@ -1299,11 +1586,7 @@ def _integrity_failures(
             success_count = sum(call.outcome == "success" for call in request_calls)
             if success_count > 1 or (success_count == 1 and request_calls[-1].outcome != "success"):
                 failures.add("model_call_sequence_invalid")
-            if (
-                len(request_calls) > 3
-                or sum(call.outcome == "transport_error" for call in request_calls) > 1
-                or sum(call.outcome in schema_retry_outcomes for call in request_calls) > 1
-            ):
+            if len(request_calls) > 3:
                 invalid_retry_transition = True
     for previous, current in zip(calls, calls[1:], strict=False):
         if (
@@ -1319,6 +1602,8 @@ def _integrity_failures(
             continue
         else:
             invalid_retry_transition = True
+    if derived_transport_retries > 1 or derived_schema_retries > 1:
+        invalid_retry_transition = True
     if (
         invalid_retry_transition
         or report.transport_retries != derived_transport_retries
@@ -2088,6 +2373,57 @@ def _is_exact_string_tuple(value: object) -> bool:
     return type(value) is tuple and all(type(item) is str for item in value)
 
 
+def _semantic_claims_payload(claims: object) -> tuple[object, ...] | None:
+    if type(claims) is not tuple:
+        return None
+    projected: list[object] = []
+    for claim in claims:
+        if (
+            type(claim) is not SemanticClaim
+            or type(claim.claim_id) is not str
+            or type(claim.answer_text) is not str
+            or type(claim.anchor) is not EvidenceAnchor
+            or type(claim.anchor.path) is not str
+            or type(claim.anchor.start_line) is not int
+            or type(claim.anchor.end_line) is not int
+            or not _is_exact_optional_string(claim.anchor.content_sha256)
+            or not _is_exact_optional_string(claim.anchor.command)
+            or type(claim.anchor.required_prefix) is not str
+            or type(claim.term_groups) is not tuple
+            or not all(_is_exact_string_tuple(group) for group in claim.term_groups)
+            or type(claim.polarity_rules) is not tuple
+            or type(claim.negative_control) is not bool
+        ):
+            return None
+        projected_polarity: list[object] = []
+        for rule in claim.polarity_rules:
+            if (
+                type(rule) is not PolarityRule
+                or not _is_exact_string_tuple(rule.aliases)
+                or type(rule.affirmed) is not bool
+            ):
+                return None
+            projected_polarity.append((rule.aliases, rule.affirmed))
+        projected.append(
+            (
+                claim.claim_id,
+                claim.answer_text,
+                (
+                    claim.anchor.path,
+                    claim.anchor.start_line,
+                    claim.anchor.end_line,
+                    claim.anchor.content_sha256,
+                    claim.anchor.command,
+                    claim.anchor.required_prefix,
+                ),
+                claim.term_groups,
+                tuple(projected_polarity),
+                claim.negative_control,
+            )
+        )
+    return tuple(projected)
+
+
 def _suite_definition_payload(cases: object) -> tuple[object, ...] | None:
     """Project a suite through exact built-in primitives without custom equality."""
 
@@ -2106,6 +2442,7 @@ def _suite_definition_payload(cases: object) -> tuple[object, ...] | None:
             or not _is_exact_string_tuple(case.goal_variants)
             or type(case.steps) is not tuple
             or type(case.claims) is not tuple
+            or type(case.supplemental_claims) is not tuple
             or type(case.required_observations) is not tuple
             or type(case.expected_issue) is not bool
             or not _is_exact_string_tuple(case.forbidden_secrets)
@@ -2148,51 +2485,10 @@ def _suite_definition_payload(cases: object) -> tuple[object, ...] | None:
                 )
             )
 
-        projected_claims: list[object] = []
-        for claim in case.claims:
-            if (
-                type(claim) is not SemanticClaim
-                or type(claim.claim_id) is not str
-                or type(claim.answer_text) is not str
-                or type(claim.anchor) is not EvidenceAnchor
-                or type(claim.anchor.path) is not str
-                or type(claim.anchor.start_line) is not int
-                or type(claim.anchor.end_line) is not int
-                or not _is_exact_optional_string(claim.anchor.content_sha256)
-                or not _is_exact_optional_string(claim.anchor.command)
-                or type(claim.anchor.required_prefix) is not str
-                or type(claim.term_groups) is not tuple
-                or not all(_is_exact_string_tuple(group) for group in claim.term_groups)
-                or type(claim.polarity_rules) is not tuple
-                or type(claim.negative_control) is not bool
-            ):
-                return None
-            projected_polarity: list[object] = []
-            for rule in claim.polarity_rules:
-                if (
-                    type(rule) is not PolarityRule
-                    or not _is_exact_string_tuple(rule.aliases)
-                    or type(rule.affirmed) is not bool
-                ):
-                    return None
-                projected_polarity.append((rule.aliases, rule.affirmed))
-            projected_claims.append(
-                (
-                    claim.claim_id,
-                    claim.answer_text,
-                    (
-                        claim.anchor.path,
-                        claim.anchor.start_line,
-                        claim.anchor.end_line,
-                        claim.anchor.content_sha256,
-                        claim.anchor.command,
-                        claim.anchor.required_prefix,
-                    ),
-                    claim.term_groups,
-                    tuple(projected_polarity),
-                    claim.negative_control,
-                )
-            )
+        projected_claims = _semantic_claims_payload(case.claims)
+        projected_supplemental_claims = _semantic_claims_payload(case.supplemental_claims)
+        if projected_claims is None or projected_supplemental_claims is None:
+            return None
 
         projected_requirements: list[object] = []
         for requirement in case.required_observations:
@@ -2211,7 +2507,8 @@ def _suite_definition_payload(cases: object) -> tuple[object, ...] | None:
                 tuple(sorted(case.files.items())),
                 case.goal_variants,
                 tuple(projected_steps),
-                tuple(projected_claims),
+                projected_claims,
+                projected_supplemental_claims,
                 tuple(projected_requirements),
                 case.expected_issue,
                 case.forbidden_secrets,
@@ -2382,21 +2679,11 @@ def default_cases() -> tuple[BenchmarkCase, ...]:
     ios_files = {
         "App/ProfileViewController.swift": (
             "import UIKit\n"
-            "class ProfileViewController: UIViewController {\n"
-            "  func refresh() {\n"
-            "    DispatchQueue.global().async {\n"
-            "      self.nameLabel.text = self.loadName()\n"
-            "    }\n"
-            "  }\n"
-            "}\n"
-            "class AvatarViewController: UIViewController {\n"
-            "  func refresh() {\n"
-            "    DispatchQueue.global().async {\n"
-            "      let image = self.loadImage()\n"
-            "      DispatchQueue.main.async { self.avatarView.image = image }\n"
-            "    }\n"
-            "  }\n"
-            "}\n"
+            "class ProfileViewController: UIViewController { func refreshProfile() { "
+            "DispatchQueue.global().async { self.nameLabel.text = self.loadName() } } }\n"
+            "class AvatarViewController: UIViewController { func refreshAvatar() { "
+            "DispatchQueue.global().async { let image = self.loadImage(); "
+            "DispatchQueue.main.async { self.avatarView.image = image } } } }\n"
         )
     }
     ios_path = "App/ProfileViewController.swift"
@@ -2409,11 +2696,8 @@ def default_cases() -> tuple[BenchmarkCase, ...]:
             "  std::string local = compute();\n"
             "  return std::string_view(local);\n"
             "}\n"
-            "class ConfigCache {\n"
-            "  std::string storage_;\n"
-            " public:\n"
-            "  std::string_view load_safe() { return storage_; }\n"
-            "};\n"
+            "class ConfigCache { std::string storage_; public: "
+            "std::string_view load_safe() { return storage_; } };\n"
         )
     }
     cpp_path = "src/config.cpp"
@@ -2430,11 +2714,11 @@ def default_cases() -> tuple[BenchmarkCase, ...]:
         ),
         "projects/static/projects/SearchResults.jsx": (
             'import React from "react";\n'
-            "export function UnsafeResult({ term }) {\n"
-            "  return <div dangerouslySetInnerHTML={{ __html: term }} />;\n"
+            "export function UnsafeResult({ userSuppliedTerm }) {\n"
+            "  return <div dangerouslySetInnerHTML={{ __html: userSuppliedTerm }} />;\n"
             "}\n"
-            "export function SafeResult({ term }) {\n"
-            "  return <div>{term}</div>;\n"
+            "export function SafeResult({ userSuppliedTerm }) {\n"
+            "  return <div>{userSuppliedTerm}</div>;\n"
             "}\n"
         ),
         "package.json": '{"dependencies":{"react":"18.3.1"}}\n',
@@ -2556,16 +2840,20 @@ def default_cases() -> tuple[BenchmarkCase, ...]:
             claims=(
                 _claim(
                     "ios-background-ui",
-                    "ProfileViewController mutates nameLabel on a global background queue.",
+                    "refreshProfile mutates nameLabel on a global background queue.",
                     _find_anchor(
                         ios_files,
                         ios_path,
-                        "class ProfileViewController: UIViewController {",
-                        "  func refresh() {",
-                        "    DispatchQueue.global().async {",
-                        "      self.nameLabel.text = self.loadName()",
+                        "class ProfileViewController: UIViewController { func refreshProfile() { "
+                        "DispatchQueue.global().async { self.nameLabel.text = self.loadName() "
+                        "} } }",
                     ),
-                    ("ProfileViewController", "profile view controller"),
+                    (
+                        "refreshProfile",
+                        "ProfileViewController.refreshProfile",
+                        "ProfileViewController",
+                        "profile view controller",
+                    ),
                     (
                         "background",
                         "global queue",
@@ -2574,7 +2862,7 @@ def default_cases() -> tuple[BenchmarkCase, ...]:
                         "DispatchQueue.global",
                         "off main thread",
                     ),
-                    ("nameLabel", "label", "UIKit"),
+                    ("nameLabel", "label", "UIKit", "UI", "UI updates"),
                     polarity=(
                         _polarity(
                             True,
@@ -2589,22 +2877,23 @@ def default_cases() -> tuple[BenchmarkCase, ...]:
                 ),
                 _claim(
                     "ios-main-control",
-                    "AvatarViewController dispatches the avatar UI mutation to the main queue.",
+                    "refreshAvatar dispatches the avatar UI mutation to the main queue.",
                     _find_anchor(
                         ios_files,
                         ios_path,
-                        "class AvatarViewController: UIViewController {",
-                        "  func refresh() {",
-                        "    DispatchQueue.global().async {",
-                        "      let image = self.loadImage()",
-                        "      DispatchQueue.main.async { self.avatarView.image = image }",
+                        "class AvatarViewController: UIViewController { func refreshAvatar() { "
+                        "DispatchQueue.global().async { let image = self.loadImage(); "
+                        "DispatchQueue.main.async { self.avatarView.image = image } } } }",
                     ),
-                    ("AvatarViewController", "avatar view controller"),
+                    (
+                        "refreshAvatar",
+                        "AvatarViewController.refreshAvatar",
+                        "AvatarViewController",
+                        "avatar view controller",
+                    ),
                     ("main queue", "main thread", "DispatchQueue.main"),
-                    ("avatar", "image view", "UI mutation", "UI update"),
-                    polarity=(
-                        _polarity(True, "main queue", "main thread", "DispatchQueue.main"),
-                    ),
+                    ("avatar", "image view", "UI mutation", "UI update", "UI updates"),
+                    polarity=(_polarity(True, "main queue", "main thread", "DispatchQueue.main"),),
                     negative_control=True,
                 ),
             ),
@@ -2635,7 +2924,14 @@ def default_cases() -> tuple[BenchmarkCase, ...]:
                     ("string_view", "string view", "view"),
                     ("local", "destroyed", "dangling", "lifetime"),
                     polarity=(
-                        _polarity(True, "dangling", "destroyed", "out of scope", "unsafe"),
+                        _polarity(
+                            True,
+                            "dangle",
+                            "dangling",
+                            "destroyed",
+                            "out of scope",
+                            "unsafe",
+                        ),
                         _polarity(False, "safe", "member storage"),
                     ),
                 ),
@@ -2645,10 +2941,8 @@ def default_cases() -> tuple[BenchmarkCase, ...]:
                     _find_anchor(
                         cpp_files,
                         cpp_path,
-                        "class ConfigCache {",
-                        "  std::string storage_;",
-                        " public:",
-                        "  std::string_view load_safe() { return storage_; }",
+                        "class ConfigCache { std::string storage_; public: "
+                        "std::string_view load_safe() { return storage_; } };",
                     ),
                     ("load_safe", "load safe"),
                     ("member", "ConfigCache", "storage_", "owning storage"),
@@ -2761,35 +3055,57 @@ def default_cases() -> tuple[BenchmarkCase, ...]:
                 ),
                 _claim(
                     "react-dangerous-html",
-                    "UnsafeResult passes untrusted term data to React dangerouslySetInnerHTML.",
+                    "UnsafeResult passes user-supplied content to React dangerouslySetInnerHTML.",
                     _find_anchor(
                         django_files,
                         react_path,
-                        "export function UnsafeResult({ term }) {",
-                        "  return <div dangerouslySetInnerHTML={{ __html: term }} />;",
+                        "export function UnsafeResult({ userSuppliedTerm }) {",
+                        "  return <div dangerouslySetInnerHTML={{ __html: userSuppliedTerm }} />;",
                     ),
-                    ("UnsafeResult", "unsafe result", "unsafe React path"),
+                    _REACT_UNSAFE_SUBJECT_ALIASES,
                     ("dangerouslySetInnerHTML", "HTML injection", "DOM XSS"),
-                    (
-                        "term",
-                        "raw HTML",
-                        "user input",
-                        "untrusted input",
-                        "untrusted content",
-                    ),
+                    _REACT_DIRECT_FLOW_ALIASES,
+                    _REACT_UNTRUSTED_PROVENANCE_ALIASES,
                     polarity=(
                         _polarity(True, "dangerouslySetInnerHTML", "HTML injection"),
-                        _polarity(False, "React escapes", "escaped by React"),
+                        _polarity(
+                            False,
+                            "React escapes",
+                            "escaped by React",
+                            "escaped",
+                            "encoded",
+                            "HTML encoded",
+                            "entity encoded",
+                        ),
+                        _polarity(
+                            False,
+                            "safe",
+                            "trusted",
+                            "sanitized",
+                            "sanitised",
+                            "constant markup",
+                            "static markup",
+                        ),
+                        _polarity(
+                            False,
+                            "block",
+                            "blocks",
+                            "filter",
+                            "filters",
+                            "keeps away",
+                            "prevent",
+                            "prevents",
+                        ),
                     ),
                 ),
                 _claim(
                     "react-jsx-control",
-                    "SafeResult renders term as a JSX child, so React escapes it as text.",
+                    "SafeResult renders userSuppliedTerm as a JSX child, so React escapes it as text.",
                     _find_anchor(
                         django_files,
                         react_path,
-                        "export function SafeResult({ term }) {",
-                        "  return <div>{term}</div>;",
+                        "export function SafeResult({ userSuppliedTerm }) {",
+                        "  return <div>{userSuppliedTerm}</div>;",
                     ),
                     ("SafeResult", "safe result", "safe React path"),
                     (
@@ -2798,20 +3114,27 @@ def default_cases() -> tuple[BenchmarkCase, ...]:
                         "JSX expression",
                         "JSX interpolation",
                         "JSX syntax",
+                        "JSX tags",
+                        "plain JSX",
                         "renders term",
                         "React child",
                         "React element",
                         "normal React element",
                         "renders content",
+                        "renders text content",
                         "renders input",
+                        "renders user-supplied content",
+                        "renders user supplied content",
                     ),
                     (
                         "React escapes",
+                        "escapes HTML",
                         "escaped text",
                         "escapes it as text",
                         "escaping HTML",
                         "escaping content",
                         "escapes content",
+                        "automatically escapes",
                         "plain text",
                         "prevents script execution",
                         "preventing script execution",
@@ -2821,16 +3144,18 @@ def default_cases() -> tuple[BenchmarkCase, ...]:
                         "prevents DOM injection",
                         "mitigating DOM injection",
                     ),
-                    ("term", "input", "content"),
+                    ("term", "input", "content", "user data"),
                     polarity=(
                         _polarity(
                             True,
                             "React escapes",
+                            "escapes HTML",
                             "escaped text",
                             "escapes it as text",
                             "escaping HTML",
                             "escaping content",
                             "escapes content",
+                            "automatically escapes",
                             "plain text",
                             "prevents script execution",
                             "preventing script execution",
@@ -2852,19 +3177,36 @@ def default_cases() -> tuple[BenchmarkCase, ...]:
                         "package.json",
                         '{"dependencies":{"react":"18.3.1"}}',
                     ),
-                    ("package.json", "dependency metadata", "declared stack"),
-                    ("React",),
-                    ("18.3.1",),
-                    ("dependency", "declares", "lists", "includes"),
-                    polarity=(
-                        _polarity(True, "dependency", "declares", "lists", "includes"),
+                    (
+                        "package.json",
+                        "declared stack",
+                        "React framework",
+                        "React dependency",
                     ),
+                    ("React",),
+                    ("18.3.1", "v18.3.1"),
+                    ("dependency", "declares", "lists", "includes"),
+                    polarity=(_polarity(True, "dependency", "declares", "lists", "includes"),),
                 ),
             ),
             required_observations=(
                 ObservationRequirement("read_file", django_path),
                 ObservationRequirement("read_file", react_path),
                 ObservationRequirement("read_file", "package.json"),
+            ),
+            supplemental_claims=(
+                _claim(
+                    "django-framework-import",
+                    "projects/views.py imports django.db, confirming the Django backend.",
+                    _find_anchor(
+                        django_files,
+                        django_path,
+                        "from django.db import connection",
+                    ),
+                    ("django.db", "django import"),
+                    ("import", "imports", "uses", "framework", "backend", "back-end"),
+                    polarity=(_polarity(True, "import", "imports", "uses", "framework"),),
+                ),
             ),
         ),
         BenchmarkCase(
@@ -2886,6 +3228,7 @@ def default_cases() -> tuple[BenchmarkCase, ...]:
                         pytorch_path,
                         "def evaluate_bad(model, loader):",
                         "    model.train()",
+                        "    return sum(loss(model(x), y) for x, y in loader)",
                     ),
                     ("evaluate_bad", "bad evaluation"),
                     ("model.train", "train mode", "training mode"),
@@ -2898,6 +3241,8 @@ def default_cases() -> tuple[BenchmarkCase, ...]:
                         "dropout",
                         "batch normalization",
                         "autograd enabled",
+                        "without disabling gradient tracking",
+                        "without inference mode",
                     ),
                     polarity=(
                         _polarity(True, "model.train", "train mode", "training mode"),
@@ -2913,6 +3258,7 @@ def default_cases() -> tuple[BenchmarkCase, ...]:
                         "def evaluate_safe(model, loader):",
                         "    model.eval()",
                         "    with torch.inference_mode():",
+                        "        return sum(loss(model(x), y) for x, y in loader)",
                     ),
                     ("evaluate_safe", "safe evaluation"),
                     ("model.eval", "eval mode", "evaluation mode"),
