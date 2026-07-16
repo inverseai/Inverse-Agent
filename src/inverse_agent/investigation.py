@@ -654,6 +654,7 @@ class InvestigationLoop:
         initial_schema_retries_used: int = 0,
         initial_physical_attempts_used: int = 0,
         initial_resume_request_kind: str = "decision",
+        initial_final_answer_required: bool = False,
         initial_compaction_notes: str = "",
         initial_compacted_observation_ids: tuple[str, ...] = (),
     ) -> InvestigationReport:
@@ -665,6 +666,12 @@ class InvestigationLoop:
             raise ValueError("persisted logical physical-attempt state is invalid")
         if initial_resume_request_kind not in {"decision", "compaction"}:
             raise ValueError("persisted model request kind is invalid")
+        if not isinstance(initial_final_answer_required, bool):
+            raise ValueError("persisted final-answer-required state is invalid")
+        if initial_final_answer_required and (
+            initial_resume_request_kind != "decision" or initial_physical_attempts_used == 0
+        ):
+            raise ValueError("persisted final-answer-required state is inconsistent")
         if not isinstance(initial_compaction_notes, str):
             raise ValueError("persisted compaction notes are invalid")
         if len(initial_compaction_notes) > 4096:
@@ -846,6 +853,8 @@ class InvestigationLoop:
             self.planner.resume_schema_retries_used = initial_schema_retries_used
         if hasattr(self.planner, "resume_physical_attempts_used"):
             self.planner.resume_physical_attempts_used = initial_physical_attempts_used
+        if hasattr(self.planner, "resume_final_answer_required"):
+            self.planner.resume_final_answer_required = initial_final_answer_required
 
         while True:
             if self.cancel_requested is not None and self.cancel_requested():

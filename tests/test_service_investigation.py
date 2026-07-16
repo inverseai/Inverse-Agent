@@ -994,6 +994,139 @@ def test_restart_conservatively_charges_an_in_flight_model_request(
     ]
 
 
+def test_interrupted_final_answer_retry_stays_final_only_after_recovery(
+    tmp_path: Path,
+) -> None:
+    workspace_root = tmp_path / "workspaces"
+    workspace = workspace_root / "project"
+    workspace.mkdir(parents=True)
+    service = AgentService(
+        workspace_root=workspace_root,
+        state_dir=tmp_path / "state",
+        approval_secret=SECRET,
+        investigation_planner_factory=lambda _record: ScriptedInvestigationPlanner(),
+    )
+
+    class ToolOnlyClient:
+        last_response_metadata = None
+
+        def __init__(self) -> None:
+            self.schemas: list[object] = []
+
+        def complete_structured_json(self, **kwargs: object) -> dict[str, object]:
+            self.schemas.append(kwargs["schema"])
+            return {
+                "action": "list_files",
+                "path": ".",
+                "query": "",
+                "glob": "",
+                "based_on_observation_id": "",
+                "start_line": 1,
+                "max_lines": 200,
+                "summary": "",
+                "condition_holds": True,
+                "complete": True,
+                "findings": [],
+                "next_actions": [],
+                "citations": [],
+            }
+
+    usage: dict[str, int | float] = {
+        "decisions_used": 1,
+        "tool_calls_used": 0,
+        "physical_requests_used": 2,
+        "command_calls_used": 0,
+        "completion_tokens_used": 4096,
+        "completion_tokens_charged": 4096,
+        "completion_tokens_requested": 4096,
+        "observation_bytes_used": 0,
+        "active_seconds": 0.1,
+        "transport_retries": 0,
+        "schema_retries": 1,
+    }
+    try:
+        service.trust_workspace(
+            workspace,
+            trusted_by="tester",
+            scope=AttestationScope.SOURCE_READ,
+        )
+        created = service.create_run(
+            goal="Finish the durable answer",
+            workspace=workspace,
+            domain=Domain.GENERIC,
+            kind=RunKind.INVESTIGATION,
+            autonomy_level=AutonomyLevel.ADVISORY,
+        )
+        service._stop_worker.set()
+        service._wake_worker.set()
+        service._worker.join(timeout=5)
+        service.start(created.run_id, wait=False)
+        item = service.runs.claim_next_work()
+        assert item is not None
+        service.runs.set_running(created.run_id, expected_status=RunStatus.STARTING)
+        service.runs.mark_work_started(item.work_id)
+        service.runs.update_investigation_progress(
+            created.run_id,
+            usage=usage,
+            event_kind="investigation.model_request_started",
+            event_payload={
+                **usage,
+                "request": {
+                    "request_index": 2,
+                    "logical_decision": 1,
+                    "requested_completion_tokens": 4096,
+                    "charged_completion_tokens": 4096,
+                    "started_at": time.time(),
+                    "retry_kind": "schema",
+                    "transport_retries_used": 0,
+                    "schema_retries_used": 1,
+                    "physical_attempts_used": 2,
+                    "request_kind": "decision",
+                    "final_answer_required": True,
+                },
+            },
+        )
+
+        interrupted = service._investigation_recovery(created.run_id)
+        assert interrupted.in_flight_request is not None
+        assert interrupted.in_flight_request.final_answer_required is True
+        resumed = service._record_interrupted_model_request(
+            service.runs.require(created.run_id),
+            interrupted,
+        )
+        assert resumed.in_flight_request is None
+        assert resumed.resume_final_answer_required is True
+
+        client = ToolOnlyClient()
+        report = InvestigationLoop(
+            planner=ModelInvestigationPlanner(
+                client=client,
+                max_auto_reads=0,
+                max_nudges=0,
+            ),
+            trust=service.trust,
+        ).run(
+            run_id=created.run_id,
+            goal=created.goal,
+            workspace=workspace,
+            prior_usage=service.runs.require(created.run_id).usage,
+            initial_model_calls=resumed.model_calls,
+            initial_transport_retries_used=resumed.resume_transport_retries_used,
+            initial_schema_retries_used=resumed.resume_schema_retries_used,
+            initial_physical_attempts_used=resumed.resume_physical_attempts_used,
+            initial_resume_request_kind=resumed.resume_request_kind,
+            initial_final_answer_required=resumed.resume_final_answer_required,
+        )
+    finally:
+        service.close()
+
+    schema = client.schemas[0]
+    assert isinstance(schema, dict)
+    assert schema["properties"]["action"]["enum"] == ["final_answer"]
+    assert report.stop_reason.value == "protocol_failure"
+    assert report.error == "final-answer-only request returned a tool call"
+
+
 def test_durable_compaction_state_rehydrates_without_orphaning_catalog(
     tmp_path: Path,
 ) -> None:

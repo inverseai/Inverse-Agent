@@ -3591,6 +3591,7 @@ class ModelInvestigationPlanner:
     resume_transport_retries_used: int = field(default=0, init=False, repr=False)
     resume_schema_retries_used: int = field(default=0, init=False, repr=False)
     resume_physical_attempts_used: int = field(default=0, init=False, repr=False)
+    resume_final_answer_required: bool = field(default=False, init=False, repr=False)
     _turn: int = field(default=0, init=False)
     _auto_reads: int = field(default=0, init=False)
     _nudges: int = field(default=0, init=False)
@@ -4152,6 +4153,7 @@ class ModelInvestigationPlanner:
                     "schema_retries_used": schema_retries_used,
                     "physical_attempts_used": physical_attempts_used,
                     "request_kind": request_kind,
+                    "final_answer_required": final_answer_required,
                 }
             )
         started_at = time.monotonic()
@@ -4481,15 +4483,22 @@ class ModelInvestigationPlanner:
         resume_transport = self.resume_transport_retries_used if self._turn == 1 else 0
         resume_schema = self.resume_schema_retries_used if self._turn == 1 else 0
         resume_physical = self.resume_physical_attempts_used if self._turn == 1 else 0
+        resume_final_answer_required = (
+            self.resume_final_answer_required if self._turn == 1 else False
+        )
         if self._turn == 1:
             self.resume_request_kind = "decision"
             self.resume_transport_retries_used = 0
             self.resume_schema_retries_used = 0
             self.resume_physical_attempts_used = 0
+            self.resume_final_answer_required = False
         command_recovery_complete = self._command_recovery_is_complete(catalog)
+        initial_final_answer_required = command_recovery_complete or (
+            resume_kind == "decision" and resume_final_answer_required
+        )
         complex_answer_likely = sum(_render_block(item)[1] for item in catalog) >= 3
         completion_reserve = self._completion_allowance(
-            final_answer_required=command_recovery_complete,
+            final_answer_required=initial_final_answer_required,
             complex_answer_likely=complex_answer_likely,
         )
         history_budget = self._history_token_budget(
@@ -4523,7 +4532,7 @@ class ModelInvestigationPlanner:
                 physical_attempts_used=resume_physical if resume_kind == "compaction" else 0,
             )
             completion_reserve = self._completion_allowance(
-                final_answer_required=command_recovery_complete,
+                final_answer_required=initial_final_answer_required,
                 complex_answer_likely=complex_answer_likely,
             )
             history_budget = self._history_token_budget(
@@ -4552,8 +4561,12 @@ class ModelInvestigationPlanner:
             (self.context_tokens + 9) // 10,
             2 * self.max_estimator_error_tokens,
         )
-        decision_system = self._system_prompt(command_recovery_complete=command_recovery_complete)
-        decision_schema = self._decision_schema(command_recovery_complete=command_recovery_complete)
+        decision_system = self._system_prompt(
+            command_recovery_complete=initial_final_answer_required
+        )
+        decision_schema = self._decision_schema(
+            command_recovery_complete=initial_final_answer_required
+        )
         if (
             self._prompt_token_bound(
                 prompt,
@@ -4571,7 +4584,7 @@ class ModelInvestigationPlanner:
         pending_retry: str | None = None
         pending_failure: Exception | None = None
         schema_retry_correction = _SCHEMA_RETRY_CORRECTION if schema_used > 0 else None
-        final_answer_retry_required = command_recovery_complete
+        final_answer_retry_required = initial_final_answer_required
 
         def record_executed_retry(kind: str | None) -> None:
             if kind == "transport":
@@ -4608,6 +4621,9 @@ class ModelInvestigationPlanner:
             request_schema = self._decision_schema(
                 command_recovery_complete=request_final_answer_required
             )
+            request_system = self._system_prompt(
+                command_recovery_complete=request_final_answer_required
+            )
             request_prompt = self._build_prompt(
                 goal=goal,
                 observations=observations,
@@ -4623,7 +4639,7 @@ class ModelInvestigationPlanner:
                 if (
                     self._prompt_token_bound(
                         request_prompt,
-                        system=decision_system,
+                        system=request_system,
                         schema=request_schema,
                     )
                     + request_completion_reserve
@@ -4634,7 +4650,7 @@ class ModelInvestigationPlanner:
                 payload = self._request(
                     request_prompt,
                     request_kind="decision",
-                    system=decision_system,
+                    system=request_system,
                     schema_name="investigation_decision",
                     schema=request_schema,
                     retry_kind=request_retry_kind,
@@ -4653,6 +4669,8 @@ class ModelInvestigationPlanner:
                 payload_received = True
                 decision = parse_decision(payload)
                 parsed_decision = decision
+                if request_final_answer_required and not isinstance(decision, AgentAnswer):
+                    raise ValueError("final-answer-only request returned a tool call")
                 if isinstance(decision, AgentAnswer):
                     decision = _recover_inline_citations(decision, catalog, rendered_ids)
                     decision = _split_labeled_broad_citation(decision, catalog, rendered_ids)

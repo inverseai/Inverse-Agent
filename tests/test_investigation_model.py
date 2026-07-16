@@ -817,11 +817,14 @@ def test_grounded_malformed_answer_gets_one_accounted_schema_retry() -> None:
     )
     client = FakeClient([invalid, valid])
     planner = ModelInvestigationPlanner(client=client, max_auto_reads=0, max_nudges=0)
+    request_events: list[dict[str, int | float | str | None]] = []
+    planner.request_event_sink = request_events.append
     decision = planner.decide(goal="x", catalog=(evidence,))
     assert isinstance(decision, AgentAnswer)
     assert decision.findings == ("HEAD has no first parent.",)
     assert planner.schema_retries == 1
     assert [call.outcome for call in planner.model_calls] == ["schema_error", "success"]
+    assert [event["final_answer_required"] for event in request_events] == [False, True]
     correction = json.loads(client.prompts[1])["retry_correction"]
     assert "one or more non-empty findings" in correction
     retry_properties = client.schemas[1]["properties"]
@@ -830,6 +833,24 @@ def test_grounded_malformed_answer_gets_one_accounted_schema_retry() -> None:
     assert retry_properties["findings"]["minItems"] == 1
     assert retry_properties["next_actions"]["minItems"] == 1
     assert retry_properties["citations"]["minItems"] == 1
+
+
+def test_resumed_final_answer_retry_remains_final_only_and_rejects_tool_call() -> None:
+    client = FakeClient([_base("list_files", path=".")])
+    planner = ModelInvestigationPlanner(client=client, max_auto_reads=0, max_nudges=0)
+    planner.resume_schema_retries_used = 1
+    planner.resume_physical_attempts_used = 2
+    planner.resume_final_answer_required = True
+    request_events: list[dict[str, int | float | str | None]] = []
+    planner.request_event_sink = request_events.append
+
+    with pytest.raises(ValueError, match="final-answer-only request returned a tool call"):
+        planner.decide(goal="finish the answer", catalog=())
+
+    assert client.schemas[0]["properties"]["action"]["enum"] == ["final_answer"]
+    assert request_events[0]["schema_retries_used"] == 1
+    assert request_events[0]["physical_attempts_used"] == 3
+    assert request_events[0]["final_answer_required"] is True
 
 
 def test_body_only_source_citation_expands_to_immediate_named_declaration() -> None:
