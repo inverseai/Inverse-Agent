@@ -447,6 +447,11 @@ def _add_model_arguments(parser: argparse.ArgumentParser) -> None:
         choices=(16_384, 24_576, 32_768, 49_152),
     )
     parser.add_argument("--model-estimator-bytes-per-token", type=float)
+    parser.add_argument(
+        "--model-reasoning-effort",
+        choices=("low", "medium", "high"),
+        help="Optional reasoning capability to request from a supporting endpoint",
+    )
     parser.add_argument("--model-allow-remote", action="store_true")
 
 
@@ -655,6 +660,14 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     benchmark_investigation.add_argument(
+        "--model-reasoning-effort",
+        choices=("low", "medium", "high"),
+        help=(
+            "Explicit endpoint reasoning capability; defaults to "
+            "INVERSE_AGENT_MODEL_REASONING_EFFORT and is required for model runs"
+        ),
+    )
+    benchmark_investigation.add_argument(
         "--model-allow-remote",
         action="store_true",
         help="Permit a non-loopback model endpoint (requires https)",
@@ -687,7 +700,11 @@ def benchmark_investigation_command(args: argparse.Namespace) -> int:
         import os
 
         from inverse_agent.investigation_model import ModelInvestigationPlanner
-        from inverse_agent.planner import OpenAICompatibleClient, validate_model_endpoint
+        from inverse_agent.planner import (
+            MODEL_REASONING_EFFORTS,
+            OpenAICompatibleClient,
+            validate_model_endpoint,
+        )
 
         base_url = args.model_base_url or os.environ.get(
             "INVERSE_AGENT_MODEL_BASE_URL", "http://127.0.0.1:1234/v1"
@@ -701,13 +718,6 @@ def benchmark_investigation_command(args: argparse.Namespace) -> int:
         }
         allow_remote = env_allows_remote and bool(getattr(args, "model_allow_remote", False))
         normalized_url = validate_model_endpoint(base_url, allow_remote=allow_remote)
-        client = OpenAICompatibleClient(
-            base_url=normalized_url,
-            model=args.model,
-            api_key=os.environ.get("INVERSE_AGENT_MODEL_API_KEY") or None,
-            allow_remote=allow_remote,
-            timeout_seconds=120,
-        )
         context_tokens = args.model_context_tokens
         if context_tokens is None:
             raw_context = os.environ.get("INVERSE_AGENT_MODEL_CONTEXT_TOKENS")
@@ -736,6 +746,23 @@ def benchmark_investigation_command(args: argparse.Namespace) -> int:
                 ) from exc
         if not 1.0 <= estimator_bytes_per_token <= 4.0:
             raise ValueError("model estimator bytes per token must be between 1.0 and 4.0")
+        reasoning_effort = args.model_reasoning_effort or os.environ.get(
+            "INVERSE_AGENT_MODEL_REASONING_EFFORT"
+        )
+        if reasoning_effort is None:
+            raise ValueError(
+                "model investigation benchmark requires an explicit reasoning-effort value"
+            )
+        if reasoning_effort not in MODEL_REASONING_EFFORTS:
+            raise ValueError("model reasoning effort must be low, medium, or high")
+        client = OpenAICompatibleClient(
+            base_url=normalized_url,
+            model=args.model,
+            api_key=os.environ.get("INVERSE_AGENT_MODEL_API_KEY") or None,
+            allow_remote=allow_remote,
+            timeout_seconds=120,
+            reasoning_effort=reasoning_effort,
+        )
 
         from inverse_agent.investigation import AgentBudget
 
@@ -747,6 +774,7 @@ def benchmark_investigation_command(args: argparse.Namespace) -> int:
                 estimator_bytes_per_token=estimator_bytes_per_token,
                 goal_hint=case.model_hint,
                 allowed_commands=case.command_tools,
+                command_recovery_dependencies=case.command_recovery_dependencies,
             )
 
         # The gate uses the same calibrated contract as production investigations.
@@ -777,6 +805,7 @@ def benchmark_investigation_command(args: argparse.Namespace) -> int:
             "endpoint_model_consistent": endpoint_model_consistent,
             "context_tokens": context_tokens,
             "estimator_bytes_per_token": estimator_bytes_per_token,
+            "reasoning_effort": reasoning_effort,
         }
     else:
         result = run_benchmark(cases)

@@ -152,7 +152,13 @@ _COMMAND_PROMPT_APPENDIX = (
     "command is an observation: diagnose it and replan instead of repeating it. "
     "When selecting a different command to recover from a failed command, set "
     "based_on_observation_id to that failed command's exact observation ID; "
-    "otherwise set it to an empty string."
+    "otherwise set it to an empty string. command_recovery_dependencies maps each "
+    "recovery command to the command that must already have a failed observation. "
+    "Never select a mapped recovery command before that required failure."
+)
+_COMMAND_FINALIZATION_APPENDIX = (
+    "\nThe declared command recovery sequence is complete. Return final_answer now; "
+    "do not select another tool or command."
 )
 _SCHEMA_RETRY_CORRECTION = (
     "The previous response violated the required decision protocol. Return exactly one "
@@ -524,6 +530,15 @@ def _normalize_path(value: object) -> str:
     return text or "."
 
 
+def _normalize_command_name(value: object) -> str:
+    """Normalize the model-visible command observation path to its frozen name."""
+
+    command = str(value or "").strip()
+    if command.startswith("command/"):
+        command = command.removeprefix("command/")
+    return command
+
+
 def parse_decision(payload: Mapping[str, Any]) -> Decision:
     action = payload.get("action")
     if action == "final_answer":
@@ -559,7 +574,7 @@ def parse_decision(payload: Mapping[str, Any]) -> Decision:
             max_lines=min(200, max(1, int(payload.get("max_lines") or 200))),
         )
     if action == "run_command":
-        command = str(payload.get("path") or "").strip()
+        command = _normalize_command_name(payload.get("path"))
         if not command:
             raise ValueError("run_command requires an available command name in path")
         raw_dependency = _coerce_optional(payload.get("based_on_observation_id"))
@@ -571,6 +586,36 @@ def parse_decision(payload: Mapping[str, Any]) -> Decision:
             ),
         )
     raise ValueError(f"model returned an unsupported action: {action!r}")
+
+
+def _grounded_answer_structure_error(
+    answer: AgentAnswer,
+    catalog: tuple[ToolObservation, ...],
+) -> str | None:
+    """Return a retryable shape error once source-bearing evidence exists."""
+
+    has_evidence = any(
+        (observation.tool == "read_file" or observation.metadata.get("citable_command"))
+        and bool(observation.content_hash)
+        and bool(observation.lines)
+        for observation in catalog
+    )
+    if not has_evidence:
+        return None
+    if not answer.summary.strip():
+        return "final answer summary is empty"
+    if not answer.findings or any(not finding.strip() for finding in answer.findings):
+        return "final answer must contain non-empty findings"
+    if not answer.next_actions or any(not action.strip() for action in answer.next_actions):
+        return "final answer must contain non-empty recommended next actions"
+    if not answer.citations or len(answer.findings) != len(answer.citations):
+        return "each finding must have one positionally corresponding citation"
+    citation_ranges = {
+        (citation.path, citation.start_line, citation.end_line) for citation in answer.citations
+    }
+    if len(citation_ranges) != len(answer.citations):
+        return "each finding must use a distinct citation range"
+    return None
 
 
 @dataclass
@@ -587,6 +632,7 @@ class ModelInvestigationPlanner:
     client: SupportsStructuredJson
     goal_hint: str = ""
     allowed_commands: tuple[str, ...] = ()
+    command_recovery_dependencies: tuple[tuple[str, str], ...] = ()
     max_transport_retries: int = 1
     max_schema_retries: int = 1
     max_auto_reads: int = 3
@@ -632,6 +678,23 @@ class ModelInvestigationPlanner:
             not command or len(command) > 120 for command in self.allowed_commands
         ):
             raise ValueError("allowed_commands must contain unique non-empty names")
+        dependency_targets = tuple(
+            target for target, _source in self.command_recovery_dependencies
+        )
+        if (
+            len(set(dependency_targets)) != len(dependency_targets)
+            or any(
+                type(target) is not str
+                or type(source) is not str
+                or target not in self.allowed_commands
+                or source not in self.allowed_commands
+                or target == source
+                for target, source in self.command_recovery_dependencies
+            )
+        ):
+            raise ValueError(
+                "command recovery dependencies must uniquely reference distinct allowed commands"
+            )
         if not 0 <= self.max_transport_retries <= 1:
             raise ValueError("max_transport_retries must be 0 or 1")
         if not 0 <= self.max_schema_retries <= 1:
@@ -750,11 +813,77 @@ class ModelInvestigationPlanner:
             )
         return allowance
 
-    def _system_prompt(self) -> str:
-        return _SYSTEM_PROMPT + (_COMMAND_PROMPT_APPENDIX if self.allowed_commands else "")
+    def _system_prompt(self, *, command_recovery_complete: bool = False) -> str:
+        prompt = _SYSTEM_PROMPT + (_COMMAND_PROMPT_APPENDIX if self.allowed_commands else "")
+        if command_recovery_complete:
+            prompt += _COMMAND_FINALIZATION_APPENDIX
+        return prompt
 
-    def _decision_schema(self) -> dict[str, Any]:
-        return _schema_for_commands(self.allowed_commands)
+    def _decision_schema(self, *, command_recovery_complete: bool = False) -> dict[str, Any]:
+        schema = _schema_for_commands(self.allowed_commands)
+        if not command_recovery_complete:
+            return schema
+        properties = dict(schema["properties"])
+        action = dict(properties["action"])
+        action["enum"] = ["final_answer"]
+        properties["action"] = action
+        return {**schema, "properties": properties}
+
+    def _command_recovery_is_complete(self, catalog: tuple[ToolObservation, ...]) -> bool:
+        if not self.command_recovery_dependencies:
+            return False
+        for target, source in self.command_recovery_dependencies:
+            failed_sources = tuple(
+                observation
+                for observation in catalog
+                if observation.tool == "run_command"
+                and observation.metadata.get("command_name") == source
+                and observation.metadata.get("status") == "failed"
+            )
+            if len(failed_sources) != 1:
+                return False
+            if not any(
+                observation.tool == "run_command"
+                and observation.metadata.get("command_name") == target
+                and observation.metadata.get("status") == "succeeded"
+                and observation.metadata.get("based_on_observation_id")
+                == failed_sources[0].observation_id
+                for observation in catalog
+            ):
+                return False
+        return True
+
+    def _bind_unique_failed_command_dependency(
+        self,
+        decision: ToolCall,
+        catalog: tuple[ToolObservation, ...],
+    ) -> ToolCall:
+        """Bind an omitted recovery dependency when prior evidence is unambiguous.
+
+        This only preserves a causal edge already present in the observation
+        catalog. It never selects a command, expands the allowlist, or repairs an
+        explicit dependency supplied by the model.
+        """
+
+        if decision.tool != "run_command" or decision.based_on_observation_id is not None:
+            return decision
+        required_command = dict(self.command_recovery_dependencies).get(decision.command or "")
+        if required_command is None:
+            return decision
+        candidates = tuple(
+            observation
+            for observation in catalog
+            if observation.tool == "run_command"
+            and observation.metadata.get("status") == "failed"
+            and observation.metadata.get("command_name") == required_command
+        )
+        if not candidates:
+            raise ValueError(
+                "model selected a recovery command before its required failed observation"
+            )
+        if len(candidates) != 1:
+            return decision
+        return replace(decision, based_on_observation_id=candidates[0].observation_id)
 
     def _prompt_token_bound(
         self,
@@ -820,6 +949,9 @@ class ModelInvestigationPlanner:
                 "goal": goal,
                 "hint": self.goal_hint,
                 "available_commands": list(self.allowed_commands),
+                "command_recovery_dependencies": {
+                    target: source for target, source in self.command_recovery_dependencies
+                },
                 "turn": self._turn,
                 "observation_catalog": observation_catalog or [],
                 "pinned_investigation_notes": pinned_notes,
@@ -1306,8 +1438,21 @@ class ModelInvestigationPlanner:
             (self.context_tokens + 9) // 10,
             2 * self.max_estimator_error_tokens,
         )
+        command_recovery_complete = self._command_recovery_is_complete(catalog)
+        decision_system = self._system_prompt(
+            command_recovery_complete=command_recovery_complete
+        )
+        decision_schema = self._decision_schema(
+            command_recovery_complete=command_recovery_complete
+        )
         if (
-            self._prompt_token_bound(prompt) + completion_reserve + safety_margin
+            self._prompt_token_bound(
+                prompt,
+                system=decision_system,
+                schema=decision_schema,
+            )
+            + completion_reserve
+            + safety_margin
             > self.context_tokens
         ):
             raise PlannerBudgetError("model context budget exhausted")
@@ -1357,16 +1502,22 @@ class ModelInvestigationPlanner:
             )
             try:
                 if (
-                    self._prompt_token_bound(request_prompt) + completion_reserve + safety_margin
+                    self._prompt_token_bound(
+                        request_prompt,
+                        system=decision_system,
+                        schema=decision_schema,
+                    )
+                    + completion_reserve
+                    + safety_margin
                     > self.context_tokens
                 ):
                     raise PlannerBudgetError("model context budget exhausted")
                 payload = self._request(
                     request_prompt,
                     request_kind="decision",
-                    system=self._system_prompt(),
+                    system=decision_system,
                     schema_name="investigation_decision",
-                    schema=self._decision_schema(),
+                    schema=decision_schema,
                     retry_kind=request_retry_kind,
                     transport_retries_used=transport_used,
                     schema_retries_used=schema_used,
@@ -1380,12 +1531,18 @@ class ModelInvestigationPlanner:
                 )
                 payload_received = True
                 decision = parse_decision(payload)
+                if isinstance(decision, AgentAnswer):
+                    answer_error = _grounded_answer_structure_error(decision, catalog)
+                    if answer_error is not None:
+                        raise ValueError(answer_error)
                 if (
                     isinstance(decision, ToolCall)
                     and decision.tool == "run_command"
                     and decision.command not in self.allowed_commands
                 ):
                     raise ValueError("model selected a command that is unavailable in this run")
+                if isinstance(decision, ToolCall):
+                    decision = self._bind_unique_failed_command_dependency(decision, catalog)
                 pending_retry = None
                 pending_failure = None
             except PlannerAttestationError:

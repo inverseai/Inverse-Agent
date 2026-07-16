@@ -40,10 +40,11 @@ Start the local GPT-OSS-20B model and Codex-style workbench together. The worksp
 ```powershell
 .\scripts\start-workbench.ps1 -WorkspaceRoot "D:\Office Repos" `
   -ModelContextTokens 32768 `
-  -ModelEstimatorBytesPerToken 2.0
+  -ModelEstimatorBytesPerToken 2.0 `
+  -ModelReasoningEffort high
 ```
 
-The numbers above are examples, not defaults: use the pair produced by calibration for the exact local model, LM Studio build, and GPU configuration. Omitting both keeps verification available and leaves investigation disabled.
+The numbers above are examples, not defaults: use the pair produced by calibration for the exact local model, LM Studio build, and GPU configuration. Omitting both keeps verification available and leaves investigation disabled. Reasoning effort is a separate endpoint capability: the launcher sends it only when explicitly selected, and `default` omits the non-universal request field.
 
 Open the printed loopback URL and enter the two session credentials shown in the same terminal. The operator token can profile workspaces and create tasks. The separate approver token is required to trust a workspace, approve a command, or decline a pending command. Operator access lasts only for the browser tab; approval access is memory-only and must be re-entered after a reload.
 
@@ -113,11 +114,12 @@ $env:INVERSE_AGENT_MODEL_NAME = "inverse-gpt-oss-20b"
 $env:INVERSE_AGENT_MODEL_BASE_URL = "http://127.0.0.1:1234/v1"
 $env:INVERSE_AGENT_MODEL_CONTEXT_TOKENS = "32768"
 $env:INVERSE_AGENT_MODEL_ESTIMATOR_BYTES_PER_TOKEN = "2.0"
+$env:INVERSE_AGENT_MODEL_REASONING_EFFORT = "high"
 uv run inverse-agent model-check
 uv run inverse-agent start D:\work\django-app --domain django
 ```
 
-When neither model variable is present, Inverse-Agent remains deterministic. Model name and base URL must be configured together; investigation additionally requires the calibrated context/estimator pair and a numeric loopback endpoint. Model failures stop planning and never silently fall back. `evaluate` remains deterministic unless `--use-model` is supplied explicitly.
+When neither model variable is present, Inverse-Agent remains deterministic. Model name and base URL must be configured together; investigation additionally requires the calibrated context/estimator pair and a numeric loopback endpoint. Reasoning effort is optional for production but, when configured, is validated, fingerprinted, and sent only as an explicit endpoint capability. Model failures stop planning and never silently fall back. `evaluate` remains deterministic unless `--use-model` is supplied explicitly.
 
 Remote model endpoints are denied by default. They require HTTPS, `INVERSE_AGENT_MODEL_ALLOW_REMOTE=1`, and the `--model-allow-remote` flag together. API keys are accepted only through `INVERSE_AGENT_MODEL_API_KEY`, never through a command-line flag.
 

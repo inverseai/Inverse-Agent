@@ -14,6 +14,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from inverse_agent.planner import (
+    MODEL_REASONING_EFFORTS,
     DeterministicPlanner,
     OpenAICompatibleClient,
     Planner,
@@ -29,6 +30,7 @@ MODEL_ENV_NAMES = (
     "INVERSE_AGENT_MODEL_MAX_ACTIONS",
     "INVERSE_AGENT_MODEL_CONTEXT_TOKENS",
     "INVERSE_AGENT_MODEL_ESTIMATOR_BYTES_PER_TOKEN",
+    "INVERSE_AGENT_MODEL_REASONING_EFFORT",
     "INVERSE_AGENT_MODEL_ALLOW_REMOTE",
 )
 _MODEL_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/@:+-]{0,255}")
@@ -45,6 +47,7 @@ class PlannerConfig:
     allow_remote: bool = False
     context_tokens: int | None = None
     estimator_bytes_per_token: float | None = None
+    reasoning_effort: str | None = None
 
     @property
     def investigation_available(self) -> bool:
@@ -71,6 +74,7 @@ class PlannerConfig:
             "timeout_seconds": self.timeout_seconds,
             "context_tokens": self.context_tokens,
             "estimator_bytes_per_token": self.estimator_bytes_per_token,
+            "reasoning_effort": self.reasoning_effort,
         }
         canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
         return f"{self.kind}:sha256:{sha256(canonical.encode()).hexdigest()}"
@@ -87,6 +91,7 @@ class PlannerConfig:
             "investigation_available": self.investigation_available,
             "context_tokens": self.context_tokens,
             "estimator_bytes_per_token": self.estimator_bytes_per_token,
+            "reasoning_effort": self.reasoning_effort,
         }
 
 
@@ -145,6 +150,13 @@ def resolve_planner(
     allow_remote = env_allows_remote and flag_allows_remote
     normalized_url = validate_model_endpoint(base_url, allow_remote=allow_remote)
     api_key = values.get("INVERSE_AGENT_MODEL_API_KEY") or None
+    reasoning_effort = _string_override(
+        args,
+        "model_reasoning_effort",
+        values.get("INVERSE_AGENT_MODEL_REASONING_EFFORT"),
+    )
+    if reasoning_effort is not None and reasoning_effort not in MODEL_REASONING_EFFORTS:
+        raise ValueError("model reasoning effort must be low, medium, or high")
     raw_context = _number_override(
         args,
         "model_context_tokens",
@@ -186,6 +198,7 @@ def resolve_planner(
         allow_remote=allow_remote,
         context_tokens=context_tokens,
         estimator_bytes_per_token=estimator_bytes_per_token,
+        reasoning_effort=reasoning_effort,
     )
     client = OpenAICompatibleClient(
         base_url=normalized_url,
@@ -193,6 +206,7 @@ def resolve_planner(
         api_key=api_key,
         timeout_seconds=timeout_seconds,
         allow_remote=allow_remote,
+        reasoning_effort=reasoning_effort,
     )
     return PlannerResolution(StructuredPlanner(client, max_actions=max_actions), config, client)
 

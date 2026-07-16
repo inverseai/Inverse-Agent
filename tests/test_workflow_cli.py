@@ -30,6 +30,7 @@ def test_workbench_launcher_clears_omitted_calibration_pair() -> None:
     assert "$hasContextCalibration -ne $hasEstimatorCalibration" in script
     assert "$env:INVERSE_AGENT_MODEL_CONTEXT_TOKENS = $null" in script
     assert "$env:INVERSE_AGENT_MODEL_ESTIMATOR_BYTES_PER_TOKEN = $null" in script
+    assert "$env:INVERSE_AGENT_MODEL_REASONING_EFFORT = $null" in script
 
 
 def _service(

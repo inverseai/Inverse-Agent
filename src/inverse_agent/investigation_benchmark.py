@@ -98,6 +98,25 @@ _FATAL_STOPS = {
     StopReason.PROTOCOL_FAILURE: "unrecovered_model_protocol_failure",
 }
 _HEX_COMMIT = re.compile(r"[0-9a-f]{40,64}\Z", re.ASCII)
+_GIT_IDENTITY_FINDING = re.compile(
+    r"(?:the\s+)?(?:current\s+)?head\s+commit(?:\s+(?:id|hash))?"
+    r"(?:\s+is\s+|\s*:\s*)([0-9a-f]{40,64})[.!]?\Z",
+    re.IGNORECASE | re.ASCII,
+)
+_EXPLICIT_COMMIT_ID = re.compile(
+    r"(?<![0-9a-f])[0-9a-f]{40,64}(?![0-9a-f])",
+    re.IGNORECASE | re.ASCII,
+)
+_GIT_UNRESOLVED_IDENTITY = re.compile(
+    r"\b(?:unavailable|unknown|unresolved|missing)\b"
+    r"|\bnot\s+(?:available|known|found|identified)\b"
+    r"|\bnot\s+found\b"
+    r"|\b(?:failed|unable)\s+to\s+(?:resolve|identify)\b"
+    r"|\b(?:resolution|identification)\s+failed\b"
+    r"|\b(?:cannot|could\s+not|did\s+not|was\s+not|is\s+not|has\s+not)\s+"
+    r"(?:be\s+)?(?:resolve|resolved|identified)\b",
+    re.ASCII,
+)
 _HEX_SHA256 = re.compile(r"[0-9a-f]{64}\Z", re.ASCII)
 _HEX_CHALLENGE_ID = re.compile(r"[0-9a-f]{32}\Z", re.ASCII)
 _COMPLETED_COMMAND = re.compile(r"completed in \d+(?:\.\d+)?s\Z", re.ASCII)
@@ -218,6 +237,7 @@ class BenchmarkCase:
     forbidden_secrets: tuple[str, ...] = ()
     model_hint: str = ""
     command_tools: tuple[str, ...] = ()
+    command_recovery_dependencies: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -792,6 +812,67 @@ def _command_anchor_matches(
     return line_body(observation.lines[offset]).startswith(anchor.required_prefix)
 
 
+def _git_identity_finding_matches(
+    finding: str,
+    citation: SourceCitation,
+    catalog: tuple[ToolObservation, ...],
+) -> bool:
+    """Accept an exact observed HEAD identity without requiring a synonym verb."""
+
+    match = _GIT_IDENTITY_FINDING.fullmatch(finding.strip())
+    if match is None:
+        return False
+    observed_commit = _cited_head_commit(citation, catalog)
+    return observed_commit is not None and secrets.compare_digest(
+        match.group(1).casefold(),
+        observed_commit.casefold(),
+    )
+
+
+def _cited_head_commit(
+    citation: SourceCitation,
+    catalog: tuple[ToolObservation, ...],
+) -> str | None:
+    observation = next(
+        (item for item in catalog if item.observation_id == citation.observation_id),
+        None,
+    )
+    if (
+        observation is None
+        or observation.metadata.get("command_name") != "generic.head_commit"
+        or citation.path != "command/generic.head_commit"
+        or citation.start_line != 1
+        or citation.end_line != 1
+        or not observation.lines
+    ):
+        return None
+    observed_line = line_body(observation.lines[0])
+    prefix = "HEAD commit:"
+    if not observed_line.startswith(prefix):
+        return None
+    observed_commit = observed_line.removeprefix(prefix).strip()
+    return observed_commit if _HEX_COMMIT.fullmatch(observed_commit) is not None else None
+
+
+def _git_explicit_hashes_match_observation(
+    finding: str,
+    citation: SourceCitation,
+    catalog: tuple[ToolObservation, ...],
+) -> bool | None:
+    explicit_hashes = _EXPLICIT_COMMIT_ID.findall(finding)
+    if not explicit_hashes:
+        return None
+    observed_commit = _cited_head_commit(citation, catalog)
+    return observed_commit is not None and all(
+        secrets.compare_digest(commit.casefold(), observed_commit.casefold())
+        for commit in explicit_hashes
+    )
+
+
+def _git_identity_has_unresolved_language(finding: str) -> bool:
+    return _GIT_UNRESOLVED_IDENTITY.search(_normalize_semantics(finding)) is not None
+
+
 def _claim_pair_matches(
     claim: SemanticClaim,
     finding: str,
@@ -800,7 +881,25 @@ def _claim_pair_matches(
     workspace: Path,
     all_claims: tuple[SemanticClaim, ...],
 ) -> bool:
-    if not _semantic_match(claim, finding, all_claims):
+    explicit_hashes_match: bool | None = None
+    if claim.claim_id == "git-head":
+        if _git_identity_has_unresolved_language(finding):
+            return False
+        explicit_hashes_match = _git_explicit_hashes_match_observation(
+            finding,
+            citation,
+            report.catalog,
+        )
+        if explicit_hashes_match is False:
+            return False
+    semantic_match = _semantic_match(claim, finding, all_claims)
+    if (
+        not semantic_match
+        and claim.claim_id == "git-head"
+        and _git_identity_finding_matches(finding, citation, report.catalog)
+    ):
+        semantic_match = True
+    if not semantic_match:
         return False
     if claim.anchor.command is not None:
         return _command_anchor_matches(claim.anchor, citation, report.catalog)
@@ -1920,6 +2019,13 @@ def _suite_definition_payload(cases: object) -> tuple[object, ...] | None:
             or not _is_exact_string_tuple(case.forbidden_secrets)
             or type(case.model_hint) is not str
             or not _is_exact_string_tuple(case.command_tools)
+            or type(case.command_recovery_dependencies) is not tuple
+            or any(
+                type(edge) is not tuple
+                or len(edge) != 2
+                or any(type(command) is not str for command in edge)
+                for edge in case.command_recovery_dependencies
+            )
         ):
             return None
 
@@ -2019,6 +2125,7 @@ def _suite_definition_payload(cases: object) -> tuple[object, ...] | None:
                 case.forbidden_secrets,
                 case.model_hint,
                 case.command_tools,
+                case.command_recovery_dependencies,
             )
         )
     return tuple(projected_cases)
@@ -2681,11 +2788,14 @@ def default_cases() -> tuple[BenchmarkCase, ...]:
             ),
             expected_issue=True,
             model_hint=(
-                "Probe the requested Git relationship directly. If an approved command "
-                "fails, diagnose that observation before selecting a different command, "
-                "and bind the recovery with based_on_observation_id."
+                "First select generic.parent_commit. Only after that approved command returns "
+                "a failed observation, select generic.head_commit and bind the recovery with "
+                "based_on_observation_id. Then return exactly two findings with distinct "
+                "citations: one states that HEAD has no first parent and is the root commit; "
+                "the other states that the current HEAD commit was resolved or identified."
             ),
             command_tools=_GIT_COMMANDS,
+            command_recovery_dependencies=(("generic.head_commit", "generic.parent_commit"),),
         ),
     )
 

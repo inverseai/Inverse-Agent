@@ -25,6 +25,7 @@ MAX_MODEL_RESPONSE_BYTES = 1024 * 1024
 MAX_MODEL_COMPLETION_TOKENS = 4096
 MAX_SUCCESSFUL_RESPONSE_MODEL_HISTORY = 1024
 MAX_OBSERVED_RESPONSE_MODELS = 64
+MODEL_REASONING_EFFORTS = ("low", "medium", "high")
 MODEL_RESPONSE_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/@:+-]{0,255}")
 PLAN_RESPONSE_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -139,11 +140,15 @@ class OpenAICompatibleClient:
         api_key: str | None = None,
         timeout_seconds: int = 60,
         allow_remote: bool = False,
+        reasoning_effort: str | None = None,
     ) -> None:
+        if reasoning_effort is not None and reasoning_effort not in MODEL_REASONING_EFFORTS:
+            raise ValueError("model reasoning effort must be low, medium, or high")
         self.base_url = validate_model_endpoint(base_url, allow_remote=allow_remote)
         self.model = model
         self.api_key = api_key
         self.timeout_seconds = timeout_seconds
+        self.reasoning_effort = reasoning_effort
         self._observed_response_models: set[str] = set()
         self._observed_response_models_overflowed = False
         self._response_model_mismatch_observed = False
@@ -251,25 +256,28 @@ class OpenAICompatibleClient:
             validator = Draft202012Validator(schema_payload)
         except SchemaError as exc:
             raise ValueError("model response schema is invalid") from exc
-        body = json.dumps(
-            {
-                "model": self.model,
-                "messages": [
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": prompt},
-                ],
-                "response_format": {
-                    "type": "json_schema",
-                    "json_schema": {
-                        "name": schema_name,
-                        "strict": True,
-                        "schema": schema_payload,
-                    },
+        request_payload: dict[str, Any] = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": prompt},
+            ],
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": schema_name,
+                    "strict": True,
+                    "schema": schema_payload,
                 },
-                "temperature": 0,
-                "max_tokens": max_tokens,
-            }
-        ).encode()
+            },
+            "temperature": 0,
+            "max_tokens": max_tokens,
+        }
+        # This member is not universal across OpenAI-compatible servers. Send it
+        # only after an operator explicitly selects a supported capability.
+        if self.reasoning_effort is not None:
+            request_payload["reasoning_effort"] = self.reasoning_effort
+        body = json.dumps(request_payload).encode()
         headers = {"Content-Type": "application/json"}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"

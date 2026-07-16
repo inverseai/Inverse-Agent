@@ -17,6 +17,7 @@ def _args(**overrides: object) -> argparse.Namespace:
         "model_base_url": None,
         "model_context_tokens": None,
         "model_estimator_bytes_per_token": None,
+        "model_reasoning_effort": None,
         "model_allow_remote": False,
         "output": None,
     }
@@ -127,6 +128,22 @@ def test_model_run_requires_calibrated_context(
         )
 
 
+def test_model_run_requires_explicit_reasoning_effort(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("INVERSE_AGENT_MODEL_REASONING_EFFORT", raising=False)
+
+    with pytest.raises(ValueError, match="requires an explicit reasoning-effort"):
+        benchmark_investigation_command(
+            _args(
+                model="some-model",
+                model_base_url="http://127.0.0.1:1234/v1",
+                model_context_tokens=24_576,
+                model_estimator_bytes_per_token=2.0,
+            )
+        )
+
+
 def test_model_context_help_matches_required_live_contract(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -135,4 +152,5 @@ def test_model_context_help_matches_required_live_contract(
 
     help_text = " ".join(capsys.readouterr().out.split())
     assert "INVERSE_AGENT_MODEL_CONTEXT_TOKENS for model runs" in help_text
+    assert "INVERSE_AGENT_MODEL_REASONING_EFFORT" in help_text
     assert "or 16384" not in help_text

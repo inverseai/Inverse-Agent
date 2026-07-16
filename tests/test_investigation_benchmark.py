@@ -116,6 +116,9 @@ def test_seven_cases_cover_priority_stacks_and_real_git() -> None:
     git_case = next(case for case in cases if case.name == "git_approval_replanning")
     assert git_case.expected_issue is True
     assert all("root commit" not in goal.casefold() for goal in git_case.goal_variants)
+    assert git_case.command_recovery_dependencies == (
+        ("generic.head_commit", "generic.parent_commit"),
+    )
 
 
 def test_deterministic_gate_passes_semantics_integrity_and_git(
@@ -447,6 +450,11 @@ def test_semantic_subject_fragment_exemption_requires_full_containment() -> None
         "The current commit ID hadn't resolved, but HEAD was identified.",
         "The claim that HEAD was resolved must not be believed.",
         "The claim that HEAD was resolved mustn't be believed.",
+        "The current HEAD commit ID is unavailable.",
+        "The current HEAD commit hash is unknown.",
+        "The current HEAD commit ID is unresolved.",
+        "The current HEAD commit hash is missing.",
+        "The current HEAD commit ID was not found.",
     ):
         assert not benchmark_module._semantic_match(claim, finding, case.claims)
     assert benchmark_module._semantic_match(
@@ -471,6 +479,165 @@ def test_semantic_subject_fragment_exemption_requires_full_containment() -> None
         case.claims,
     )
     assert benchmark_module._semantic_match(claim, claim.answer_text, case.claims)
+
+
+def test_git_identity_finding_requires_the_exact_cited_commit() -> None:
+    commit = "1724a08da0b04ff81d5aa5cb661a21c3e1897754"
+    observation = ToolObservation(
+        observation_id="obs_head",
+        tool="run_command",
+        path="command/generic.head_commit",
+        content_hash="hash-head",
+        text=f"HEAD commit: {commit}",
+        lines=(f"1: HEAD commit: {commit}",),
+        metadata={"command_name": "generic.head_commit", "status": "succeeded"},
+    )
+    citation = SourceCitation(
+        observation_id=observation.observation_id,
+        path=observation.path,
+        start_line=1,
+        end_line=1,
+    )
+    assert benchmark_module._git_identity_finding_matches(
+        f"The current HEAD commit ID is {commit}.",
+        citation,
+        (observation,),
+    )
+    assert benchmark_module._git_identity_finding_matches(
+        f"HEAD commit hash: {commit}",
+        citation,
+        (observation,),
+    )
+    assert benchmark_module._git_identity_finding_matches(
+        f"Current HEAD commit is {commit}.",
+        citation,
+        (observation,),
+    )
+    for finding in (
+        "The current HEAD commit ID is unavailable.",
+        "The current HEAD commit hash is unknown.",
+        "The current HEAD commit ID failed to resolve.",
+        "The current HEAD commit ID resolution failed.",
+        f"The current HEAD commit ID is {'0' * 40}.",
+        f"The current HEAD commit ID is {commit}, but it is unavailable.",
+    ):
+        assert not benchmark_module._git_identity_finding_matches(
+            finding,
+            citation,
+            (observation,),
+        )
+
+
+def test_git_identity_rejects_mixed_unresolved_language() -> None:
+    for finding in (
+        "The current HEAD commit ID was resolved as unavailable.",
+        "The current HEAD commit hash was identified as unknown.",
+        "The current HEAD commit ID was resolved, but failed to resolve.",
+        "The current HEAD commit ID was resolved but is unresolved.",
+        "The current HEAD commit hash was identified but is missing.",
+        "The current HEAD commit ID resolution failed.",
+        "The current HEAD commit ID could not be resolved.",
+        "The current HEAD commit hash was not identified.",
+        "The current HEAD commit ID was resolved, but is not available.",
+        "The current HEAD commit hash was identified, but is not known.",
+        "The current HEAD commit ID was resolved, but identification failed.",
+        "The current HEAD commit ID was resolved, but failed to identify it.",
+    ):
+        assert benchmark_module._git_identity_has_unresolved_language(finding)
+    assert not benchmark_module._git_identity_has_unresolved_language(
+        "The current HEAD commit was resolved after the failed parent probe."
+    )
+
+
+def test_git_head_claim_rejects_wrong_hashes_and_mixed_contradictions() -> None:
+    case = next(item for item in default_cases() if item.name == "git_approval_replanning")
+    claim = next(item for item in case.claims if item.claim_id == "git-head")
+    commit = "1724a08da0b04ff81d5aa5cb661a21c3e1897754"
+    observation = ToolObservation(
+        observation_id="obs_head",
+        tool="run_command",
+        path="command/generic.head_commit",
+        content_hash="hash-head",
+        text=f"HEAD commit: {commit}",
+        lines=(f"1: HEAD commit: {commit}",),
+        metadata={"command_name": "generic.head_commit", "status": "succeeded"},
+    )
+    citation = SourceCitation(
+        observation_id=observation.observation_id,
+        path=observation.path,
+        start_line=1,
+        end_line=1,
+    )
+    report = InvestigationReport(
+        run_id="git-claim",
+        verdict=InvestigationVerdict.PASS,
+        stop_reason=StopReason.FINISHED,
+        answer=None,
+        catalog=(observation,),
+        decisions_used=1,
+        tool_calls_used=1,
+        physical_requests_used=1,
+    )
+
+    def matches(finding: str) -> bool:
+        return benchmark_module._claim_pair_matches(
+            claim,
+            finding,
+            citation,
+            report,
+            Path("."),
+            case.claims,
+        )
+
+    assert matches("The current HEAD commit was resolved after the failed parent probe.")
+    assert matches(f"The current HEAD commit was resolved as {commit}.")
+    assert matches(f"Current HEAD commit is {commit}.")
+    assert not matches(f"The current HEAD commit ID was resolved as {'0' * 40}.")
+    assert not matches(f"The current HEAD commit ID was resolved as hash_{'0' * 40}.")
+    for finding in (
+        "The current HEAD commit ID was resolved as unavailable.",
+        "The current HEAD commit hash was identified as unknown.",
+        "The current HEAD commit ID was resolved, but failed to resolve.",
+        "The current HEAD commit ID was resolved but is unresolved.",
+        "The current HEAD commit hash was identified but is missing.",
+        "The current HEAD commit ID was resolved, but is not available.",
+        "The current HEAD commit hash was identified, but is not known.",
+        "The current HEAD commit ID was resolved, but identification failed.",
+        "The current HEAD commit ID was resolved, but failed to identify it.",
+    ):
+        assert not matches(finding)
+
+
+def test_git_full_scorer_rejects_wrong_hash_next_to_word_character(tmp_path: Path) -> None:
+    case = next(item for item in default_cases() if item.name == "git_approval_replanning")
+
+    def factory(selected, _goal):  # type: ignore[no-untyped-def]
+        def answer(catalog: tuple[ToolObservation, ...]) -> AgentAnswer:
+            return AgentAnswer(
+                summary="The probes completed.",
+                findings=(
+                    selected.claims[0].answer_text,
+                    f"The current HEAD commit ID was resolved as hash_{'0' * 40}.",
+                ),
+                next_actions=("Keep the observed identity.",),
+                citations=_case_citations(selected, catalog),
+                issue_present=True,
+            )
+
+        return benchmark_module._BenchmarkReplanningPlanner(
+            steps=selected.steps,
+            build_answer=answer,
+        )
+
+    results = run_case_with_planner(
+        case,
+        tmp_path,
+        ScopedTrustStore(tmp_path / "wrong-hash-trust.sqlite"),
+        factory,
+    )
+    assert len(results) == 3
+    assert all(not result.passed for result in results)
+    assert all("semantic claims" in result.reason for result in results)
 
 
 def test_semantic_predicates_bind_to_the_nearest_subject(tmp_path: Path) -> None:

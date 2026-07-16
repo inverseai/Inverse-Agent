@@ -99,6 +99,23 @@ def _base(action: str, **overrides: Any) -> dict[str, Any]:
     return payload
 
 
+def _command_observation(
+    observation_id: str,
+    command: str,
+    *,
+    status: str = "failed",
+) -> ToolObservation:
+    return ToolObservation(
+        observation_id=observation_id,
+        tool="run_command",
+        path=f"command/{command}",
+        content_hash=f"hash-{observation_id}",
+        text=f"{command}: {status}",
+        lines=(f"1: {command}: {status}",),
+        metadata={"command_name": command, "status": status, "citable_command": True},
+    )
+
+
 def test_parse_read_file_decision() -> None:
     client = FakeClient([_base("read_file", path="src/app.py", start_line=5, max_lines=20)])
     planner = ModelInvestigationPlanner(client=client)
@@ -128,7 +145,7 @@ def test_command_action_exists_only_for_explicitly_available_tools() -> None:
     read_actions = read_client.schemas[0]["properties"]["action"]["enum"]
     assert "run_command" not in read_actions
 
-    command_client = FakeClient([_base("run_command", path="generic.head_commit")])
+    command_client = FakeClient([_base("run_command", path="command/generic.head_commit")])
     decision = ModelInvestigationPlanner(
         client=command_client,
         allowed_commands=("generic.head_commit",),
@@ -159,11 +176,152 @@ def test_command_recovery_preserves_failed_observation_dependency() -> None:
     assert decision.based_on_observation_id == "obs_parent_failed"
 
 
-def test_model_cannot_select_an_unavailable_command() -> None:
+def test_command_recovery_binds_the_unique_allowed_failed_observation() -> None:
+    client = FakeClient([_base("run_command", path="command/generic.head_commit")])
+    decision = ModelInvestigationPlanner(
+        client=client,
+        allowed_commands=("generic.parent_commit", "generic.head_commit"),
+        command_recovery_dependencies=(("generic.head_commit", "generic.parent_commit"),),
+    ).decide(
+        goal="recover",
+        catalog=(_command_observation("obs_parent_failed", "generic.parent_commit"),),
+    )
+    assert isinstance(decision, ToolCall)
+    assert decision.command == "generic.head_commit"
+    assert decision.based_on_observation_id == "obs_parent_failed"
+
+
+def test_command_recovery_does_not_guess_between_failed_observations() -> None:
+    client = FakeClient([_base("run_command", path="generic.head_commit")])
+    decision = ModelInvestigationPlanner(
+        client=client,
+        allowed_commands=("generic.parent_commit", "generic.head_commit", "generic.status"),
+        command_recovery_dependencies=(("generic.head_commit", "generic.parent_commit"),),
+    ).decide(
+        goal="recover",
+        catalog=(
+            _command_observation("obs_parent_failed_1", "generic.parent_commit"),
+            _command_observation("obs_parent_failed_2", "generic.parent_commit"),
+        ),
+    )
+    assert isinstance(decision, ToolCall)
+    assert decision.based_on_observation_id is None
+
+
+def test_command_recovery_cannot_run_before_its_declared_failure() -> None:
     client = FakeClient(
         [
             _base("run_command", path="generic.head_commit"),
-            _base("run_command", path="generic.head_commit"),
+            _base("run_command", path="generic.parent_commit"),
+        ]
+    )
+    planner = ModelInvestigationPlanner(
+        client=client,
+        allowed_commands=("generic.parent_commit", "generic.head_commit"),
+        command_recovery_dependencies=(("generic.head_commit", "generic.parent_commit"),),
+    )
+    decision = planner.decide(goal="recover", catalog=())
+    assert isinstance(decision, ToolCall)
+    assert decision.command == "generic.parent_commit"
+    assert planner.schema_retries == 1
+
+
+def test_completed_command_recovery_requires_final_answer_schema() -> None:
+    parent = _command_observation("obs_parent_failed", "generic.parent_commit")
+    head = ToolObservation(
+        observation_id="obs_head_succeeded",
+        tool="run_command",
+        path="command/generic.head_commit",
+        content_hash="hash-head",
+        text="HEAD commit: abc",
+        lines=("1: HEAD commit: abc",),
+        metadata={
+            "command_name": "generic.head_commit",
+            "status": "succeeded",
+            "citable_command": True,
+            "based_on_observation_id": parent.observation_id,
+        },
+    )
+    answer = _base(
+        "final_answer",
+        summary="done",
+        findings=["HEAD is the root commit.", "HEAD commit ID is abc."],
+        next_actions=["Keep the evidence."],
+        citations=[
+            {
+                "observation_id": parent.observation_id,
+                "path": parent.path,
+                "start_line": 1,
+                "end_line": 1,
+            },
+            {
+                "observation_id": head.observation_id,
+                "path": head.path,
+                "start_line": 1,
+                "end_line": 1,
+            },
+        ],
+    )
+    client = FakeClient([answer])
+    decision = ModelInvestigationPlanner(
+        client=client,
+        allowed_commands=("generic.parent_commit", "generic.head_commit"),
+        command_recovery_dependencies=(("generic.head_commit", "generic.parent_commit"),),
+    ).decide(goal="recover", catalog=(parent, head))
+    assert isinstance(decision, AgentAnswer)
+    assert client.schemas[0]["properties"]["action"]["enum"] == ["final_answer"]
+    assert "recovery sequence is complete" in client.system_prompts[0]
+
+
+@pytest.mark.parametrize(
+    "dependencies",
+    [
+        (("generic.head_commit", "generic.head_commit"),),
+        (("generic.missing", "generic.parent_commit"),),
+        (("generic.head_commit", "generic.missing"),),
+        (
+            ("generic.head_commit", "generic.parent_commit"),
+            ("generic.head_commit", "generic.status"),
+        ),
+    ],
+)
+def test_command_recovery_dependencies_must_be_unique_allowed_edges(
+    dependencies: tuple[tuple[str, str], ...],
+) -> None:
+    with pytest.raises(ValueError, match="recovery dependencies"):
+        ModelInvestigationPlanner(
+            client=FakeClient([]),
+            allowed_commands=("generic.parent_commit", "generic.head_commit", "generic.status"),
+            command_recovery_dependencies=dependencies,
+        )
+
+
+def test_command_recovery_does_not_overwrite_an_explicit_dependency() -> None:
+    client = FakeClient(
+        [
+            _base(
+                "run_command",
+                path="generic.head_commit",
+                based_on_observation_id="obs_explicit",
+            )
+        ]
+    )
+    decision = ModelInvestigationPlanner(
+        client=client,
+        allowed_commands=("generic.parent_commit", "generic.head_commit"),
+    ).decide(
+        goal="recover",
+        catalog=(_command_observation("obs_parent_failed", "generic.parent_commit"),),
+    )
+    assert isinstance(decision, ToolCall)
+    assert decision.based_on_observation_id == "obs_explicit"
+
+
+def test_model_cannot_select_an_unavailable_command() -> None:
+    client = FakeClient(
+        [
+            _base("run_command", path="command/evil"),
+            _base("run_command", path="command/evil"),
         ]
     )
     planner = ModelInvestigationPlanner(client=client)
@@ -205,6 +363,48 @@ def test_schema_retry_then_success() -> None:
     assert first_prompt["retry_correction"] == ""
     assert "previous response violated" in retry_prompt["retry_correction"]
     assert "bad json" not in client.prompts[1]
+
+
+def test_grounded_malformed_answer_gets_one_accounted_schema_retry() -> None:
+    evidence = _command_observation(
+        "obs_parent_failed",
+        "generic.parent_commit",
+    )
+    invalid = _base(
+        "final_answer",
+        summary="grounded but empty",
+        findings=[],
+        next_actions=[],
+        citations=[
+            {
+                "observation_id": evidence.observation_id,
+                "path": evidence.path,
+                "start_line": 1,
+                "end_line": 1,
+            }
+        ],
+    )
+    valid = _base(
+        "final_answer",
+        summary="grounded",
+        findings=["HEAD has no first parent."],
+        next_actions=["Inspect HEAD."],
+        citations=[
+            {
+                "observation_id": evidence.observation_id,
+                "path": evidence.path,
+                "start_line": 1,
+                "end_line": 1,
+            }
+        ],
+    )
+    client = FakeClient([invalid, valid])
+    planner = ModelInvestigationPlanner(client=client, max_auto_reads=0, max_nudges=0)
+    decision = planner.decide(goal="x", catalog=(evidence,))
+    assert isinstance(decision, AgentAnswer)
+    assert decision.findings == ("HEAD has no first parent.",)
+    assert planner.schema_retries == 1
+    assert [call.outcome for call in planner.model_calls] == ["schema_error", "success"]
 
 
 def test_transport_retry_after_schema_failure_keeps_corrective_message() -> None:
@@ -1036,6 +1236,7 @@ def test_grounded_answer_is_not_nudged() -> None:
         "final_answer",
         summary="done",
         findings=["found"],
+        next_actions=["verify"],
         citations=[
             {"observation_id": "mis-copied", "path": "a.py", "start_line": 2, "end_line": 2}
         ],
@@ -1075,6 +1276,7 @@ def test_auto_read_fetches_cited_unread_path() -> None:
         "final_answer",
         summary="s",
         findings=["f"],
+        next_actions=["verify"],
         citations=[
             {"observation_id": "obs_x", "path": "experiment.py", "start_line": 2, "end_line": 2}
         ],
@@ -1101,6 +1303,7 @@ def test_auto_read_skipped_when_path_already_read() -> None:
         "final_answer",
         summary="s",
         findings=["f"],
+        next_actions=["verify"],
         citations=[
             {"observation_id": "wrong", "path": "experiment.py", "start_line": 2, "end_line": 2}
         ],

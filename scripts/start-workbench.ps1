@@ -6,6 +6,8 @@ param(
     [int]$ModelContextTokens = 0,
     [ValidateRange(0.0, 4.0)]
     [double]$ModelEstimatorBytesPerToken = 0.0,
+    [ValidateSet("default", "low", "medium", "high")]
+    [string]$ModelReasoningEffort = "default",
     [switch]$SkipModelStart
 )
 
@@ -57,6 +59,12 @@ if ($hasContextCalibration) {
 else {
     $env:INVERSE_AGENT_MODEL_CONTEXT_TOKENS = $null
     $env:INVERSE_AGENT_MODEL_ESTIMATOR_BYTES_PER_TOKEN = $null
+}
+if ($ModelReasoningEffort -eq "default") {
+    $env:INVERSE_AGENT_MODEL_REASONING_EFFORT = $null
+}
+else {
+    $env:INVERSE_AGENT_MODEL_REASONING_EFFORT = $ModelReasoningEffort
 }
 
 $approvalSecret = $env:INVERSE_AGENT_APPROVAL_SECRET

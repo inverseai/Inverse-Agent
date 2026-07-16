@@ -112,6 +112,7 @@ def test_cli_values_override_environment() -> None:
         model_base_url="http://127.0.0.1:1234/v1",
         model_timeout_seconds=10,
         model_max_actions=4,
+        model_reasoning_effort="high",
         model_allow_remote=False,
     )
     resolution = resolve_planner(
@@ -121,12 +122,14 @@ def test_cli_values_override_environment() -> None:
             "INVERSE_AGENT_MODEL_BASE_URL": "http://localhost:9999/v1",
             "INVERSE_AGENT_MODEL_TIMEOUT_SECONDS": "20",
             "INVERSE_AGENT_MODEL_MAX_ACTIONS": "7",
+            "INVERSE_AGENT_MODEL_REASONING_EFFORT": "low",
         },
     )
     assert isinstance(resolution.planner, StructuredPlanner)
     assert resolution.config.model == "cli/model"
     assert resolution.config.timeout_seconds == 10
     assert resolution.config.max_actions == 4
+    assert resolution.config.reasoning_effort == "high"
 
 
 def test_api_key_is_excluded_from_config_output() -> None:
@@ -239,7 +242,33 @@ def test_planner_fingerprint_covers_non_secret_runtime_configuration() -> None:
         timeout_seconds=61,
         max_actions=8,
     )
+    changed_reasoning = PlannerConfig(
+        kind="openai-compatible",
+        model="model",
+        base_url="http://127.0.0.1:1234/v1",
+        timeout_seconds=60,
+        max_actions=8,
+        reasoning_effort="high",
+    )
     assert baseline.fingerprint != changed_timeout.fingerprint
+    assert baseline.fingerprint != changed_reasoning.fingerprint
+
+
+def test_reasoning_effort_is_explicit_validated_and_safely_reported() -> None:
+    base = {
+        "INVERSE_AGENT_MODEL_NAME": "openai/gpt-oss-20b",
+        "INVERSE_AGENT_MODEL_BASE_URL": "http://127.0.0.1:1234/v1",
+    }
+    configured = resolve_planner(
+        env={**base, "INVERSE_AGENT_MODEL_REASONING_EFFORT": "high"}
+    )
+    assert configured.config.reasoning_effort == "high"
+    assert configured.config.safe_summary()["reasoning_effort"] == "high"
+    assert configured.client is not None
+    assert configured.client.reasoning_effort == "high"
+
+    with pytest.raises(ValueError, match="reasoning effort"):
+        resolve_planner(env={**base, "INVERSE_AGENT_MODEL_REASONING_EFFORT": "extreme"})
 
 
 @pytest.mark.parametrize(
@@ -340,6 +369,7 @@ def test_openai_compatible_client_round_trip_and_authorization() -> None:
     assert server.authorization == "Bearer secret-model-key"
     assert server.request_payload and server.request_payload["temperature"] == 0
     assert server.request_payload["max_tokens"] == 4096
+    assert "reasoning_effort" not in server.request_payload
     assert server.request_payload["response_format"] == {
         "type": "json_schema",
         "json_schema": {
@@ -388,6 +418,30 @@ def test_openai_compatible_client_accepts_a_bounded_custom_schema() -> None:
         "strict": True,
         "schema": schema,
     }
+
+
+def test_openai_compatible_client_sends_explicit_reasoning_capability_only() -> None:
+    response_payload = {"actions": [], "rationale": "Done"}
+    server, thread = _serve(_response(json.dumps(response_payload)))
+    try:
+        host, port = server.server_address
+        client = OpenAICompatibleClient(
+            base_url=f"http://{host}:{port}/v1",
+            model="model",
+            reasoning_effort="high",
+        )
+        assert client.complete_json(system="system", prompt="prompt") == response_payload
+    finally:
+        _stop(server, thread)
+
+    assert server.request_payload and server.request_payload["reasoning_effort"] == "high"
+
+    with pytest.raises(ValueError, match="reasoning effort"):
+        OpenAICompatibleClient(
+            base_url="http://127.0.0.1:1234/v1",
+            model="model",
+            reasoning_effort="extreme",
+        )
 
 
 def test_openai_compatible_client_retains_validated_usage_metadata() -> None:
