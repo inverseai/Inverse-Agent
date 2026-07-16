@@ -82,6 +82,27 @@ def test_benchmark_react_flow_accepts_unsafe_adverb_after_provenance() -> None:
     )
 
 
+def test_benchmark_react_flow_accepts_explicit_absence_of_escaping() -> None:
+    assert _react_untrusted_flow_matches(
+        "In SearchResults.jsx, component UnsafeResult renders user‑supplied content using "
+        "<div dangerouslySetInnerHTML={{ __html: userSuppliedTerm }} />, which injects raw "
+        "HTML without escaping."
+    )
+
+
+def test_benchmark_react_flow_accepts_component_in_path() -> None:
+    assert _react_untrusted_flow_matches(
+        "The UnsafeResult component in `projects/static/projects/SearchResults.jsx` renders "
+        "untrusted user input via dangerouslySetInnerHTML, creating a DOM injection risk."
+    )
+
+
+def test_benchmark_react_flow_accepts_reinforced_untrusted_provenance() -> None:
+    assert _react_untrusted_flow_matches(
+        "UnsafeResult passes untrusted user-supplied data into dangerouslySetInnerHTML."
+    )
+
+
 def test_benchmark_react_safe_control_accepts_escapes_html_by_default() -> None:
     case = next(item for item in default_cases() if item.name == "django_react_injection")
     claim = next(item for item in case.claims if item.claim_id == "react-jsx-control")
@@ -89,6 +110,42 @@ def test_benchmark_react_safe_control_accepts_escapes_html_by_default() -> None:
     assert _semantic_match(
         claim,
         "SafeResult renders content using JSX interpolation, which escapes HTML by default.",
+        (*case.claims, *case.supplemental_claims),
+    )
+
+
+def test_benchmark_react_safe_control_accepts_automatic_react_escaping() -> None:
+    case = next(item for item in default_cases() if item.name == "django_react_injection")
+    claim = next(item for item in case.claims if item.claim_id == "react-jsx-control")
+
+    assert _semantic_match(
+        claim,
+        "SafeResult renders user-supplied content inside a div, ensuring automatic React "
+        "escaping of text.",
+        (*case.claims, *case.supplemental_claims),
+    )
+
+
+def test_benchmark_react_safe_control_accepts_user_supplied_text() -> None:
+    case = next(item for item in default_cases() if item.name == "django_react_injection")
+    claim = next(item for item in case.claims if item.claim_id == "react-jsx-control")
+
+    assert _semantic_match(
+        claim,
+        "The sibling component SafeResult outputs user-supplied text as a normal React "
+        "element, ensuring automatic escaping and preventing XSS.",
+        (*case.claims, *case.supplemental_claims),
+    )
+
+
+def test_benchmark_react_safe_control_accepts_child_element_escaping() -> None:
+    case = next(item for item in default_cases() if item.name == "django_react_injection")
+    claim = next(item for item in case.claims if item.claim_id == "react-jsx-control")
+
+    assert _semantic_match(
+        claim,
+        "The React component SafeResult safely displays userSuppliedTerm by rendering it as "
+        "a child element, which escapes HTML content and prevents DOM injection.",
         (*case.claims, *case.supplemental_claims),
     )
 
@@ -104,6 +161,18 @@ def test_react_dependency_accepts_framework_as_grammatical_subject() -> None:
     )
 
 
+def test_django_unsafe_claim_accepts_concatenated_sql_string() -> None:
+    case = next(item for item in default_cases() if item.name == "django_react_injection")
+    claim = next(item for item in case.claims if item.claim_id == "django-sql-injection")
+
+    assert _semantic_match(
+        claim,
+        "search_unsafe concatenates request input directly into an SQL string, creating an "
+        "injection risk.",
+        (*case.claims, *case.supplemental_claims),
+    )
+
+
 def test_ios_unsafe_claim_accepts_unicode_non_main_thread() -> None:
     case = next(item for item in default_cases() if item.name == "ios_main_thread_ui")
     claim = next(item for item in case.claims if item.claim_id == "ios-background-ui")
@@ -113,6 +182,19 @@ def test_ios_unsafe_claim_accepts_unicode_non_main_thread() -> None:
         "ProfileViewController.refreshProfile updates nameLabel.text inside "
         "DispatchQueue.global().async, causing UI changes on a non\u2011main thread - an unsafe "
         "UIKit refresh path.",
+        (*case.claims, *case.supplemental_claims),
+    )
+
+
+def test_ios_safe_claim_ignores_competing_subject_in_qualified_source_path() -> None:
+    case = next(item for item in default_cases() if item.name == "ios_main_thread_ui")
+    claim = next(item for item in case.claims if item.claim_id == "ios-main-control")
+
+    assert _semantic_match(
+        claim,
+        "In AvatarViewController.refreshAvatar, the image is loaded on a background thread "
+        "but assignment to self.avatarView.image occurs inside DispatchQueue.main.async "
+        "(safe UI update), as shown on line 3 of App/ProfileViewController.swift.",
         (*case.claims, *case.supplemental_claims),
     )
 
@@ -1334,6 +1416,17 @@ def test_semantic_subject_fragment_exemption_requires_full_containment() -> None
     assert benchmark_module._semantic_match(claim, claim.answer_text, case.claims)
 
 
+def test_git_root_claim_accepts_lacks_first_parent_wording() -> None:
+    case = next(item for item in default_cases() if item.name == "git_approval_replanning")
+    claim = next(item for item in case.claims if item.claim_id == "git-root")
+
+    assert benchmark_module._semantic_match(
+        claim,
+        "HEAD lacks a first parent and is the repository's root commit.",
+        case.claims,
+    )
+
+
 def test_git_identity_finding_requires_the_exact_cited_commit() -> None:
     commit = "1724a08da0b04ff81d5aa5cb661a21c3e1897754"
     observation = ToolObservation(
@@ -1445,6 +1538,10 @@ def test_git_head_claim_rejects_wrong_hashes_and_mixed_contradictions() -> None:
     assert matches("The current HEAD commit was resolved after the failed parent probe.")
     assert matches(f"The current HEAD commit was resolved as {commit}.")
     assert matches(f"Current HEAD commit is {commit}.")
+    assert matches(
+        "The command generic.head_commit successfully reported the current HEAD commit "
+        f"SHA-1 as {commit}, identifying the exact commit."
+    )
     assert not matches(f"The current HEAD commit ID was resolved as {'0' * 40}.")
     assert not matches(f"The current HEAD commit ID was resolved as hash_{'0' * 40}.")
     for finding in (
@@ -2721,6 +2818,33 @@ def test_terminal_schema_retry_is_accounted_without_inventing_an_extra_retry() -
     )
 
     assert "model_call_accounting_invalid" not in failures
+    assert "retry_accounting_invalid" not in failures
+
+
+def test_one_schema_retry_per_distinct_decision_is_valid() -> None:
+    case = default_cases()[0]
+    calls = (
+        ModelCallRecord(1, 1, 100, 10, 20, 10, "requested", 0.1, "schema_error"),
+        ModelCallRecord(2, 1, 100, 10, 20, 10, "requested", 0.1, "success"),
+        ModelCallRecord(3, 2, 100, 10, 20, 10, "requested", 0.1, "schema_error"),
+        ModelCallRecord(4, 2, 100, 10, 20, 10, "requested", 0.1, "success"),
+    )
+
+    failures = _integrity_failures(
+        case,
+        _report(
+            decisions_used=2,
+            physical_requests_used=4,
+            model_calls=calls,
+            completion_tokens_requested=400,
+            completion_tokens_charged=40,
+            completion_tokens_used=40,
+            schema_retries=2,
+        ),
+        AgentBudget(),
+        expected_model=None,
+    )
+
     assert "retry_accounting_invalid" not in failures
 
 

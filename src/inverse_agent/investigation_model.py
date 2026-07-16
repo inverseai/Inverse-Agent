@@ -222,7 +222,9 @@ _DANGEROUS_HTML_SINK_CANDIDATE = re.compile(r"dangerouslySetInnerHTML", re.IGNOR
 _UNSAFE_RESULT_SUBJECT = re.compile(r"(?<![A-Za-z0-9_$])UnsafeResult(?![A-Za-z0-9_$])")
 _UNSAFE_RESULT_CANDIDATE = re.compile(r"UnsafeResult", re.IGNORECASE)
 _UNTRUSTED_DATA = re.compile(
-    r"\b(?:untrusted|user[- ]controlled|user[- ]provided|user[- ]supplied|"
+    r"\b(?:untrusted|user[- \u00a0\u2010-\u2015\u2212]controlled|"
+    r"user[- \u00a0\u2010-\u2015\u2212]provided|"
+    r"user[- \u00a0\u2010-\u2015\u2212]supplied|"
     r"user(?:Controlled|Provided|Supplied)[A-Za-z0-9_$]*)\b",
     re.IGNORECASE,
 )
@@ -292,7 +294,7 @@ _REACT_PROTECTED_OR_NEGATED = frozenset(
     }
 )
 _REACT_POST_SINK_DISCONNECTION = frozenset({"audit", "logger", "only", "wrapper"})
-_REACT_SUBJECT_FLOW_WORDS = frozenset({"component", "directly", "explicitly", "that"})
+_REACT_SUBJECT_FLOW_WORDS = frozenset({"component", "directly", "explicitly", "in", "that"})
 _REACT_FLOW_PROVENANCE_WORDS = frozenset(
     {"a", "an", "directly", "explicitly", "raw", "the", "untrusted"}
 )
@@ -301,6 +303,7 @@ _REACT_PROVENANCE_SINK_WORDS = frozenset(
         "content",
         "data",
         "directly",
+        "div",
         "dom",
         "html",
         "input",
@@ -316,13 +319,19 @@ _REACT_PROVENANCE_SINK_WORDS = frozenset(
         "the",
         "through",
         "to",
+        "using",
+        "user",
         "value",
         "via",
         "with",
         "unsafely",
     }
 )
-_REACT_FLOW_CONNECTORS = frozenset({"into", "through", "to", "via", "with"})
+_REACT_FLOW_CONNECTORS = frozenset({"into", "through", "to", "using", "via", "with"})
+_REACT_ABSENT_PROTECTION = re.compile(
+    r"\bwithout\s+(?:encoding|escaping|saniti[sz](?:ation|ing))\b",
+    re.IGNORECASE,
+)
 _EXPLICIT_DECLARATION = re.compile(
     r"^\s*(?:(?:abstract|annotation|async|case|data|declare|default|export|final|internal|open|"
     r"override|partial|private|protected|pub(?:\s*\([^)]*\))?|public|readonly|"
@@ -412,6 +421,10 @@ _PYTHON_FROM_IMPORT_LINE = re.compile(
     r"^\s*from\s+(?:\.+(?:[A-Za-z_][A-Za-z0-9_.]*)?|"
     r"[A-Za-z_][A-Za-z0-9_.]*)\s+import\s+(.+?)\s*$"
 )
+_LEADING_IMPORT_OR_INCLUDE = re.compile(
+    r"^\s*(?:#\s*include\b|from\s+\S+\s+import\b|import\b|use\b)",
+    re.IGNORECASE,
+)
 _JS_DEFAULT_IMPORT_DECLARATION = re.compile(
     r"^\s*import\s+(?:type\s+)?([A-Za-z_$][A-Za-z0-9_$]*)"
     r"(?:\s*,|\s+from\b)",
@@ -489,7 +502,9 @@ _SCHEMA_RETRY_CORRECTION = (
     "The previous response violated the required decision protocol. Return exactly one "
     "JSON object matching the supplied schema, with no prose, markdown fence, prefix, "
     "suffix, or additional object. Re-check that every finding is self-contained and has "
-    "exactly one distinct citation in the same position."
+    "exactly one distinct citation in the same position. When correcting a final answer, "
+    "return the complete final answer with non-empty summary, findings, next_actions, and "
+    "citations; never erase populated evidence arrays."
 )
 _SOURCE_SYMBOL_CITATION_ERROR = (
     "each source citation must include the source-defined symbol named in its finding plus "
@@ -511,6 +526,9 @@ _SUITE_BODY_CITATION_ERROR = (
 _INJECTION_PROVENANCE_ERROR = (
     "a dangerouslySetInnerHTML security finding must state a positive direct flow of explicitly "
     "untrusted, user-controlled, user-provided, or user-supplied data into that sink"
+)
+_REQUESTED_MANIFEST_FINDING_ERROR = (
+    "final answer omits explicitly requested dependency metadata evidence"
 )
 _SCHEMA_RETRY_DETAILS = {
     "final answer summary is empty": "Return a non-empty summary.",
@@ -561,6 +579,11 @@ _SCHEMA_RETRY_DETAILS = {
         "name, positive flow verb, explicit provenance phrase, then dangerouslySetInnerHTML; "
         "do not substitute only 'raw HTML' or 'term prop' for provenance. Also cite the "
         "component declaration through the decisive sink line."
+    ),
+    _REQUESTED_MANIFEST_FINDING_ERROR: (
+        "Include one self-contained finding that states the observed declared dependency or "
+        "framework from the completed dependency manifest read, with its own exact manifest "
+        "citation. Preserve every other supported finding and citation."
     ),
     "complete and condition_holds must be JSON booleans": (
         "Set complete and condition_holds to JSON true or false values, not strings."
@@ -2624,7 +2647,7 @@ def _trim_blank_citation_edges(
                     leading_source,
                     leading_basename,
                 )
-                if not leading_declarations or (leading_declarations & relevant_local_subjects):
+                if leading_declarations & relevant_local_subjects:
                     break
                 shorter_source, shorter_basename = _contextual_source_slice(
                     full_source,
@@ -2635,6 +2658,12 @@ def _trim_blank_citation_edges(
                 if not relevant_local_subjects <= _visible_declaration_symbols(
                     shorter_source,
                     shorter_basename,
+                ):
+                    break
+                if (
+                    not leading_declarations
+                    and _LEADING_IMPORT_OR_INCLUDE.match(line_body(observation.lines[start_offset]))
+                    is None
                 ):
                     break
                 start_offset += 1
@@ -2702,6 +2731,10 @@ _INLINE_CITATION = re.compile(
     r"\b(obs_[A-Za-z0-9_]{8,128})\b\s+(?:lines?\s*)?(\d+)\s*[-\u2013]\s*(\d+)\b",
     re.ASCII,
 )
+_LABELED_LINE_RANGE = re.compile(
+    r"\blines?\s+(\d+)(?:\s*[-\u2010-\u2015]\s*(\d+))?\b",
+    re.IGNORECASE,
+)
 
 
 def _recover_inline_citations(
@@ -2749,6 +2782,61 @@ def _recover_inline_citations(
             or end_line < start_line
             or end_line > last_line
             or citation_intersects_redaction(observation, citation)
+        ):
+            return answer
+        recovered.append(citation)
+    return replace(answer, citations=tuple(recovered))
+
+
+def _split_labeled_broad_citation(
+    answer: AgentAnswer,
+    catalog: tuple[ToolObservation, ...],
+    rendered_ids: frozenset[str],
+) -> AgentAnswer:
+    """Split one broad citation only from exact per-finding ``line(s)`` labels.
+
+    Models sometimes return two positionally distinct findings and one citation
+    spanning both adjacent declarations. Recovery is allowed only when every
+    finding supplies exactly one explicit line label, all labeled ranges are
+    non-overlapping subsets of the original rendered citation, and no range is
+    redacted. Nothing is inferred from symbols, prose order, or hidden source.
+    """
+
+    if len(answer.findings) < 2 or len(answer.citations) != 1:
+        return answer
+    original = answer.citations[0]
+    observation = next(
+        (
+            item
+            for item in catalog
+            if item.observation_id == original.observation_id
+            and item.observation_id in rendered_ids
+            and item.path == original.path
+            and (item.tool == "read_file" or item.metadata.get("citable_command"))
+            and item.content_hash
+        ),
+        None,
+    )
+    if observation is None:
+        return answer
+    recovered: list[SourceCitation] = []
+    for finding in answer.findings:
+        matches = tuple(_LABELED_LINE_RANGE.finditer(finding))
+        if len(matches) != 1:
+            return answer
+        match = matches[0]
+        start_line = int(match.group(1))
+        end_line = int(match.group(2) or match.group(1))
+        citation = replace(original, start_line=start_line, end_line=end_line)
+        if (
+            start_line < original.start_line
+            or end_line < start_line
+            or end_line > original.end_line
+            or citation_intersects_redaction(observation, citation)
+            or any(
+                start_line <= existing.end_line and existing.start_line <= end_line
+                for existing in recovered
+            )
         ):
             return answer
         recovered.append(citation)
@@ -3006,6 +3094,31 @@ def _grounded_answer_structure_error(
     return None
 
 
+def _requested_manifest_finding_error(
+    goal: str,
+    answer: AgentAnswer,
+    catalog: tuple[ToolObservation, ...],
+) -> str | None:
+    """Require evidence already read for an explicit dependency-metadata request."""
+
+    if "dependency metadata" not in goal.casefold():
+        return None
+    completed_manifests = {
+        observation.path.replace("\\", "/")
+        for observation in catalog
+        if observation.tool == "read_file"
+        and observation.content_hash
+        and not observation.truncated
+        and not observation.incomplete
+        and observation.path.replace("\\", "/").rsplit("/", 1)[-1].casefold()
+        in _DEPENDENCY_MANIFEST_NAMES
+    }
+    if not completed_manifests:
+        return None
+    cited_paths = {citation.path.replace("\\", "/") for citation in answer.citations}
+    return None if completed_manifests & cited_paths else _REQUESTED_MANIFEST_FINDING_ERROR
+
+
 def _identifier_occurs(source: str, identifier: str) -> bool:
     return (
         re.search(
@@ -3032,7 +3145,10 @@ def _source_observation_has_lexical_context(observation: ToolObservation) -> boo
 
 
 def _has_direct_untrusted_html_flow(finding: str) -> bool:
-    semantic_finding = _CODE_PATH_SPAN.sub(" ", finding)
+    semantic_finding = _CODE_PATH_SPAN.sub(
+        " ",
+        _REACT_ABSENT_PROTECTION.sub("unescaped", finding),
+    )
     sink_candidates = tuple(_DANGEROUS_HTML_SINK_CANDIDATE.finditer(semantic_finding))
     if not sink_candidates:
         return True
@@ -3795,6 +3911,13 @@ class ModelInvestigationPlanner:
         action = dict(properties["action"])
         action["enum"] = ["final_answer"]
         properties["action"] = action
+        for field_name in ("findings", "next_actions", "citations"):
+            field_schema = dict(properties[field_name])
+            field_schema["minItems"] = 1
+            properties[field_name] = field_schema
+        summary = dict(properties["summary"])
+        summary["minLength"] = 1
+        properties["summary"] = summary
         return {**schema, "properties": properties}
 
     def _command_recovery_is_complete(self, catalog: tuple[ToolObservation, ...]) -> bool:
@@ -4448,6 +4571,7 @@ class ModelInvestigationPlanner:
         pending_retry: str | None = None
         pending_failure: Exception | None = None
         schema_retry_correction = _SCHEMA_RETRY_CORRECTION if schema_used > 0 else None
+        final_answer_retry_required = command_recovery_complete
 
         def record_executed_retry(kind: str | None) -> None:
             if kind == "transport":
@@ -4479,6 +4603,11 @@ class ModelInvestigationPlanner:
             attempts_before = physical_attempts_used
             request_retry_kind = pending_retry
             retry_recorded = False
+            parsed_decision: Decision | None = None
+            request_final_answer_required = final_answer_retry_required
+            request_schema = self._decision_schema(
+                command_recovery_complete=request_final_answer_required
+            )
             request_prompt = self._build_prompt(
                 goal=goal,
                 observations=observations,
@@ -4487,13 +4616,17 @@ class ModelInvestigationPlanner:
                 retry_correction=schema_retry_correction,
             )
             try:
+                request_completion_reserve = self._completion_allowance(
+                    final_answer_required=request_final_answer_required,
+                    complex_answer_likely=complex_answer_likely,
+                )
                 if (
                     self._prompt_token_bound(
                         request_prompt,
                         system=decision_system,
-                        schema=decision_schema,
+                        schema=request_schema,
                     )
-                    + completion_reserve
+                    + request_completion_reserve
                     + safety_margin
                     > self.context_tokens
                 ):
@@ -4503,12 +4636,12 @@ class ModelInvestigationPlanner:
                     request_kind="decision",
                     system=decision_system,
                     schema_name="investigation_decision",
-                    schema=decision_schema,
+                    schema=request_schema,
                     retry_kind=request_retry_kind,
                     transport_retries_used=transport_used,
                     schema_retries_used=schema_used,
                     physical_attempts_used=physical_attempts_used + 1,
-                    final_answer_required=command_recovery_complete,
+                    final_answer_required=request_final_answer_required,
                     complex_answer_likely=complex_answer_likely,
                 )
                 physical_attempts_used, retry_recorded, _ = account_started_attempt(
@@ -4519,8 +4652,10 @@ class ModelInvestigationPlanner:
                 )
                 payload_received = True
                 decision = parse_decision(payload)
+                parsed_decision = decision
                 if isinstance(decision, AgentAnswer):
                     decision = _recover_inline_citations(decision, catalog, rendered_ids)
+                    decision = _split_labeled_broad_citation(decision, catalog, rendered_ids)
                     decision = _repair_citations(decision, catalog, rendered_ids)
                     decision = _expand_immediate_symbol_declaration_citations(
                         decision, catalog, rendered_ids
@@ -4530,6 +4665,8 @@ class ModelInvestigationPlanner:
                     decision = _repair_citation_label_findings(decision, catalog, rendered_ids)
                     decision = _repair_non_evidentiary_answer_fields(decision)
                     answer_error = _grounded_answer_structure_error(decision, catalog)
+                    if answer_error is None:
+                        answer_error = _requested_manifest_finding_error(goal, decision, catalog)
                     if answer_error is not None:
                         raise ValueError(answer_error)
                 if (
@@ -4586,6 +4723,8 @@ class ModelInvestigationPlanner:
                 if schema_used >= self.max_schema_retries:
                     raise
                 schema_used += 1
+                if isinstance(parsed_decision, AgentAnswer):
+                    final_answer_retry_required = True
                 schema_retry_correction = _schema_retry_correction(exc)
                 pending_retry = "schema"
                 pending_failure = exc

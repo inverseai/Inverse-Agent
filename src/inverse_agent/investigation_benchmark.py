@@ -122,7 +122,19 @@ _HEX_SHA256 = re.compile(r"[0-9a-f]{64}\Z", re.ASCII)
 _HEX_CHALLENGE_ID = re.compile(r"[0-9a-f]{32}\Z", re.ASCII)
 _COMPLETED_COMMAND = re.compile(r"completed in \d+(?:\.\d+)?s\Z", re.ASCII)
 _NEGATION_TOKENS = frozenset(
-    {"cannot", "neither", "never", "no", "not", "off", "outside", "without"}
+    {
+        "cannot",
+        "lack",
+        "lacking",
+        "lacks",
+        "neither",
+        "never",
+        "no",
+        "not",
+        "off",
+        "outside",
+        "without",
+    }
 )
 _NEGATING_AUXILIARIES = frozenset(
     {
@@ -192,6 +204,10 @@ _UNRESOLVED_ANAPHORIC_NEGATION = re.compile(
 )
 _SEMANTIC_PUNCTUATION_TRANSLATION = str.maketrans(
     {"\u2018": "'", "\u2019": "'", "\u201c": '"', "\u201d": '"'}
+)
+_SEMANTIC_QUALIFIED_CODE_PATH = re.compile(
+    r"`?(?:(?:[A-Za-z]:)?(?:[^`\s/\\]+[/\\])+[^`\s/\\]+\.[A-Za-z0-9]{1,10})`?",
+    re.ASCII,
 )
 _CONTRACTION_EXPANSIONS = (
     (re.compile(r"\b(?:isn'?t|isnt)\b", re.IGNORECASE), "is not"),
@@ -289,15 +305,19 @@ _REACT_UNTRUSTED_PROVENANCE_ALIASES = (
     "user-provided content",
     "user provided content",
 )
-_REACT_FLOW_CONNECTORS = frozenset({"into", "through", "to", "via", "with"})
+_REACT_FLOW_CONNECTORS = frozenset({"into", "through", "to", "using", "via", "with"})
 _REACT_FLOW_BRIDGE_TOKENS = _REACT_FLOW_CONNECTORS | frozenset(
-    {"directly", "dom", "react", "s", "the", "unsafely"}
+    {"directly", "div", "dom", "react", "s", "the", "unsafely"}
 )
-_REACT_FLOW_LEAD_TOKENS = frozenset({"a", "an", "directly", "its", "the"})
-_REACT_SUBJECT_FLOW_TOKENS = frozenset({"component", "directly", "explicitly", "that"})
+_REACT_FLOW_LEAD_TOKENS = frozenset({"a", "an", "directly", "its", "the", "untrusted"})
+_REACT_SUBJECT_FLOW_TOKENS = frozenset({"component", "directly", "explicitly", "in", "that"})
 _REACT_DEPENDENCY_SUBJECT_INVERSION = re.compile(
     r"\bReact\s+(?:framework|dependency)\s+is\s+declared\s+in\s+"
     r"package\.json\s+dependencies\b",
+    re.IGNORECASE,
+)
+_REACT_ABSENT_PROTECTION = re.compile(
+    r"\bwithout\s+(?:encoding|escaping|saniti[sz](?:ation|ing))\b",
     re.IGNORECASE,
 )
 _REACT_EDGE_INVALID_TOKENS = frozenset(
@@ -962,6 +982,7 @@ def _mark_react_edge_symbols(finding: str) -> str | None:
 def _react_untrusted_flow_matches(finding: str) -> bool:
     """Require one direct, positive UnsafeResult data-flow edge into the HTML sink."""
 
+    finding = _REACT_ABSENT_PROTECTION.sub("unescaped", finding)
     marked_finding = _mark_react_edge_symbols(finding)
     if marked_finding is None:
         return False
@@ -1027,6 +1048,7 @@ def _semantic_match(
 ) -> bool:
     if not claim.term_groups or not claim.polarity_rules:
         return False
+    finding = _SEMANTIC_QUALIFIED_CODE_PATH.sub(" ", finding)
     if claim.claim_id == "react-dependency":
         finding = _REACT_DEPENDENCY_SUBJECT_INVERSION.sub(
             "package.json declares React dependency",
@@ -1588,6 +1610,14 @@ def _integrity_failures(
                 failures.add("model_call_sequence_invalid")
             if len(request_calls) > 3:
                 invalid_retry_transition = True
+            group_transport_retries = sum(
+                call.outcome == "transport_error" for call in request_calls[:-1]
+            )
+            group_schema_retries = sum(
+                call.outcome in schema_retry_outcomes for call in request_calls[:-1]
+            )
+            if group_transport_retries > 1 or group_schema_retries > 1:
+                invalid_retry_transition = True
     for previous, current in zip(calls, calls[1:], strict=False):
         if (
             current.logical_decision != previous.logical_decision
@@ -1602,8 +1632,6 @@ def _integrity_failures(
             continue
         else:
             invalid_retry_transition = True
-    if derived_transport_retries > 1 or derived_schema_retries > 1:
-        invalid_retry_transition = True
     if (
         invalid_retry_transition
         or report.transport_retries != derived_transport_retries
@@ -3010,7 +3038,7 @@ def default_cases() -> tuple[BenchmarkCase, ...]:
                         "unsafe Django path",
                         "Django unsafe path",
                     ),
-                    ("SQL injection", "raw SQL", "query"),
+                    ("SQL injection", "raw SQL", "SQL statement", "SQL string", "query"),
                     (
                         "concatenate",
                         "concatenates",
@@ -3111,6 +3139,7 @@ def default_cases() -> tuple[BenchmarkCase, ...]:
                     (
                         "JSX child",
                         "JSX children",
+                        "child element",
                         "JSX expression",
                         "JSX interpolation",
                         "JSX syntax",
@@ -3129,12 +3158,14 @@ def default_cases() -> tuple[BenchmarkCase, ...]:
                     (
                         "React escapes",
                         "escapes HTML",
+                        "escapes HTML content",
                         "escaped text",
                         "escapes it as text",
                         "escaping HTML",
                         "escaping content",
                         "escapes content",
                         "automatically escapes",
+                        "automatic React escaping",
                         "plain text",
                         "prevents script execution",
                         "preventing script execution",
@@ -3144,18 +3175,20 @@ def default_cases() -> tuple[BenchmarkCase, ...]:
                         "prevents DOM injection",
                         "mitigating DOM injection",
                     ),
-                    ("term", "input", "content", "user data"),
+                    ("term", "input", "content", "text", "user data"),
                     polarity=(
                         _polarity(
                             True,
                             "React escapes",
                             "escapes HTML",
+                            "escapes HTML content",
                             "escaped text",
                             "escapes it as text",
                             "escaping HTML",
                             "escaping content",
                             "escapes content",
                             "automatically escapes",
+                            "automatic React escaping",
                             "plain text",
                             "prevents script execution",
                             "preventing script execution",
@@ -3393,8 +3426,27 @@ def default_cases() -> tuple[BenchmarkCase, ...]:
                         required_prefix="HEAD commit:",
                     ),
                     ("HEAD", "current commit"),
-                    ("resolved", "commit ID", "commit hash", "identified"),
-                    polarity=(_polarity(True, "resolved", "identified"),),
+                    (
+                        "resolved",
+                        "commit ID",
+                        "commit hash",
+                        "identified",
+                        "identifying",
+                        "reported",
+                        "reports",
+                        "SHA-1",
+                        "SHA1",
+                    ),
+                    polarity=(
+                        _polarity(
+                            True,
+                            "resolved",
+                            "identified",
+                            "identifying",
+                            "reported",
+                            "reports",
+                        ),
+                    ),
                 ),
             ),
             required_observations=(

@@ -37,7 +37,9 @@ from inverse_agent.investigation_model import (
     _repair_citations,
     _repair_non_evidentiary_answer_fields,
     _repair_unique_listed_read_path,
+    _requested_manifest_finding_error,
     _requires_named_source_symbol,
+    _split_labeled_broad_citation,
     _trim_blank_citation_edges,
     _visible_declaration_symbols,
     parse_decision,
@@ -471,6 +473,73 @@ def test_explicit_dependency_metadata_goal_auto_reads_only_visible_manifest() ->
     assert decision == ToolCall(tool="read_file", path="package.json")
 
 
+def test_requested_dependency_metadata_requires_completed_manifest_finding() -> None:
+    manifest = ToolObservation(
+        observation_id="obs_manifest",
+        tool="read_file",
+        path="package.json",
+        content_hash="manifest-hash",
+        text='{"dependencies":{"react":"18.3.1"}}',
+        lines=('1: {"dependencies":{"react":"18.3.1"}}',),
+        start_line=1,
+    )
+    source = ToolObservation(
+        observation_id="obs_readme",
+        tool="read_file",
+        path="README.md",
+        content_hash="readme-hash",
+        text="React UI",
+        lines=("1: React UI",),
+        start_line=1,
+    )
+    invalid = _base(
+        "final_answer",
+        summary="The source mentions React.",
+        findings=["README.md mentions a React UI."],
+        next_actions=["Confirm the dependency declaration."],
+        citations=[
+            {
+                "observation_id": source.observation_id,
+                "path": source.path,
+                "start_line": 1,
+                "end_line": 1,
+            }
+        ],
+    )
+    valid = _base(
+        "final_answer",
+        summary="The dependency metadata declares React.",
+        findings=["package.json declares React 18.3.1 as a dependency."],
+        next_actions=["Keep the declaration current."],
+        citations=[
+            {
+                "observation_id": manifest.observation_id,
+                "path": manifest.path,
+                "start_line": 1,
+                "end_line": 1,
+            }
+        ],
+    )
+    client = FakeClient([invalid, valid])
+    planner = ModelInvestigationPlanner(client=client, max_auto_reads=0, max_nudges=0)
+
+    decision = planner.decide(
+        goal="Verify the declared framework from dependency metadata.",
+        catalog=(source, manifest),
+    )
+
+    assert isinstance(decision, AgentAnswer)
+    assert decision.citations[0].path == "package.json"
+    assert planner.schema_retries == 1
+    assert "dependency manifest" in json.loads(client.prompts[1])["retry_correction"]
+    assert (
+        _requested_manifest_finding_error(
+            "Verify dependency metadata.", decision, (source, manifest)
+        )
+        is None
+    )
+
+
 def test_recursive_nonroot_manifest_path_is_not_double_prefixed() -> None:
     listing = ToolObservation(
         observation_id="obs_listing",
@@ -755,6 +824,12 @@ def test_grounded_malformed_answer_gets_one_accounted_schema_retry() -> None:
     assert [call.outcome for call in planner.model_calls] == ["schema_error", "success"]
     correction = json.loads(client.prompts[1])["retry_correction"]
     assert "one or more non-empty findings" in correction
+    retry_properties = client.schemas[1]["properties"]
+    assert retry_properties["action"]["enum"] == ["final_answer"]
+    assert retry_properties["summary"]["minLength"] == 1
+    assert retry_properties["findings"]["minItems"] == 1
+    assert retry_properties["next_actions"]["minItems"] == 1
+    assert retry_properties["citations"]["minItems"] == 1
 
 
 def test_body_only_source_citation_expands_to_immediate_named_declaration() -> None:
@@ -1027,6 +1102,39 @@ def test_leading_unmentioned_import_is_trimmed_from_local_subject_anchor() -> No
     )
 
     assert repaired.citations == (SourceCitation(evidence.observation_id, evidence.path, 2, 4),)
+    assert _grounded_answer_structure_error(repaired, (evidence,)) is None
+
+
+def test_leading_swift_import_is_trimmed_from_local_subject_anchor() -> None:
+    source = (
+        "import UIKit\n"
+        "class ProfileViewController: UIViewController { func refreshProfile() { "
+        "DispatchQueue.global().async { self.nameLabel.text = self.loadName() } } }\n"
+    )
+    evidence = ToolObservation(
+        observation_id="obs_swift_leading_import",
+        tool="read_file",
+        path="App/ProfileViewController.swift",
+        content_hash="source-hash",
+        text=source,
+        lines=tuple(f"{index}: {line}" for index, line in enumerate(source.splitlines(), 1)),
+        start_line=1,
+    )
+    answer = AgentAnswer(
+        summary="The unsafe refresh was inspected.",
+        findings=("ProfileViewController.refreshProfile updates nameLabel on a background queue.",),
+        next_actions=("Move the UI write to the main queue.",),
+        citations=(SourceCitation(evidence.observation_id, evidence.path, 1, 2),),
+        issue_present=True,
+    )
+
+    repaired = _trim_blank_citation_edges(
+        answer,
+        (evidence,),
+        frozenset({evidence.observation_id}),
+    )
+
+    assert repaired.citations == (SourceCitation(evidence.observation_id, evidence.path, 2, 2),)
     assert _grounded_answer_structure_error(repaired, (evidence,)) is None
 
 
@@ -1421,6 +1529,21 @@ def test_production_react_flow_accepts_explicit_provenance_identifier(
 def test_production_react_flow_accepts_unsafe_adverb_after_provenance() -> None:
     assert _has_direct_untrusted_html_flow(
         "UnsafeResult component renders userSuppliedTerm unsafely via dangerouslySetInnerHTML."
+    )
+
+
+def test_production_react_flow_accepts_explicit_absence_of_escaping() -> None:
+    assert _has_direct_untrusted_html_flow(
+        "In SearchResults.jsx, component UnsafeResult renders user‑supplied content using "
+        "<div dangerouslySetInnerHTML={{ __html: userSuppliedTerm }} />, which injects raw "
+        "HTML without escaping."
+    )
+
+
+def test_production_react_flow_accepts_component_in_path_and_untrusted_user_input() -> None:
+    assert _has_direct_untrusted_html_flow(
+        "The UnsafeResult component in `projects/static/projects/SearchResults.jsx` renders "
+        "untrusted user input via dangerouslySetInnerHTML, creating a DOM injection risk."
     )
 
 
@@ -3807,6 +3930,64 @@ def test_inline_citation_recovery_replaces_partial_array_only_when_every_finding
         SourceCitation(first.observation_id, first.path, 2, 2),
         SourceCitation(second.observation_id, second.path, 5, 5),
     )
+
+
+def test_labeled_line_ranges_split_one_broad_rendered_citation() -> None:
+    observation = ToolObservation(
+        observation_id="obs_manifest_01234567",
+        tool="read_file",
+        path="AndroidManifest.xml",
+        content_hash="manifest-hash",
+        text="exported\nprivate one\nprivate two",
+        lines=("4: exported", "5: private one", "6: private two"),
+        start_line=4,
+    )
+    answer = AgentAnswer(
+        summary="The activities were compared.",
+        findings=(
+            "DeepLinkActivity is externally reachable (line 4 of the manifest).",
+            "InternalSettingsActivity remains private (lines 5‑6 of the manifest).",
+        ),
+        next_actions=("Review the exported activity.",),
+        citations=(SourceCitation(observation.observation_id, observation.path, 4, 6),),
+        issue_present=True,
+    )
+
+    recovered = _split_labeled_broad_citation(
+        answer,
+        (observation,),
+        frozenset({observation.observation_id}),
+    )
+
+    assert recovered.citations == (
+        SourceCitation(observation.observation_id, observation.path, 4, 4),
+        SourceCitation(observation.observation_id, observation.path, 5, 6),
+    )
+
+
+def test_labeled_line_range_split_fails_closed_on_overlap() -> None:
+    observation = ToolObservation(
+        observation_id="obs_manifest_01234567",
+        tool="read_file",
+        path="AndroidManifest.xml",
+        content_hash="manifest-hash",
+        text="one\ntwo\nthree",
+        lines=("4: one", "5: two", "6: three"),
+        start_line=4,
+    )
+    original = SourceCitation(observation.observation_id, observation.path, 4, 6)
+    answer = AgentAnswer(
+        summary="Overlapping evidence.",
+        findings=("First behavior is on lines 4-5.", "Second behavior is on lines 5-6."),
+        next_actions=("Review.",),
+        citations=(original,),
+    )
+
+    assert _split_labeled_broad_citation(
+        answer,
+        (observation,),
+        frozenset({observation.observation_id}),
+    ).citations == (original,)
 
 
 @pytest.mark.parametrize(
