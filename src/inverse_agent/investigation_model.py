@@ -46,6 +46,7 @@ from inverse_agent.planner import (
     PlannerBudgetError,
     PlannerError,
     PlannerProtocolError,
+    PlannerResponseValidationError,
     PlannerTransportError,
 )
 
@@ -85,8 +86,20 @@ DECISION_SCHEMA: dict[str, Any] = {
             ),
         },
         "complete": {"type": "boolean"},
-        "findings": {"type": "array", "items": {"type": "string"}},
-        "next_actions": {"type": "array", "items": {"type": "string"}},
+        "findings": {
+            "type": "array",
+            "items": {
+                "type": "string",
+                "description": "One plain natural-language finding sentence, not JSON text.",
+            },
+        },
+        "next_actions": {
+            "type": "array",
+            "items": {
+                "type": "string",
+                "description": "One plain natural-language action sentence, not JSON text.",
+            },
+        },
         "citations": {
             "type": "array",
             "items": {
@@ -177,7 +190,9 @@ _SYSTEM_PROMPT = (
     "and at least one recommended next action. Provide exactly one citation for "
     "each finding in the same order. For a security control, explain the protection "
     "mechanism or result rather than only calling it safe or naming syntax. Keep all "
-    "answer fields concise; do not duplicate findings or citations inside the summary.\n"
+    "answer fields concise. Every findings and next_actions array item must be a plain "
+    "natural-language sentence, never serialized JSON, object syntax, or a key/value "
+    "record. Do not duplicate findings or citations inside the summary.\n"
     "Observation completeness: headers explicitly show truncated/incomplete flags. "
     "A bounded non-code read_file window may support a localized claim when every cited "
     "line is visible. Code-source anchors require a read_file observation beginning at "
@@ -504,7 +519,9 @@ _SCHEMA_RETRY_CORRECTION = (
     "suffix, or additional object. Re-check that every finding is self-contained and has "
     "exactly one distinct citation in the same position. When correcting a final answer, "
     "return the complete final answer with non-empty summary, findings, next_actions, and "
-    "citations; never erase populated evidence arrays."
+    "citations; never erase populated evidence arrays. Every findings and next_actions "
+    "item must be a plain natural-language sentence, never serialized JSON, object syntax, "
+    "or a key/value record."
 )
 _SOURCE_SYMBOL_CITATION_ERROR = (
     "each source citation must include the source-defined symbol named in its finding plus "
@@ -4741,7 +4758,9 @@ class ModelInvestigationPlanner:
                 if schema_used >= self.max_schema_retries:
                     raise
                 schema_used += 1
-                if isinstance(parsed_decision, AgentAnswer):
+                if isinstance(parsed_decision, AgentAnswer) or (
+                    isinstance(exc, PlannerResponseValidationError) and exc.attempted_final_answer
+                ):
                     final_answer_retry_required = True
                 schema_retry_correction = _schema_retry_correction(exc)
                 pending_retry = "schema"

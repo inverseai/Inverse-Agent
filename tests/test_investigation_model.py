@@ -49,6 +49,7 @@ from inverse_agent.planner import (
     PlannerAttestationError,
     PlannerBudgetError,
     PlannerProtocolError,
+    PlannerResponseValidationError,
     PlannerTransportError,
 )
 
@@ -827,12 +828,57 @@ def test_grounded_malformed_answer_gets_one_accounted_schema_retry() -> None:
     assert [event["final_answer_required"] for event in request_events] == [False, True]
     correction = json.loads(client.prompts[1])["retry_correction"]
     assert "one or more non-empty findings" in correction
+    assert "plain natural-language sentence" in correction
     retry_properties = client.schemas[1]["properties"]
     assert retry_properties["action"]["enum"] == ["final_answer"]
     assert retry_properties["summary"]["minLength"] == 1
     assert retry_properties["findings"]["minItems"] == 1
     assert retry_properties["next_actions"]["minItems"] == 1
     assert retry_properties["citations"]["minItems"] == 1
+    assert retry_properties["findings"]["items"]["description"].endswith("not JSON text.")
+
+
+def test_client_rejected_final_answer_retries_with_final_only_schema() -> None:
+    evidence = _command_observation("obs_parent_failed", "generic.parent_commit")
+    valid = _base(
+        "final_answer",
+        summary="grounded",
+        findings=["HEAD has no first parent."],
+        next_actions=["Inspect HEAD."],
+        citations=[
+            {
+                "observation_id": evidence.observation_id,
+                "path": evidence.path,
+                "start_line": 1,
+                "end_line": 1,
+            }
+        ],
+    )
+    client = FakeClient(
+        [
+            PlannerResponseValidationError(
+                "schema mismatch",
+                attempted_final_answer=True,
+            ),
+            valid,
+        ]
+    )
+    planner = ModelInvestigationPlanner(client=client, max_auto_reads=0, max_nudges=0)
+    request_events: list[dict[str, int | float | str | bool | None]] = []
+    planner.request_event_sink = request_events.append
+
+    decision = planner.decide(goal="x", catalog=(evidence,))
+
+    assert isinstance(decision, AgentAnswer)
+    assert client.schemas[0]["properties"]["action"]["enum"] == [
+        "read_file",
+        "list_files",
+        "search_text",
+        "final_answer",
+    ]
+    assert client.schemas[1]["properties"]["action"]["enum"] == ["final_answer"]
+    assert [event["final_answer_required"] for event in request_events] == [False, True]
+    assert [call.outcome for call in planner.model_calls] == ["protocol_error", "success"]
 
 
 def test_resumed_final_answer_retry_remains_final_only_and_rejects_tool_call() -> None:

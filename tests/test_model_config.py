@@ -16,6 +16,7 @@ from inverse_agent.planner import (
     DeterministicPlanner,
     OpenAICompatibleClient,
     PlannerProtocolError,
+    PlannerResponseValidationError,
     PlannerTransportError,
     StructuredPlanner,
     validate_model_endpoint,
@@ -609,6 +610,41 @@ def test_openai_compatible_client_validates_structured_output_locally(
             )
     finally:
         _stop(server, thread)
+
+
+@pytest.mark.parametrize(
+    ("action", "attempted_final_answer"),
+    [("final_answer", True), ("list_files", False)],
+)
+def test_schema_validation_error_retains_only_final_answer_retry_hint(
+    action: str,
+    attempted_final_answer: bool,
+) -> None:
+    server, thread = _serve(_response(json.dumps({"action": action})))
+    schema = {
+        "type": "object",
+        "properties": {
+            "action": {"type": "string", "enum": ["final_answer", "list_files"]},
+            "findings": {"type": "array", "items": {"type": "string"}},
+        },
+        "required": ["action", "findings"],
+        "additionalProperties": False,
+    }
+    try:
+        host, port = server.server_address
+        client = OpenAICompatibleClient(base_url=f"http://{host}:{port}/v1", model="model")
+        with pytest.raises(PlannerResponseValidationError) as raised:
+            client.complete_structured_json(
+                system="system",
+                prompt="prompt",
+                schema_name="investigation_decision",
+                schema=schema,
+            )
+    finally:
+        _stop(server, thread)
+
+    assert raised.value.attempted_final_answer is attempted_final_answer
+    assert str(raised.value) == "model response does not match the requested JSON schema"
 
 
 @pytest.mark.parametrize(

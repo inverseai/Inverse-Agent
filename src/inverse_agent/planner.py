@@ -50,6 +50,15 @@ class PlannerProtocolError(PlannerError):
     """Raised when the model endpoint returns an invalid response."""
 
 
+class PlannerResponseValidationError(PlannerProtocolError):
+    """Raised when decoded model content violates the requested JSON schema."""
+
+    def __init__(self, message: str, *, attempted_final_answer: bool = False) -> None:
+        super().__init__(message)
+        # Preserve only the retry-routing fact, never the rejected model payload.
+        self.attempted_final_answer = attempted_final_answer
+
+
 class PlannerBudgetError(PlannerError):
     """Raised before a model call would exceed a configured run budget."""
 
@@ -358,8 +367,9 @@ class OpenAICompatibleClient:
         try:
             validator.validate(parsed)
         except (ValidationError, ValueError, RecursionError) as exc:
-            raise PlannerProtocolError(
-                "model response does not match the requested JSON schema"
+            raise PlannerResponseValidationError(
+                "model response does not match the requested JSON schema",
+                attempted_final_answer=parsed.get("action") == "final_answer",
             ) from exc
         return parsed
 
